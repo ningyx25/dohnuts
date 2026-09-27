@@ -879,7 +879,8 @@ def test_isolate_accounts_for_every_input_row():
     assert [row["id"] for row in isolate(kept, rerun_audit, rerun_dropped)] == [
         row["id"] for row in kept
     ]
-    assert not rerun_dropped and not rerun_audit
+    assert not rerun_dropped
+    assert not rerun_audit
 
 
 def test_isolate_is_invariant_under_input_permutation():
@@ -888,7 +889,7 @@ def test_isolate_is_invariant_under_input_permutation():
         rows = collision_rows()
         kept = isolate([rows[index] for index in order], Counter(), [])
         fingerprints.add(
-            json.dumps([[row["id"], row["group"], row["split"]] for row in kept], sort_keys=True)
+            json.dumps(sorted([[row["id"], row["group"], row["split"]] for row in kept]))
         )
     assert len(fingerprints) == 1
 
@@ -986,6 +987,22 @@ def test_validate_rows_rejects_duplicate_ids(image_root):
     rows = rows_for_step(step, str(step.image))
     rows[0]["id"] = rows[1]["id"]
     with pytest.raises(ValueError, match="Duplicate row id"):
+        validate_rows(rows)
+
+
+def test_validate_rows_rejects_unknown_split(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    rows[0]["split"] = "validation"
+    with pytest.raises(ValueError, match="Unknown split"):
+        validate_rows(rows)
+
+
+def test_validate_rows_reports_unreadable_images(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    rows[0]["image"] = "does-not-exist.png"
+    with pytest.raises(ValueError, match="Image is not readable: demo_step1:action"):
         validate_rows(rows)
 
 
@@ -1099,13 +1116,14 @@ def isolate(rows: Iterable[dict], audit: Counter, dropped: list[dict[str, str]])
     return kept
 
 
-def validate_rows(rows: Iterable[dict], *, root: Path = Path.cwd()) -> None:
+def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
     """Self-check ids, splits, targets, candidate counts, images, group isolation.
 
     Every failure is a `ValueError` naming the offending row, so callers can
     abort with one actionable line. `root` resolves the stored image paths
-    (they are repository-root relative).
+    (they are repository-root relative) and defaults to the working directory.
     """
+    root = Path.cwd() if root is None else root
     seen_ids = set()
     splits_by_group: dict[str, set] = {}
     for row in rows:
@@ -1138,7 +1156,7 @@ def validate_rows(rows: Iterable[dict], *, root: Path = Path.cwd()) -> None:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(44 passed)
+Expected: PASS(46 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1482,7 +1500,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(48 passed,1 skipped — 若本地存在 `example-data/` 则为 49 passed)
+Expected: PASS(50 passed,1 skipped — 若本地存在 `example-data/` 则为 51 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1667,7 +1685,7 @@ def main(argv=None):
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(51 passed)
+Expected: PASS(53 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
