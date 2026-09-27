@@ -170,11 +170,11 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 - 分桶(常量:`SPLIT_SEED = "doh-gui-split-2026"`):
   `bucket = int(digest(SPLIT_SEED + ":" + group)[:8], 16) % 100`
   → `< 10` calibration,`< 20` dev,`< 30` test,其余 train(≈70/10/10/10)。
-- 图片内容 `sha256` 作为 alias 参与 group 并查(union-find),防止同一张截图出现在两个
-  split;并查后的组按优先级 `train < calibration < dev < test` 保留最高优先级分区,
-  其余行排除并计数 `cross_split_group`。合并后的组名取该组**任务成员**的字典序最小值
-  (alias 只参与并查、不参与命名,否则合并组会被改名为图片哈希),与输入分片顺序无关。
-  合并组名与最终保留哪个分区无关(取最小值,不取幸存者)。**但输出哈希的完全可复现性
+- 图片内容 `sha256` 作为 alias 参与**逐记录消歧**:对每个 alias 取携带它的记录所在
+  split 的最高优先级(`train < calibration < dev < test`),该 alias 在较低优先级 split
+  中的那些**记录**排除并计数 `cross_split_group`,而任务的其他记录仍留在自己的 split。
+  因此同一张截图绝不跨 split,且一次截图碰撞不会带走整个任务;`group` 始终等于
+  `task:<任务id>`,不因碰撞改名,结果与输入分片顺序无关。**输出哈希的完全可复现性
   以「相同输入文件、相同记录顺序、相同 `--output`」为前提**:行的 `image` 字段内嵌输出
   目录下的图片路径,内容重复时保留首个,二者都依赖调用方式。
 - dataset 命名:`gui_action` / `gui_button` / `gui_complete` / `gui_swipe`,按问题类型

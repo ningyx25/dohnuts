@@ -4,7 +4,7 @@
 
 **Goal:** 把 GUI 逐步 SFT 轨迹(`raw_data.json`,每步一条)确定性地转成 Dohnuts 决策行(action 8 类 / button 4 类 / complete noul / swipe_dir 4 类),产出四个 split 与审计清单,可直接喂给 `train.ipynb` 的 C 流程。
 
-**Architecture:** 纯函数核心放 `src/dohnuts/gui_data.py`(解析、派生、分桶、并查隔离、自检),CLI 外壳放 `scripts/prepare_gui_data.py`(输入发现、图像复制、token 预算、manifest)。一步产 2–3 行,共享 state/image/group,一行一问题,完全复用现有 `DecisionCollator`/`Predictor`/`train.py`/`metrics.py`。规格:`docs/superpowers/specs/2026-09-27-gui-direct-decision-data-design.md`。
+**Architecture:** 纯函数核心放 `src/dohnuts/gui_data.py`(解析、派生、分桶、隔离(截图逐记录消歧)、自检),CLI 外壳放 `scripts/prepare_gui_data.py`(输入发现、图像复制、token 预算、manifest)。一步产 2–3 行,共享 state/image/group,一行一问题,完全复用现有 `DecisionCollator`/`Predictor`/`train.py`/`metrics.py`。规格:`docs/superpowers/specs/2026-09-27-gui-direct-decision-data-design.md`。
 
 **Tech Stack:** Python 3.12、PIL、transformers(AutoProcessor/smart_resize)、pytest、ruff、pdm。
 
@@ -920,7 +920,7 @@ def test_isolate_is_invariant_under_input_permutation():
     assert len(fingerprints) == 1
 
 
-def test_isolate_keeps_highest_priority_partition_for_shared_images():
+def test_isolate_drops_only_the_lower_priority_rows_of_a_shared_screenshot():
     audit, dropped = Counter(), []
     rows = [
         row_stub("a:action", group="task:a", split="train"),
@@ -929,7 +929,7 @@ def test_isolate_keeps_highest_priority_partition_for_shared_images():
     kept = list(isolate(rows, audit, dropped))
     assert [row["id"] for row in kept] == ["b:action"]
     assert kept[0]["split"] == "test"
-    assert kept[0]["group"] == "task:a"  # rewritten to the union root
+    assert kept[0]["group"] == "task:b"  # groups are never rewritten
     assert sum(audit.values()) == 1
     assert "cross_split_group" in next(iter(audit))
     assert dropped == [
@@ -961,7 +961,7 @@ def test_swipe_direction_vertical_axis(image_root):
     assert rows[-1]["target"][list(SWIPE_DIRECTIONS).index("down")] == 1.0
 
 
-def test_isolate_group_naming_is_order_independent():
+def test_isolate_is_order_independent_for_shared_screenshots():
     audit, dropped = Counter(), []
     rows = [
         row_stub("b:action", group="task:b", split="test"),
@@ -969,7 +969,7 @@ def test_isolate_group_naming_is_order_independent():
     ]
     kept = list(isolate(rows, audit, dropped))
     assert [row["id"] for row in kept] == ["b:action"]
-    assert kept[0]["group"] == "task:a"  # canonical minimum, not the last seen
+    assert kept[0]["group"] == "task:b"
     assert dropped[0]["id"] == "a:action"
 
 
@@ -992,7 +992,7 @@ def test_isolate_drops_duplicate_row_ids():
     ]
 
 
-def test_isolate_merges_groups_without_dropping_rows():
+def test_isolate_keeps_same_split_screenshots_untouched():
     audit, dropped = Counter(), []
     rows = [
         row_stub("a:action", group="task:a", split="train", alias="image-bytes:9"),
@@ -1000,7 +1000,7 @@ def test_isolate_merges_groups_without_dropping_rows():
     ]
     kept = list(isolate(rows, audit, dropped))
     assert [row["id"] for row in kept] == ["a:action", "b:action"]
-    assert {row["group"] for row in kept} == {"task:a"}
+    assert {row["group"] for row in kept} == {"task:a", "task:b"}
     assert not dropped
     assert not audit
 
@@ -1076,50 +1076,28 @@ from collections.abc import Iterable
 
 ```python
 def isolate(rows: Iterable[dict], audit: Counter, dropped: list[dict[str, str]]) -> list[dict]:
-    """Union groups sharing image bytes, keep the top partition, drop duplicates.
+    """Resolve screenshot collisions across splits, then drop duplicates.
 
     Returns the kept rows and appends one `{id, reason, detail, stage}` entry per
     dropped row to `dropped`, so the CLI can report both in excluded.jsonl.
 
-    This mutates every input row (dropped ones included): `row["group"]` becomes
-    the canonical union root, and deduplication deliberately runs after that
-    merge so merged tasks dedup against each other. Reason precedence is
-    cross-split, then duplicate row id, then duplicate content. Among mutually
-    duplicate rows the first in input order survives, so callers must pass rows
-    in a fixed order (the CLI sorts its input files).
+    A screenshot (identical image bytes, carried as an alias) may only live in one
+    split: for every alias the highest-priority split among the rows carrying it
+    wins (`train < calibration < dev < test`), and the rows carrying that alias in
+    lower-priority splits are dropped as `cross_split_group`. A task's other rows
+    stay in the task's own split and `group` is never rewritten. Reason precedence
+    is cross-split, then duplicate row id, then duplicate content. Among mutually
+    duplicate rows the first in input order survives, so callers must pass rows in
+    a fixed order (the CLI sorts its input files).
     """
     pending = list(rows)
-    parents: dict[str, str] = {}
-
-    def find(key: str) -> str:
-        parents.setdefault(key, key)
-        while key != parents[key]:
-            parents[key] = parents[parents[key]]
-            key = parents[key]
-        return key
-
-    # Aliases never become union nodes: they only record which group a screenshot
-    # was first seen with, so a merged group keeps a task-group name instead of an
-    # image hash.
-    first_group: dict[str, str] = {}
+    best: dict[str, int] = {}
     for row in pending:
         for alias in row["aliases"]:
-            if alias in first_group:
-                left, right = find(first_group[alias]), find(row["group"])
-                if left != right:
-                    # Name a merged group after its lexicographically smallest
-                    # member so the result never depends on input shard order.
-                    parents[max(left, right)] = min(left, right)
-            else:
-                first_group[alias] = row["group"]
-    priority: dict[str, int] = {}
-    for row in pending:
-        root = find(row["group"])
-        priority[root] = max(priority.get(root, 0), SPLIT_ORDER[row["split"]])
+            best[alias] = max(best.get(alias, 0), SPLIT_ORDER[row["split"]])
     seen, seen_ids, kept = set(), set(), []
     for row in pending:
-        row["group"] = find(row["group"])
-        if SPLIT_ORDER[row["split"]] != priority[row["group"]]:
+        if any(SPLIT_ORDER[row["split"]] < best[alias] for alias in row["aliases"]):
             audit[f"{row['dataset']}:{row['split']}:cross_split_group"] += 1
             dropped.append(
                 {"id": row["id"], "reason": "cross_split_group", "detail": "", "stage": "isolate"}

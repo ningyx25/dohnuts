@@ -229,16 +229,17 @@ Known limits: only one screenshot per step; symbol links inside the input root
 can still resolve outside it; tasks that share a screen with another task are not
 detected as near-duplicates.
 
-**Identical screenshots merge isolation groups.** Steps whose screenshots are
-byte-identical are treated as one group and only the highest-priority split
-survives, so the losing tasks' rows are dropped as `cross_split_group`. A
-launcher screen, lock screen, or repeated initial state therefore collapses many
-tasks into one split: a synthetic set of 120 tasks that all opened on the same
-home screen lost 82% of its rows (360 records → 66 rows, three of four splits
-empty). Always read `manifest["exclusions"]` and the per-split counts — a
-`cross_split_group` count that is a large fraction of the input is that signal,
-not a bug — and inspect `excluded.jsonl` for the affected ids before trusting the
-split sizes.
+**Shared screenshots are resolved per record.** Screenshots with identical bytes
+may only live in one split: for every screenshot the highest-priority split among
+the records carrying it wins (`train < calibration < dev < test`), and the rows
+carrying it in lower-priority splits are dropped as `cross_split_group`. The rest
+of a task's rows stay in the task's own split, and task groups are never renamed.
+A launcher screen, lock screen, or repeated initial state therefore costs only
+the rows that literally repeat that screenshot — on a 27k-record trajectory set
+with a repeated launcher screen this dropped 1,881 rows (7%), where merging whole
+task groups would have cost about half the data. Read `manifest["exclusions"]`
+(especially `cross_split_group:…`) and `excluded.jsonl` (`stage=isolate`) to see
+exactly which rows went and why before trusting the split sizes.
 
 ```bash
 # Run from the repository root. --input is your own directory of step-record
