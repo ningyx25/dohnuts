@@ -8,6 +8,7 @@ docs/superpowers/specs/2026-09-27-gui-direct-decision-data-design.md.
 
 import hashlib
 import json
+import math
 import re
 from collections import Counter
 from collections.abc import Iterable
@@ -94,7 +95,10 @@ def task_id(step_id: str) -> str:
 def point(value: object) -> tuple[float, float] | None:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         return None
-    if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in value):
+    if any(
+        isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item)
+        for item in value
+    ):
         return None
     return float(value[0]), float(value[1])
 

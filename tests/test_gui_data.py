@@ -263,6 +263,17 @@ def test_parse_step_rejects_deeply_nested_tool_calls(image_root):
     assert parse_step(record, image_root=image_root) == (None, "missing_tool_call")
 
 
+def test_parse_step_rejects_non_finite_swipe_coordinates(image_root):
+    record = make_record(
+        "a_step1", {"action": "swipe", "coordinate": [float("nan"), 0], "coordinate2": [1, 1]}
+    )
+    assert parse_step(record, image_root=image_root) == (None, "invalid_swipe")
+    record = make_record(
+        "a_step1", {"action": "swipe", "coordinate": [0, 0], "coordinate2": [float("inf"), 0]}
+    )
+    assert parse_step(record, image_root=image_root) == (None, "invalid_swipe")
+
+
 def test_parse_step_never_raises_on_malformed_records(image_root):
     malformed = [
         None,
@@ -500,6 +511,19 @@ def test_isolate_drops_duplicate_row_ids():
             "stage": "isolate",
         }
     ]
+
+
+def test_isolate_merges_groups_without_dropping_rows():
+    audit, dropped = Counter(), []
+    rows = [
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:9"),
+        row_stub("b:action", group="task:b", split="train", alias="image-bytes:9"),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["a:action", "b:action"]
+    assert {row["group"] for row in kept} == {"task:a"}
+    assert not dropped
+    assert not audit
 
 
 def test_validate_rows_rejects_unnormalized_target(image_root):
@@ -781,6 +805,49 @@ def test_cli_stores_the_exact_screenshot_bytes(tmp_path, image_root):
     prepare.convert(source, output)
     stored = output / "images" / (prepare.digest_file(image_root / "shot.png") + ".png")
     assert stored.read_bytes() == (image_root / "shot.png").read_bytes()
+
+
+def test_cli_reports_an_unloadable_token_check_model(tmp_path, image_root):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    with pytest.raises(SystemExit, match="Cannot load the token-check model"):
+        prepare.main(
+            [
+                "--input",
+                str(source),
+                "--output",
+                str(image_root / "out"),
+                "--model",
+                "/nonexistent",
+            ]
+        )
+
+
+def test_cli_output_is_consumable_by_training_data(image_root):
+    model = Path("Qwen/Qwen3.5-0.8B")
+    if not model.is_dir():
+        pytest.skip("local Qwen3.5-0.8B snapshot is not available")
+    from dohnuts.training_data import DecisionCollator, load_records
+
+    steps = [
+        make_record("645_BrowserMaze_step1", {"action": "system_button", "button": "Home"}),
+        make_record(
+            "002_Gallery_step1",
+            {"action": "swipe", "coordinate": [500, 800], "coordinate2": [200, 800]},
+            image="other.png",
+        ),
+    ]
+    output = convert(image_root, steps)
+    rows = [
+        row
+        for split in prepare.SPLITS
+        for group in load_records(output / f"{split}.jsonl").values()
+        for row in group
+    ]
+    assert rows
+    collated, *_ = DecisionCollator(model)(rows)
+    assert collated["input_ids"].shape[0] == len(rows)
 
 
 def test_example_data_converts_when_present():
