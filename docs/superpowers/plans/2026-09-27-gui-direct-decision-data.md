@@ -148,7 +148,9 @@ def test_parse_step_rejects_invalid_button(image_root):
 
 
 def test_parse_step_rejects_diagonal_swipe_tie(image_root):
-    record = make_record("a_step1", {"action": "swipe", "coordinate": [0, 0], "coordinate2": [10, 10]})
+    record = make_record(
+        "a_step1", {"action": "swipe", "coordinate": [0, 0], "coordinate2": [10, 10]}
+    )
     assert parse_step(record, image_root=image_root) == (None, "invalid_swipe")
 
 
@@ -388,7 +390,14 @@ git commit -m "Add GUI step parsing for direct-decision data" -- src/dohnuts/gui
 先把 `tests/test_gui_data.py` 顶部的 `from dohnuts.gui_data import parse_step` 替换为:
 
 ```python
-from dohnuts.gui_data import ACTIONS, BUTTONS, SWIPE_DIRECTIONS, parse_step, rows_for_step, split_for
+from dohnuts.gui_data import (
+    ACTIONS,
+    BUTTONS,
+    SWIPE_DIRECTIONS,
+    parse_step,
+    rows_for_step,
+    split_for,
+)
 ```
 
 (ruff 的 `E402` 会把"非顶部 import"判为错误,所以后续任务新增的 import 一律改顶部区块。)
@@ -403,7 +412,9 @@ def step_for(image_root, uid, arguments):
 
 
 def test_system_button_step_rows(image_root):
-    step = step_for(image_root, "645_BrowserMaze_step3", {"action": "system_button", "button": "Back"})
+    step = step_for(
+        image_root, "645_BrowserMaze_step3", {"action": "system_button", "button": "Back"}
+    )
     rows = rows_for_step(step, "data/processed/gui-v1/images/x.png")
     assert [row["id"] for row in rows] == [
         "645_BrowserMaze_step3:action",
@@ -446,7 +457,9 @@ def test_swipe_step_rows_use_dominant_axis(image_root):
 
 
 def test_wait_step_rows_have_no_conditional_row(image_root):
-    rows = rows_for_step(step_for(image_root, "demo_step1", {"action": "wait", "time": 2}), "img.png")
+    rows = rows_for_step(
+        step_for(image_root, "demo_step1", {"action": "wait", "time": 2}), "img.png"
+    )
     assert [row["id"] for row in rows] == ["demo_step1:action", "demo_step1:complete"]
 
 
@@ -603,7 +616,9 @@ from dohnuts.gui_data import (
 再在 `tests/test_gui_data.py` 末尾追加:
 
 ```python
-def row_stub(uid, *, group, split, alias="image-bytes:deadbeef", dataset="gui_action", question=None):
+def row_stub(
+    uid, *, group, split, alias="image-bytes:deadbeef", dataset="gui_action", question=None
+):
     return {
         "id": uid,
         "dataset": dataset,
@@ -612,7 +627,8 @@ def row_stub(uid, *, group, split, alias="image-bytes:deadbeef", dataset="gui_ac
         "split": split,
         "state": {"user_query": uid},
         "image": "img.png",
-        "question": question or {"type": "choice", "instructions": "q", "criteria": {"a": "a", "b": "b"}},
+        "question": question
+        or {"type": "choice", "instructions": "q", "criteria": {"a": "a", "b": "b"}},
         "target": [1.0, 0.0],
     }
 
@@ -635,8 +651,12 @@ def test_isolate_drops_duplicate_inputs():
     audit = Counter()
     question = {"type": "choice", "instructions": "q", "criteria": {"a": "a", "b": "b"}}
     rows = [
-        row_stub("a:action", group="task:a", split="train", alias="image-bytes:1", question=question),
-        row_stub("a:action", group="task:a", split="train", alias="image-bytes:1", question=question),
+        row_stub(
+            "a:action", group="task:a", split="train", alias="image-bytes:1", question=question
+        ),
+        row_stub(
+            "a:action", group="task:a", split="train", alias="image-bytes:1", question=question
+        ),
     ]
     kept = list(isolate(rows, audit))
     assert len(kept) == 1
@@ -845,8 +865,9 @@ def test_cli_is_deterministic(tmp_path, image_root):
     steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
     first, second = convert(image_root, steps), convert(image_root, steps)
     assert first != second  # different output directories
-    assert json.loads((first / "manifest.json").read_text())["sha256"] == (
-        json.loads((second / "manifest.json").read_text())["sha256"]
+    assert (
+        json.loads((first / "manifest.json").read_text())["sha256"]
+        == (json.loads((second / "manifest.json").read_text())["sha256"])
     )
 
 
@@ -868,9 +889,7 @@ def test_example_data_converts_when_present():
     source = Path(__file__).parents[1] / "example-data" / "raw_data.json"
     if not source.exists():
         pytest.skip("example-data is local-only")
-    step, reason = parse_step(
-        json.loads(source.read_text())[0], image_root=source.parent
-    )
+    step, reason = parse_step(json.loads(source.read_text())[0], image_root=source.parent)
     assert reason is None
     rows = rows_for_step(step, "example-data/raw_images/screenshot_step3.png")
     assert [row["id"] for row in rows] == [
@@ -1162,17 +1181,24 @@ def token_length(processor, row: dict) -> int:
     return length + (height // factor) * (width // factor) - 1
 ```
 
-在 `convert` 的记录循环中,把 `stored = store_image(step, output)` 之前插入:
+在 `convert` 中,把以 `for record in records(paths):` 开头的整个循环替换为下面这段
+(唯一新增的是 `if processor is not None:` 分支,其余不变):
 
 ```python
-        if processor is not None:
-            lengths = [token_length(processor, row) for row in rows_for_step(step, str(step.image))]
-            if any(length > MAX_LENGTH for length in lengths):
-                audit["token_budget"] += 1
-                excluded.append(
-                    {"id": step.id, "reason": "token_budget", "detail": str(max(lengths))}
-                )
-                continue
+for record in records(paths):
+    step, reason = parse_step(record, image_root=image_root)
+    if step is None:
+        audit[reason] += 1
+        excluded.append({"id": record.get("id"), "reason": reason, "detail": ""})
+        continue
+    if processor is not None:
+        lengths = [token_length(processor, row) for row in rows_for_step(step, str(step.image))]
+        if any(length > MAX_LENGTH for length in lengths):
+            audit["token_budget"] += 1
+            excluded.append({"id": step.id, "reason": "token_budget", "detail": str(max(lengths))})
+            continue
+    stored = store_image(step, output)
+    rows.extend(rows_for_step(step, os.path.relpath(stored, root)))
 ```
 
 并把 `main` 改成:
