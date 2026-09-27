@@ -287,7 +287,7 @@ def step_for(image_root, uid, arguments):
 
 def test_system_button_step_rows(image_root):
     step = step_for(
-        image_root, "645_BrowserMaze_step3", {"action": "system_button", "button": "Back"}
+        image_root, "645_BrowserMaze_step3", {"action": "system_button", "button": "Home"}
     )
     rows = rows_for_step(step, "data/processed/gui-v1/images/x.png")
     assert [row["id"] for row in rows] == [
@@ -299,17 +299,17 @@ def test_system_button_step_rows(image_root):
     assert {row["group"] for row in rows} == {"task:645_BrowserMaze"}
     assert {row["image"] for row in rows} == {"data/processed/gui-v1/images/x.png"}
     action, button, complete = rows
-    assert action["question"]["criteria"] == ACTIONS
+    assert list(action["question"]["criteria"]) == list(ACTIONS)
     assert action["question"]["type"] == "choice"
     assert action["target"][list(ACTIONS).index("system_button")] == 1.0
     assert sum(action["target"]) == 1.0
-    assert button["target"] == [1.0, 0.0, 0.0, 0.0]
+    assert button["target"] == [0.0, 1.0, 0.0, 0.0]
     assert list(button["question"]["criteria"]) == list(BUTTONS)
     assert complete["question"]["type"] == "noul"
     assert complete["target"] == [1.0, 0.0]
     assert action["split"] == split_for("task:645_BrowserMaze")
     assert action["aliases"] == ["image-bytes:" + step.image_sha256]
-    assert action["reference"]["tool_call"]["arguments"]["button"] == "Back"
+    assert action["reference"]["tool_call"]["arguments"]["button"] == "Home"
 
 
 def test_terminate_step_rows(image_root):
@@ -321,13 +321,17 @@ def test_terminate_step_rows(image_root):
 
 
 def test_swipe_step_rows_use_dominant_axis(image_root):
-    arguments = {"action": "swipe", "coordinate": [500, 800], "coordinate2": [500, 200]}
+    arguments = {"action": "swipe", "coordinate": [500, 800], "coordinate2": [200, 800]}
     rows = rows_for_step(step_for(image_root, "demo_step1", arguments), "img.png")
-    assert [row["id"] for row in rows][-1] == "demo_step1:swipe_dir"
+    assert [row["id"] for row in rows] == [
+        "demo_step1:action",
+        "demo_step1:complete",
+        "demo_step1:swipe_dir",
+    ]
     swipe = rows[-1]
     assert swipe["dataset"] == "gui_swipe"
     assert list(swipe["question"]["criteria"]) == list(SWIPE_DIRECTIONS)
-    assert swipe["target"][list(SWIPE_DIRECTIONS).index("up")] == 1.0
+    assert swipe["target"][list(SWIPE_DIRECTIONS).index("left")] == 1.0
 
 
 def test_wait_step_rows_have_no_conditional_row(image_root):
@@ -341,4 +345,5 @@ def test_split_for_is_stable_and_covers_partitions():
     assert split_for("task:645_BrowserMaze") == "train"
     assert split_for("task:demo") == "test"
     assert split_for("task:beta") == "test"
+    assert split_for("task:002_Gallery") == "dev"
     assert split_for("task:delta") == "calibration"

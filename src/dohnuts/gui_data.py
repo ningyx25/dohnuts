@@ -230,7 +230,14 @@ def split_for(group: str) -> str:
 
 
 def rows_for_step(step: Step, image_path: str) -> list[dict]:
-    """One action row per step, plus button, complete, and swipe_dir rows."""
+    """One action row per step, plus button, complete, and swipe_dir rows.
+
+    `step` must come from `parse_step` (it guarantees the arguments this function
+    relies on); `image_path` is the repository-root relative path of the stored
+    image copy, not `step.image`. Rows come back in the order action, button,
+    complete, swipe_dir. Every row of a step shares `state` and `reference` **by
+    reference**: treat row values as read-only.
+    """
     arguments = step.arguments
     action = arguments["action"]
 
@@ -286,7 +293,10 @@ def rows_for_step(step: Step, image_path: str) -> list[dict]:
     if action == "swipe":
         directions = list(SWIPE_DIRECTIONS)
         direction = swipe_direction(arguments)
-        assert direction is not None  # parse_step rejects invalid swipes
+        if direction is None:
+            raise ValueError(
+                "rows_for_step requires distinct swipe axes; parse_step rejects the rest"
+            )
         rows.append(
             row(
                 "swipe_dir",
