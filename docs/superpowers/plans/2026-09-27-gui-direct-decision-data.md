@@ -1981,7 +1981,6 @@ if __name__ == "__main__":
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
 Expected: PASS(71 passed — 缺本地 `Qwen/Qwen3.5-0.8B` 快照时 collator 一致性用例 skip,数量减少)
-`example-data/` 时为 67 passed)
 
 - [ ] **Step 4b: 用真实处理器核对长度估算(必须一致)**
 
