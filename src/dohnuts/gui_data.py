@@ -69,6 +69,11 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def image_digest(path: Path) -> str:
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 @dataclass(frozen=True)
 class Step:
     id: str
@@ -105,8 +110,14 @@ def swipe_direction(arguments: dict) -> str | None:
 
 
 def message_content(messages: list, role: str) -> str | None:
+    if not isinstance(messages, list):
+        return None
     for message in messages:
-        if message.get("role") == role and isinstance(message.get("content"), str):
+        if (
+            isinstance(message, dict)
+            and message.get("role") == role
+            and isinstance(message.get("content"), str)
+        ):
             return message["content"]
     return None
 
@@ -121,12 +132,29 @@ def reference(assistant: str, call: dict) -> dict:
 
 
 def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | None]:
-    """Return the parsed step, or (None, exclusion reason)."""
-    user = message_content(record.get("messages") or [], "user")
-    assistant = message_content(record.get("messages") or [], "assistant")
+    """Return the parsed step, or (None, exclusion reason); never raises on bad input."""
+    if not isinstance(record, dict):
+        return None, "unparsable_state"
+    messages = record.get("messages")
+    if not isinstance(messages, list):
+        return None, "unparsable_state"
+    if any(not isinstance(message, dict) for message in messages):
+        return None, "unparsable_state"
+    roles = [
+        message.get("role")
+        for message in messages
+        if isinstance(message, dict) and isinstance(message.get("content"), str)
+    ]
+    users, assistants = roles.count("user"), roles.count("assistant")
+    if not users and not assistants:
+        return None, "unparsable_state"
+    if users != 1 or assistants != 1:
+        return None, "multi_turn"
+    user = message_content(messages, "user")
+    assistant = message_content(messages, "assistant")
     if user is None or assistant is None:
         return None, "unparsable_state"
-    match = STATE_PATTERN.match(user.replace("<image>", "").strip())
+    match = STATE_PATTERN.match(re.sub(r"<image>\s*$", "", user).strip())
     if match is None:
         return None, "unparsable_state"
     call_match = TOOL_CALL_PATTERN.search(assistant)
@@ -145,16 +173,25 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
         return None, "missing_id"
     arguments = call["arguments"]
     action = arguments.get("action")
-    if action not in ACTIONS:
+    if not isinstance(action, str) or action not in ACTIONS:
         return None, "unknown_action"
-    if action == "system_button" and arguments.get("button") not in BUTTONS:
+    button = arguments.get("button")
+    if action == "system_button" and (not isinstance(button, str) or button not in BUTTONS):
         return None, "invalid_button"
     if action == "swipe" and swipe_direction(arguments) is None:
         return None, "invalid_swipe"
-    images = record.get("images") or []
-    if len(images) != 1:
+    images = record.get("images")
+    if (
+        not isinstance(images, list)
+        or len(images) != 1
+        or not isinstance(images[0], str)
+        or not images[0]
+    ):
         return None, "multi_image"
-    image = Path(image_root) / str(images[0])
+    relative = Path(images[0])
+    if relative.is_absolute() or ".." in relative.parts:
+        return None, "missing_image"
+    image = Path(image_root) / relative
     if not image.is_file():
         return None, "missing_image"
     try:
@@ -171,7 +208,7 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
                 "task_progress": match.group("progress"),
             },
             image=image,
-            image_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+            image_sha256=image_digest(image),
             arguments=arguments,
             reference=reference(assistant, call),
         ),

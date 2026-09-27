@@ -1,5 +1,6 @@
 """GUI step conversion: parsing, row derivation, isolation, and CLI output."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -67,7 +68,8 @@ def test_parse_step_reads_state_and_tool_call(image_root):
     assert step.arguments == {"action": "system_button", "button": "Back"}
     assert step.reference["thought"] == "Clear the dialog first."
     assert step.reference["tool_call"]["name"] == "mobile_use"
-    assert len(step.image_sha256) == 64
+    assert step.image == image_root / "shot.png"
+    assert step.image_sha256 == hashlib.sha256((image_root / "shot.png").read_bytes()).hexdigest()
 
 
 def test_parse_step_rejects_unparsable_state(image_root):
@@ -123,3 +125,93 @@ def test_parse_step_rejects_multi_image(image_root):
 def test_parse_step_rejects_missing_image(image_root):
     record = make_record("a_step1", {"action": "wait", "time": 1}, image="gone.png")
     assert parse_step(record, image_root=image_root) == (None, "missing_image")
+
+
+def test_parse_step_rejects_multi_turn_records(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"].append({"role": "assistant", "content": "Thought: again\nAction: y"})
+    assert parse_step(record, image_root=image_root) == (None, "multi_turn")
+
+
+def test_parse_step_keeps_messages_of_other_roles(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"].insert(0, {"role": "system", "content": "tools"})
+    step, reason = parse_step(record, image_root=image_root)
+    assert reason is None
+    assert step.state["user_query"] == QUERY
+
+
+def test_parse_step_rejects_malformed_containers(image_root):
+    assert parse_step("not a record", image_root=image_root) == (None, "unparsable_state")
+    assert parse_step({"messages": "hello", "id": "a_step1"}, image_root=image_root) == (
+        None,
+        "unparsable_state",
+    )
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"] = [record["messages"][1], record["messages"][2], "junk"]
+    assert parse_step(record, image_root=image_root) == (None, "unparsable_state")
+
+
+def test_parse_step_rejects_non_string_action_and_button(image_root):
+    assert parse_step(make_record("a_step1", {"action": ["click"]}), image_root=image_root) == (
+        None,
+        "unknown_action",
+    )
+    assert parse_step(
+        make_record("a_step1", {"action": "system_button", "button": ["Back"]}),
+        image_root=image_root,
+    ) == (None, "invalid_button")
+
+
+def test_parse_step_rejects_malformed_images_container(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["images"] = {"0": "shot.png"}
+    assert parse_step(record, image_root=image_root) == (None, "multi_image")
+    record["images"] = "shot.png"
+    assert parse_step(record, image_root=image_root) == (None, "multi_image")
+    record["images"] = [""]
+    assert parse_step(record, image_root=image_root) == (None, "multi_image")
+
+
+def test_parse_step_rejects_image_paths_outside_the_input_root(image_root):
+    assert parse_step(
+        make_record("a_step1", {"action": "wait", "time": 1}, image="../shot.png"),
+        image_root=image_root,
+    ) == (None, "missing_image")
+    assert parse_step(
+        make_record("a_step1", {"action": "wait", "time": 1}, image="/etc/hostname"),
+        image_root=image_root,
+    ) == (None, "missing_image")
+
+
+def test_parse_step_rejects_undecodable_image(image_root):
+    (image_root / "shot.png").write_bytes(b"not an image")
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    assert parse_step(record, image_root=image_root) == (None, "missing_image")
+
+
+def test_parse_step_prefers_earlier_checks(image_root):
+    record = make_record("a_step1", {"action": "double_click"}, name="computer_use")
+    record["images"] = []
+    assert parse_step(record, image_root=image_root) == (None, "unknown_tool")
+
+
+def test_parse_step_never_raises_on_malformed_records(image_root):
+    malformed = [
+        None,
+        [],
+        "record",
+        {},
+        {"id": "a_step1"},
+        {"id": "a_step1", "messages": None},
+        {"id": "a_step1", "messages": [None, 1, "x"]},
+        {"id": "a_step1", "messages": [{"role": "user", "content": None}]},
+        make_record("a_step1", {"action": {"nested": "dict"}}),
+        make_record(
+            "a_step1", {"action": "swipe", "coordinate": [[1], [2]], "coordinate2": [[3], [4]]}
+        ),
+    ]
+    for record in malformed:
+        step, reason = parse_step(record, image_root=image_root)
+        assert step is None
+        assert isinstance(reason, str)
