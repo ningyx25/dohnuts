@@ -1658,7 +1658,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(66 passed,1 skipped — 若本地存在 `example-data/` 则为 67 passed)
+Expected: PASS(61 passed,1 skipped — 若本地存在 `example-data/` 则为 62 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1785,7 +1785,7 @@ def test_token_length_counts_words_and_image_patches(image_root):
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `pdm run pytest tests/test_gui_data.py -q -k token`
-Expected: 两个用例都失败 —— `test_token_length_counts_words_and_image_patches` 报
+Expected: 选中的三个用例都失败(`-k token` 同时命中 collator 一致性用例)—— 后两个报
 `AttributeError: module 'prepare_gui_data' has no attribute 'render_question'`(导入缺失);
 `test_token_budget_excludes_whole_record` 则在断言处失败(`assert {} == {'parse:token_budget': 1}`),
 因为 `convert` 此时还忽略 `processor`。
@@ -1909,7 +1909,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(61 passed,1 skipped — 若本地存在 `example-data/` 则为 62 passed)
+Expected: PASS(66 passed,1 skipped — 若本地存在 `example-data/` 则为 67 passed)
 
 - [ ] **Step 4b: 用真实处理器核对长度估算(必须一致)**
 

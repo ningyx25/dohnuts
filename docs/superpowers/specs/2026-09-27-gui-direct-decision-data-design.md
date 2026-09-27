@@ -254,7 +254,10 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 ## 12. 复现性与版本
 
 已知限制:输入的 `images` 若是指向输入根之外的**符号链接**,仍会被成功读取(只拒绝
-绝对路径与 `..` 上跳);如需要可后续版本用 `Path.resolve()` 再校验。
+绝对路径与 `..` 上跳);如需要可后续版本用 `Path.resolve()` 再校验。四个 split 文件写入
+失败会转成一行 `SystemExit`;`excluded.jsonl` 与 `manifest.json` 的写入仍可能以裸
+`OSError` 结束(触发条件极窄:恰好在这两处写入时磁盘满),表现为缺 manifest、无静默
+数据损坏。
 
 - 转换是确定性的:输入文件哈希 + 固定词表/规则 + `SPLIT_SEED` 决定输出;任何规则、
   词表或比例变更都会改变输出 sha256,必须重新训练(`train.py` 会比对四文件 SHA)。
