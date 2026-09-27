@@ -758,6 +758,29 @@ def test_cli_names_unreadable_input_files(tmp_path, image_root):
     (image_root / "broken.json").write_text("{not json")
     with pytest.raises(SystemExit, match="Unreadable step record file"):
         prepare.convert(image_root, image_root / "out")
+    (image_root / "broken.json").write_bytes(b'{"id": "\xe9"}')
+    with pytest.raises(SystemExit, match="Unreadable step record file"):
+        prepare.convert(image_root, image_root / "out")
+
+
+def test_cli_rejects_an_output_path_that_is_a_file(tmp_path, image_root):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    output = image_root / "out"
+    output.write_text("not a directory")
+    with pytest.raises(SystemExit, match="Cannot create the output directory"):
+        prepare.convert(source, output)
+
+
+def test_cli_stores_the_exact_screenshot_bytes(tmp_path, image_root):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    output = image_root / "out"
+    prepare.convert(source, output)
+    stored = output / "images" / (prepare.digest_file(image_root / "shot.png") + ".png")
+    assert stored.read_bytes() == (image_root / "shot.png").read_bytes()
 
 
 def test_example_data_converts_when_present():
@@ -812,6 +835,55 @@ def test_token_budget_excludes_whole_record(tmp_path, image_root):
     assert entry["reason"] == "token_budget"
     assert entry["stage"] == "parse"
     assert int(entry["detail"]) > 2048
+
+
+def test_cli_warns_on_empty_splits(image_root, capsys):
+    steps = [make_record("645_BrowserMaze_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    prepare.convert(source, image_root / "out")
+    captured = capsys.readouterr()
+    assert json.loads(captured.err) == {"warning": "empty splits: dev, calibration, test"}
+    assert "warning" not in captured.out
+
+
+def test_cli_skips_the_model_when_token_checks_are_disabled(tmp_path, image_root, monkeypatch):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    output = image_root / "out"
+
+    def explode(*args, **kwargs):
+        raise AssertionError("the token-check model must not be loaded")
+
+    monkeypatch.setattr(prepare.AutoProcessor, "from_pretrained", explode)
+    prepare.main(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--model",
+            "/nonexistent",
+            "--no-token-check",
+        ]
+    )
+    assert json.loads((output / "manifest.json").read_text())["token_check"] == "skipped"
+
+
+def test_token_length_matches_the_training_collator(image_root):
+    model = Path("Qwen/Qwen3.5-0.8B")
+    if not model.is_dir():
+        pytest.skip("local Qwen3.5-0.8B snapshot is not available")
+    from dohnuts.training_data import DecisionCollator
+
+    record = make_record("001_TaskA_step1", {"action": "system_button", "button": "Home"})
+    step, reason = parse_step(record, image_root=image_root)
+    assert reason is None
+    rows = rows_for_step(step, str(image_root / "shot.png"))
+    processor = prepare.AutoProcessor.from_pretrained(model, local_files_only=True)
+    collated, *_ = DecisionCollator(model)([rows[0]])
+    assert prepare.token_length(processor, rows[0]) == int(collated["input_ids"].shape[1])
 
 
 def test_token_length_counts_words_and_image_patches(image_root):

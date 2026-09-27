@@ -60,7 +60,9 @@ def records(paths: list[Path]):
     for path in paths:
         try:
             data = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError) as error:
+        except (OSError, ValueError) as error:
+            # JSONDecodeError and UnicodeDecodeError are both ValueError; a torn or
+            # non-UTF-8 file must not abort the batch with a traceback.
             raise SystemExit(
                 f"Unreadable step record file: {path} ({type(error).__name__}: {error})"
             ) from error
@@ -71,7 +73,9 @@ def records(paths: list[Path]):
 
 def store_image(step, output: Path) -> Path:
     target = output / "images" / (step.image_sha256 + ".png")
-    if not target.exists():
+    if not target.exists() or digest_file(target) != step.image_sha256:
+        # Re-copy a target whose content does not match its name: a killed
+        # previous run can leave a truncated file that later runs would trust.
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(step.image, target)
     return target
@@ -102,7 +106,10 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     paths = input_files(source)
     if not paths:
         raise SystemExit(f"No step record *.json found under {source}")
-    output.mkdir(parents=True, exist_ok=True)
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise SystemExit(f"Cannot create the output directory {output}: {error}") from error
     audit: Counter = Counter()
     excluded = []
     rows = []
@@ -157,19 +164,22 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
         validate_rows(kept, root=root)
     except ValueError as error:
         raise SystemExit(f"Self-check failed: {error}") from error
-    handles = {split: (output / f"{split}.jsonl").open("w") for split in SPLITS}
     counts: Counter = Counter()
     classes: dict[str, Counter] = {}
     try:
-        for row in kept:
-            handles[row["split"]].write(json.dumps(row, ensure_ascii=False) + "\n")
-            counts[(row["dataset"], row["split"])] += 1
-            if row["dataset"] == "gui_action":
-                label = list(ACTIONS)[row["target"].index(1.0)]
-                classes.setdefault(row["split"], Counter())[label] += 1
-    finally:
-        for handle in handles.values():
-            handle.close()
+        handles = {split: (output / f"{split}.jsonl").open("w") for split in SPLITS}
+        try:
+            for row in kept:
+                handles[row["split"]].write(json.dumps(row, ensure_ascii=False) + "\n")
+                counts[(row["dataset"], row["split"])] += 1
+                if row["dataset"] == "gui_action":
+                    label = list(ACTIONS)[row["target"].index(1.0)]
+                    classes.setdefault(row["split"], Counter())[label] += 1
+        finally:
+            for handle in handles.values():
+                handle.close()
+    except OSError as error:
+        raise SystemExit(f"Cannot write the split files under {output}: {error}") from error
     with (output / "excluded.jsonl").open("w") as stream:
         for entry in [*excluded, *dropped]:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -230,7 +240,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     processor = None
     if args.model is not None and args.token_check:
-        processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
+        try:
+            processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"Cannot load the token-check model {args.model}: {error}") from error
     convert(args.input, args.output, processor=processor)
 
 
