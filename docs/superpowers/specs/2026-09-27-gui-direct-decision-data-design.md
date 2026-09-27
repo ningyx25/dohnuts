@@ -56,8 +56,8 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
  "group": "task:645_BrowserMaze",
  "aliases": ["image-bytes:<sha256>"],
  "split": "train",
- "state": {"user_query": "In the Files app, ...", "task_progress": "You have done ...; ."},
- "image": "data/gui/v1/images/<sha256>.png",
+ "state": {"user_query": "In the Files app, ...", "task_progress": "(You have done the following operation on the current device): Step 1: ...; ."},
+ "image": "data/processed/gui-v1/images/<sha256>.png",
  "question": {"type": "choice",
    "instructions": "What is the next action the agent should take?",
    "criteria": {"click": "tap a single point on the screen", "long_press": "press and hold a point for some time", "swipe": "drag from one point to another", "type": "enter text into the active input field", "answer": "output the answer to the user", "system_button": "press a system button", "wait": "wait for the screen to change", "terminate": "finish the task and report the result"}},
@@ -83,6 +83,8 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 
 - `state` 只含 `user_query` 与 `task_progress`(逐字保留源文本,不清理标点),**绝不含
   thought**(项目规则:rationale 不进模型输入)。`reference` 仅作溯源,训练不读。
+- 输出目录约定放在 `.gitignore` 覆盖的 `data/processed/` 下(与现有 `data/processed/v1`
+  一致),原始数据与产物不进 Git。
 - 候选顺序即词表顺序;`target` 下标与之对齐;训练期 `DecisionCollator` 的候选置换
   会同步置换 `criteria` 与 `target`,无需数据侧处理。
 - `swipe_dir` 行:`{"type": "choice", "instructions": "In which direction should the screen be swiped?",
@@ -95,11 +97,14 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 
 1. `state`:取 user 消息,去掉尾部 `<image>` 标记;用一条锚定模板的正则解析(允许
    query 与 history 自身含换行):
-   `^The user query:\s*(?P<q>.*?)\nTask progress[^\n]*?:\s*(?P<p>.*?)\n?\s*$`(DOTALL)。
-   `user_query`、`task_progress` 原样保留(含结尾的 `; .`),不做标点清理。不匹配 →
+   `^The user query:\s*(?P<q>.*?)\nTask progress\s*(?P<p>.*?)\s*$`(DOTALL)。
+   `user_query` 为 `The user query:` 之后的文本;`task_progress` 为 `Task progress`
+   标签之后的全部文本——含源文本里的 `(You have done ... device):` 引导语与结尾的
+   `; .`,不做标点清理或括号剥离(与现有 smoke 行仅差源文本自带的括号)。不匹配 →
    排除 `unparsable_state`。
 2. `tool_call`:取 assistant 消息中**第一个** `<tool_call>...</tool_call>` 块解析 JSON。
    缺失或不是合法 JSON → `missing_tool_call`;`name != "mobile_use"` → `unknown_tool`。
+   记录自身必须带非空字符串 `id` → 否则 `missing_id`。
 3. `action` = `arguments.action`,必须在 8 类词表内,否则 `unknown_action`。
 4. `button` 行:仅当 `action == "system_button"`;`arguments.button` 必须在 4 类词表内,
    否则 `invalid_button`。
@@ -118,7 +123,7 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 ## 6. 排除与审计
 
 排除原因键(写入 `excluded.jsonl` 与 manifest 计数):
-`unparsable_state`、`missing_tool_call`、`unknown_tool`、`unknown_action`、
+`unparsable_state`、`missing_tool_call`、`unknown_tool`、`missing_id`、`unknown_action`、
 `invalid_button`、`invalid_swipe`、`multi_image`、`missing_image`、
 `token_budget`、`duplicate_input`、`cross_split_group`。
 
@@ -168,10 +173,15 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 2. **token 预算检查**:`--model` 给出本地模型路径时执行(见 §6);模型缺失时跳过并在
    manifest 记录 `token_check: "skipped"`。
 3. **单元测试** `tests/test_gui_data.py`:
-   - fixture = `example-data/raw_data.json`,断言产出 3 行(action/button/complete)、
-     schema 正确、target 与词表对齐、id 与 group 符合规则;
+   - fixture = 测试内构造的合成记录(JSON 字典 + PIL 生成的临时截图),**不依赖**被
+     `.gitignore` 忽略的 `example-data/`,保证 CI 可跑;
+   - 断言产出 3 行(action/button/complete)、schema 正确、target 与词表对齐、id 与
+     group 符合规则;
    - 确定性:同一输入两次转换,输出文件 sha256 相同;
-   - 排除用例:未知 action、缺图、无 `<tool_call>`、swipe 平局、多图、state 不可解析;
+   - 排除用例:未知 action、缺图、无 `<tool_call>`、swipe 平局、多图、state 不可解析、
+     缺 id;
+   - 另加一条集成断言:`example-data/raw_data.json` 存在时(本地)转换该样例,断言
+     3 行、target 指向 `system_button`/`Back`/非终止;文件缺失则 `pytest.skip`;
    - 不依赖 GPU/模型(token 检查关闭)。
 4. **端到端冒烟**:构造 ~100 个合成任务(改写样例记录的 id,并覆盖 8 类 action、
    swipe 方向与 terminate 步)转换,再喂给 `train.ipynb`(小 STEPS)跑通
