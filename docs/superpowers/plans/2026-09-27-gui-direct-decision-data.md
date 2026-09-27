@@ -1167,7 +1167,7 @@ Expected: 退出码 0
 
 ```bash
 git add src/dohnuts/gui_data.py tests/test_gui_data.py
-git commit -m "Isolate GUI decision groups and self-check converted rows" -- src/dohnuts/gui_data.py tests/test_gui_data.py
+git commit -m "Return isolated rows eagerly and unify the self-check failure type" -- src/dohnuts/gui_data.py tests/test_gui_data.py
 ```
 
 ---
