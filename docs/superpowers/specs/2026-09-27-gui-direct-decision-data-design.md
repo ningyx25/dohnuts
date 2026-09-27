@@ -150,7 +150,9 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 **解析期与隔离期的丢弃都要写入**(隔离期丢弃时 `id` 用该行的 `id`,`reason` 为
 `duplicate_input` 或 `cross_split_group`)。`duplicate_input` 覆盖两种情形:同一
 `(dataset, group, state, question)` 的重复输入,以及两条记录铸出同一行 `id`(后者在
-`detail` 记 `row id already seen`,排除后出现的那条,避免自检直接中止整批)。
+`detail` 记 `row id already seen`,排除后出现的那条,避免自检直接中止整批)。内容重复
+时保留输入顺序中**先出现**的那条;转换器对输入文件排序,因此给定相同输入与相同输出
+目录,结果可复现。
 
 - 一条原始记录若任一必需问题无法派生,整条记录排除(不产出部分行)——避免"某步只训
   一半问题"造成的分布偏斜;`button`/`swipe_dir` 本就是条件行,其缺失不算失败。
@@ -170,8 +172,10 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 - 图片内容 `sha256` 作为 alias 参与 group 并查(union-find),防止同一张截图出现在两个
   split;并查后的组按优先级 `train < calibration < dev < test` 保留最高优先级分区,
   其余行排除并计数 `cross_split_group`。合并后的组名取该组**任务成员**的字典序最小值
-  (alias 只参与并查、不参与命名,否则合并组会被改名为图片哈希),与输入分片顺序无关
-  ——输出哈希只由输入内容决定。合并组名与最终保留哪个分区无关(取最小值,不取幸存者)。
+  (alias 只参与并查、不参与命名,否则合并组会被改名为图片哈希),与输入分片顺序无关。
+  合并组名与最终保留哪个分区无关(取最小值,不取幸存者)。**但输出哈希的完全可复现性
+  以「相同输入文件、相同记录顺序、相同 `--output`」为前提**:行的 `image` 字段内嵌输出
+  目录下的图片路径,内容重复时保留首个,二者都依赖调用方式。
 - dataset 命名:`gui_action` / `gui_button` / `gui_complete` / `gui_swipe`,按问题类型
   分开。理由:`metrics.py` 只对固定候选词表计算 macro-F1,混在一个 dataset 里会失真。
   代价:`TrainingBatches` 按 dataset 名均匀采样,4 个问题族各得约 1/4 更新,少量
@@ -196,8 +200,10 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 
 ## 9. 验证
 
-1. **转换器内置自检(默认开启)**:id 全局唯一;`split` 字段与所在文件一致;target
-   归一且长度等于候选数;候选数 2–128;图片可 RGB 打开;group 不跨 split。
+1. **转换器内置自检(默认开启)**:id 全局唯一;`split` 字段与所在文件一致(未知 split
+   也判失败);target 归一且长度等于候选数;候选数 2–128;图片可 RGB 打开;group 不跨
+   split。自检失败一律抛**带行 id** 的 `ValueError`(含未知 split 与图片不可读),转换器
+   把它转成一行 `SystemExit` 信息并非零退出,而不是裸回溯。
 2. **token 预算检查**:`--model` 给出本地模型路径时执行(见 §6);模型缺失时跳过并在
    manifest 记录 `token_check: "skipped"`。
 3. **单元测试** `tests/test_gui_data.py`:

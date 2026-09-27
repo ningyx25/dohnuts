@@ -795,6 +795,7 @@ git commit -m "Derive GUI decision rows and task-hashed splits" -- src/dohnuts/g
 
 ```python
 import hashlib
+import itertools
 import json
 from collections import Counter
 from pathlib import Path
@@ -818,7 +819,14 @@ from dohnuts.gui_data import (
 
 ```python
 def row_stub(
-    uid, *, group, split, alias="image-bytes:deadbeef", dataset="gui_action", question=None
+    uid,
+    *,
+    group,
+    split,
+    alias="image-bytes:deadbeef",
+    dataset="gui_action",
+    question=None,
+    state=None,
 ):
     return {
         "id": uid,
@@ -826,12 +834,63 @@ def row_stub(
         "group": group,
         "aliases": [alias],
         "split": split,
-        "state": {"user_query": uid},
+        "state": {"user_query": uid} if state is None else state,
         "image": "img.png",
         "question": question
         or {"type": "choice", "instructions": "q", "criteria": {"a": "a", "b": "b"}},
         "target": [1.0, 0.0],
     }
+
+
+def collision_rows():
+    """One shared-image pair across splits plus three independent groups."""
+    return [
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:1"),
+        row_stub("b:action", group="task:b", split="test", alias="image-bytes:1"),
+        row_stub("c:action", group="task:c", split="test", alias="image-bytes:2"),
+        row_stub("d:action", group="task:d", split="dev", alias="image-bytes:3"),
+        row_stub("e:action", group="task:e", split="calibration", alias="image-bytes:4"),
+    ]
+
+
+def test_isolate_drops_content_duplicates_with_distinct_ids():
+    audit, dropped = Counter(), []
+    state = {"user_query": "same"}
+    rows = [
+        row_stub("a:complete", group="task:a", split="train", alias="image-bytes:1", state=state),
+        row_stub("b:complete", group="task:a", split="train", alias="image-bytes:2", state=state),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["a:complete"]
+    assert dropped == [
+        {"id": "b:complete", "reason": "duplicate_input", "detail": "", "stage": "isolate"}
+    ]
+
+
+def test_isolate_accounts_for_every_input_row():
+    audit, dropped = Counter(), []
+    rows = collision_rows()
+    kept = list(isolate(rows, audit, dropped))
+    assert Counter(row["id"] for row in kept) + Counter(entry["id"] for entry in dropped) == (
+        Counter(row["id"] for row in rows)
+    )
+    assert sum(audit.values()) == len(dropped)
+    rerun_audit, rerun_dropped = Counter(), []
+    assert [row["id"] for row in isolate(kept, rerun_audit, rerun_dropped)] == [
+        row["id"] for row in kept
+    ]
+    assert not rerun_dropped and not rerun_audit
+
+
+def test_isolate_is_invariant_under_input_permutation():
+    fingerprints = set()
+    for order in itertools.permutations(range(5)):
+        rows = collision_rows()
+        kept = isolate([rows[index] for index in order], Counter(), [])
+        fingerprints.add(
+            json.dumps([[row["id"], row["group"], row["split"]] for row in kept], sort_keys=True)
+        )
+    assert len(fingerprints) == 1
 
 
 def test_isolate_keeps_highest_priority_partition_for_shared_images():
@@ -954,17 +1013,24 @@ Expected: FAIL —`ImportError: cannot import name 'isolate'`
 
 ```python
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 ```
 
 在文件末尾追加:
 
 ```python
-def isolate(rows: Iterable[dict], audit: Counter, dropped: list) -> Iterator[dict]:
+def isolate(rows: Iterable[dict], audit: Counter, dropped: list[dict[str, str]]) -> list[dict]:
     """Union groups sharing image bytes, keep the top partition, drop duplicates.
 
-    Every dropped row is appended to `dropped` so the CLI can report it in
-    excluded.jsonl, with the same detail as parse-time exclusions.
+    Returns the kept rows and appends one `{id, reason, detail, stage}` entry per
+    dropped row to `dropped`, so the CLI can report both in excluded.jsonl.
+
+    This mutates every input row (dropped ones included): `row["group"]` becomes
+    the canonical union root, and deduplication deliberately runs after that
+    merge so merged tasks dedup against each other. Reason precedence is
+    cross-split, then duplicate row id, then duplicate content. Among mutually
+    duplicate rows the first in input order survives, so callers must pass rows
+    in a fixed order (the CLI sorts its input files).
     """
     pending = list(rows)
     parents: dict[str, str] = {}
@@ -994,7 +1060,7 @@ def isolate(rows: Iterable[dict], audit: Counter, dropped: list) -> Iterator[dic
     for row in pending:
         root = find(row["group"])
         priority[root] = max(priority.get(root, 0), SPLIT_ORDER[row["split"]])
-    seen, seen_ids = set(), set()
+    seen, seen_ids, kept = set(), set(), []
     for row in pending:
         row["group"] = find(row["group"])
         if SPLIT_ORDER[row["split"]] != priority[row["group"]]:
@@ -1029,17 +1095,25 @@ def isolate(rows: Iterable[dict], audit: Counter, dropped: list) -> Iterator[dic
             )
             continue
         seen.add(key)
-        yield row
+        kept.append(row)
+    return kept
 
 
-def validate_rows(rows: Iterable[dict]) -> None:
-    """Self-check ids, targets, candidate counts, images, and group isolation."""
+def validate_rows(rows: Iterable[dict], *, root: Path = Path.cwd()) -> None:
+    """Self-check ids, splits, targets, candidate counts, images, group isolation.
+
+    Every failure is a `ValueError` naming the offending row, so callers can
+    abort with one actionable line. `root` resolves the stored image paths
+    (they are repository-root relative).
+    """
     seen_ids = set()
     splits_by_group: dict[str, set] = {}
     for row in rows:
         if row["id"] in seen_ids:
             raise ValueError(f"Duplicate row id: {row['id']}")
         seen_ids.add(row["id"])
+        if row["split"] not in SPLIT_ORDER:
+            raise ValueError(f"Unknown split: {row['id']} ({row['split']})")
         question = row["question"]
         width = 2 if question["type"] == "noul" else len(question["criteria"])
         if not 2 <= width <= 128:
@@ -1048,8 +1122,13 @@ def validate_rows(rows: Iterable[dict]) -> None:
             raise ValueError(f"Target width does not match candidates: {row['id']}")
         if min(row["target"]) < 0 or abs(sum(row["target"]) - 1) > 1e-4:
             raise ValueError(f"Target is not a distribution: {row['id']}")
-        with Image.open(row["image"]) as image:
-            image.convert("RGB")
+        try:
+            with Image.open(root / row["image"]) as image:
+                image.convert("RGB")
+        except OSError as error:
+            raise ValueError(
+                f"Image is not readable: {row['id']} ({row['image']}): {error}"
+            ) from error
         splits_by_group.setdefault(row["group"], set()).add(row["split"])
     leaked = [group for group, splits in splits_by_group.items() if len(splits) > 1]
     if leaked:
@@ -1059,7 +1138,7 @@ def validate_rows(rows: Iterable[dict]) -> None:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(41 passed)
+Expected: PASS(44 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1139,13 +1218,17 @@ def test_cli_writes_splits_manifest_and_images(tmp_path, image_root):
 
 
 def test_cli_is_deterministic(tmp_path, image_root):
+    # The four split hashes are reproducible from the same --output: a row's
+    # `image` field embeds the output directory, so a different --output
+    # legitimately produces different bytes.
     steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
-    first, second = convert(image_root, steps), convert(image_root, steps)
-    assert first != second  # different output directories
-    assert (
-        json.loads((first / "manifest.json").read_text())["sha256"]
-        == (json.loads((second / "manifest.json").read_text())["sha256"])
-    )
+    first = convert(image_root, steps)
+    before = json.loads((first / "manifest.json").read_text())
+    second = convert(image_root, steps)
+    assert first == second
+    after = json.loads((second / "manifest.json").read_text())
+    assert after["sha256"] == before["sha256"]
+    assert after["images"] == before["images"]
 
 
 def test_cli_records_exclusions(image_root):
@@ -1286,6 +1369,7 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     audit: Counter = Counter()
     excluded = []
     rows = []
+    images_written: set[str] = set()
     for record in records(paths):
         try:
             step, reason = parse_step(record, image_root=image_root)
@@ -1301,6 +1385,7 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
                 )
                 continue
             stored = store_image(step, output)
+            images_written.add(stored.name)
             rows.extend(rows_for_step(step, os.path.relpath(stored, root)))
         except Exception as error:
             # Filesystem and decode failures outside parse_step must not abort a run.
@@ -1315,8 +1400,11 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
             )
             continue
     dropped: list = []
-    kept = list(isolate(rows, audit, dropped))
-    validate_rows(kept)
+    kept = isolate(rows, audit, dropped)
+    try:
+        validate_rows(kept, root=root)
+    except ValueError as error:
+        raise SystemExit(f"Self-check failed: {error}") from error
     handles = {split: (output / f"{split}.jsonl").open("w") for split in SPLITS}
     counts: Counter = Counter()
     classes: dict[str, Counter] = {}
@@ -1350,7 +1438,7 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
             split: dict(sorted(values.items())) for split, values in sorted(classes.items())
         },
         "exclusions": dict(sorted(audit.items())),
-        "images": sorted(path.name for path in (output / "images").glob("*.png")),
+        "images": sorted(images_written),
         "dataset_weighting": "uniform per dataset name; button and swipe rows are upweighted",
         "token_check": "skipped" if processor is None else "enabled",
         "vocabularies": {
@@ -1369,7 +1457,12 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True, help="Step records file or directory")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Step record JSON file, or a directory of *.json step-record arrays (not an output directory)",
+    )
     parser.add_argument("--output", type=Path, required=True, help="Split directory to create")
     parser.add_argument(
         "--model", type=Path, default=None, help="Local model used for the token budget check"
@@ -1389,7 +1482,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(45 passed,1 skipped — 若本地存在 `example-data/` 则为 46 passed)
+Expected: PASS(48 passed,1 skipped — 若本地存在 `example-data/` 则为 49 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1553,7 +1646,12 @@ for record in records(paths):
 ```python
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True, help="Step records file or directory")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Step record JSON file, or a directory of *.json step-record arrays (not an output directory)",
+    )
     parser.add_argument("--output", type=Path, required=True, help="Split directory to create")
     parser.add_argument(
         "--model", type=Path, default=None, help="Local model used for the token budget check"
@@ -1569,7 +1667,7 @@ def main(argv=None):
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(48 passed)
+Expected: PASS(51 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1717,6 +1815,10 @@ PY
 ```
 
 Expected: `480 steps`
+
+注意:每个合成任务必须用**不同的图片字节**(脚本按 task/index 变化颜色正是为此)。
+若所有任务共用同一张截图,并查会把它们并成一个组、只保留最高优先级分区,四个 split 里
+会有三个为空,后面的"四个 split 均非空"断言会以与 bug 无关的原因失败。
 
 - [ ] **Step 2: 转换并检查每个 split 非空**
 
