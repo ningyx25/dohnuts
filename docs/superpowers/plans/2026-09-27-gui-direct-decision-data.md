@@ -295,6 +295,17 @@ def test_parse_step_rejects_deeply_nested_tool_calls(image_root):
     assert parse_step(record, image_root=image_root) == (None, "missing_tool_call")
 
 
+def test_parse_step_rejects_non_finite_swipe_coordinates(image_root):
+    record = make_record(
+        "a_step1", {"action": "swipe", "coordinate": [float("nan"), 0], "coordinate2": [1, 1]}
+    )
+    assert parse_step(record, image_root=image_root) == (None, "invalid_swipe")
+    record = make_record(
+        "a_step1", {"action": "swipe", "coordinate": [0, 0], "coordinate2": [float("inf"), 0]}
+    )
+    assert parse_step(record, image_root=image_root) == (None, "invalid_swipe")
+
+
 def test_parse_step_never_raises_on_malformed_records(image_root):
     malformed = [
         None,
@@ -336,6 +347,7 @@ docs/superpowers/specs/2026-09-27-gui-direct-decision-data-design.md.
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -420,7 +432,10 @@ def task_id(step_id: str) -> str:
 def point(value: object) -> tuple[float, float] | None:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         return None
-    if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in value):
+    if any(
+        isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item)
+        for item in value
+    ):
         return None
     return float(value[0]), float(value[1])
 
@@ -548,7 +563,7 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(26 passed)
+Expected: PASS(27 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -767,7 +782,7 @@ def rows_for_step(step: Step, image_path: str) -> list[dict]:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(31 passed)
+Expected: PASS(32 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -966,6 +981,19 @@ def test_isolate_drops_duplicate_row_ids():
     ]
 
 
+def test_isolate_merges_groups_without_dropping_rows():
+    audit, dropped = Counter(), []
+    rows = [
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:9"),
+        row_stub("b:action", group="task:b", split="train", alias="image-bytes:9"),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["a:action", "b:action"]
+    assert {row["group"] for row in kept} == {"task:a"}
+    assert not dropped
+    assert not audit
+
+
 def test_validate_rows_rejects_unnormalized_target(image_root):
     step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
     rows = rows_for_step(step, str(step.image))
@@ -1156,7 +1184,7 @@ def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(46 passed)
+Expected: PASS(48 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1412,6 +1440,49 @@ def test_cli_stores_the_exact_screenshot_bytes(tmp_path, image_root):
     assert stored.read_bytes() == (image_root / "shot.png").read_bytes()
 
 
+def test_cli_reports_an_unloadable_token_check_model(tmp_path, image_root):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    with pytest.raises(SystemExit, match="Cannot load the token-check model"):
+        prepare.main(
+            [
+                "--input",
+                str(source),
+                "--output",
+                str(image_root / "out"),
+                "--model",
+                "/nonexistent",
+            ]
+        )
+
+
+def test_cli_output_is_consumable_by_training_data(image_root):
+    model = Path("Qwen/Qwen3.5-0.8B")
+    if not model.is_dir():
+        pytest.skip("local Qwen3.5-0.8B snapshot is not available")
+    from dohnuts.training_data import DecisionCollator, load_records
+
+    steps = [
+        make_record("645_BrowserMaze_step1", {"action": "system_button", "button": "Home"}),
+        make_record(
+            "002_Gallery_step1",
+            {"action": "swipe", "coordinate": [500, 800], "coordinate2": [200, 800]},
+            image="other.png",
+        ),
+    ]
+    output = convert(image_root, steps)
+    rows = [
+        row
+        for split in prepare.SPLITS
+        for group in load_records(output / f"{split}.jsonl").values()
+        for row in group
+    ]
+    assert rows
+    collated, *_ = DecisionCollator(model)(rows)
+    assert collated["input_ids"].shape[0] == len(rows)
+
+
 def test_example_data_converts_when_present():
     source = Path(__file__).parents[1] / "example-data" / "raw_data.json"
     if not source.exists():
@@ -1658,7 +1729,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(61 passed,1 skipped — 若本地存在 `example-data/` 则为 62 passed)
+Expected: PASS(66 passed — 本机同时具备 `Qwen/Qwen3.5-0.8B` 与 `example-data/` 时;缺任一项则相应用例 skip,数量减少)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1784,7 +1855,7 @@ def test_token_length_counts_words_and_image_patches(image_root):
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `pdm run pytest tests/test_gui_data.py -q -k token`
+Run: `pdm run pytest tests/test_gui_data.py -q -k "token_length or token_budget"`
 Expected: 选中的三个用例都失败(`-k token` 同时命中 collator 一致性用例)—— 后两个报
 `AttributeError: module 'prepare_gui_data' has no attribute 'render_question'`(导入缺失);
 `test_token_budget_excludes_whole_record` 则在断言处失败(`assert {} == {'parse:token_budget': 1}`),
@@ -1909,7 +1980,8 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(66 passed,1 skipped — 若本地存在 `example-data/` 则为 67 passed)
+Expected: PASS(71 passed — 缺本地 `Qwen/Qwen3.5-0.8B` 快照时 collator 一致性用例 skip,数量减少)
+`example-data/` 时为 67 passed)
 
 - [ ] **Step 4b: 用真实处理器核对长度估算(必须一致)**
 
@@ -2284,11 +2356,20 @@ PY
 1. `gui_complete` 在 dev / calibration / test 每个 split 都非空,且 calibration 的
    `gui_action`(choice)与 `gui_complete`(noul)行数各 ≥ 10,否则 `fit_temperatures`
    会保持对应类型温度 1.0(不报错,但失去校准)。
-2. 排除计数逐条可解释;`cross_split_group` 应接近 0(仅在跨任务共享截图时出现)。
+2. 排除计数逐条可解释。**重点看 `*:cross_split_group`**:截图字节相同的步骤会被并查
+   成一个隔离组、只保留最高优先级 split,其余按此原因丢弃——若该计数占输入比例很大
+   (真实数据里首屏/锁屏/初始状态重复很常见),说明大量任务被合并,必须用
+   `excluded.jsonl` 里 `stage=isolate` 的行 id 追查受影响的任务,再决定是接受损失还是
+   先剔除这些重复截图步骤(后者会改变输出哈希,必须在训练前做)。
 3. `action_classes` 各 split 的类别分布与整体相近;若某 split 缺关键类别(如
    `system_button`),记录在案并考虑扩大数据或调整分桶比例常量 `SPLIT_LIMITS`。
-4. 转换后不要再改 `data/processed/gui-v1` 下的 jsonl(`train.py` 会比对 SHA-256)。
-5. 首次训练前,把 `train.ipynb` 的 `SMOKE_DATA` 改为 `False`(真实数据无跨 split 泄漏)。
+4. `token_check` 应为 `"enabled"`(即确实传了 `--model`);若存在 `parse:token_budget`
+   计数,逐条确认那些行确实超预算,而不是估算与训练侧不一致(训练侧 `DecisionCollator`
+   一旦遇到超预算行会直接中止,不会静默截断)。
+5. 转换后不要再改 `data/processed/gui-v1` 下的 jsonl(`train.py` 会比对 SHA-256)。
+6. 首次训练前,把 `train.ipynb` 的 `DATA_DIR` 从 `example-data` 改为 `data/processed/gui-v1`,
+   并把 `SMOKE_DATA` 改为 `False`(真实数据无跨 split 泄漏);`TOKEN_CHECK_ROWS` 保留,
+   它会用真实 collator 再核一遍 token 预算。
 
 ---
 

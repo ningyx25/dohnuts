@@ -207,8 +207,9 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
    也判失败);target 归一且长度等于候选数;候选数 2–128;图片可 RGB 打开;group 不跨
    split。自检失败一律抛**带行 id** 的 `ValueError`(含未知 split 与图片不可读),转换器
    把它转成一行 `SystemExit` 信息并非零退出,而不是裸回溯。
-2. **token 预算检查**:`--model` 给出本地模型路径时执行(见 §6);模型缺失时跳过并在
-   manifest 记录 `token_check: "skipped"`。
+2. **token 预算检查**:传了 `--model` 时执行并在 manifest 记录 `token_check: "enabled"`;
+   未传 `--model`(或显式 `--no-token-check`)时跳过并记录 `"skipped"`。传了 `--model`
+   但加载失败**不静默降级**,而是一行 `SystemExit` 中止。
 3. **单元测试** `tests/test_gui_data.py`:
    - fixture = 测试内构造的合成记录(JSON 字典 + PIL 生成的临时截图),**不依赖**被
      `.gitignore` 忽略的 `example-data/`,保证 CI 可跑;

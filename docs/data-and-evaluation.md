@@ -209,11 +209,16 @@ Fixed rules:
   stage drops rows (`cross_split_group`, `duplicate_input`). Both land in
   `excluded.jsonl` with `{id, reason, detail, stage}` and in the manifest's
   `exclusions` counts (`parse:<reason>` and `<dataset>:<split>:<reason>`).
-- Manifest `images` lists the files this run wrote (content-deduplicated); an
-  image can outlive rows that were later dropped by isolation, so it is not the
-  set of images the dataset references. Re-running into the same `--output`
-  reproduces the same four hashes; a different `--output` legitimately changes
-  them because rows embed the stored image path.
+- Manifest `images` lists the screenshot files this run stored (bare file names
+  under `<output>/images/`, content-deduplicated); an image can outlive rows that
+  were later dropped by isolation, so it is not the set of images the dataset
+  references. Re-running into the same `--output` reproduces the same four
+  hashes; a different `--output` legitimately changes them because rows embed the
+  stored image path.
+- `excluded.jsonl` uses two id conventions: parse-stage entries carry the raw
+  record id (which can be `null` when the record has none), isolate-stage entries
+  carry the affected row id with its `:action`/`:button`/`:complete`/`:swipe_dir`
+  suffix.
 
 Coordinates and typed text are payloads for the orchestrator, not decisions:
 this model answers what to do, which button to press, in which direction to
@@ -222,6 +227,17 @@ swipe, and whether to stop. Region detection stays outside the converter.
 Known limits: only one screenshot per step; symbol links inside the input root
 can still resolve outside it; tasks that share a screen with another task are not
 detected as near-duplicates.
+
+**Identical screenshots merge isolation groups.** Steps whose screenshots are
+byte-identical are treated as one group and only the highest-priority split
+survives, so the losing tasks' rows are dropped as `cross_split_group`. A
+launcher screen, lock screen, or repeated initial state therefore collapses many
+tasks into one split: a synthetic set of 120 tasks that all opened on the same
+home screen lost 82% of its rows (360 records → 66 rows, three of four splits
+empty). Always read `manifest["exclusions"]` and the per-split counts — a
+`cross_split_group` count that is a large fraction of the input is that signal,
+not a bug — and inspect `excluded.jsonl` for the affected ids before trusting the
+split sizes.
 
 ```bash
 # Run from the repository root. --input is your own directory of step-record
