@@ -1184,6 +1184,26 @@ git commit -m "Return isolated rows eagerly and unify the self-check failure typ
 `import json` 之前),再在 `tests/test_gui_data.py` 末尾追加:
 
 ```python
+def test_isolate_prefers_the_row_id_reason_over_the_content_reason():
+    audit, dropped = Counter(), []
+    rows = [
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:1"),
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:2"),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["a:action"]
+    assert dropped[0]["detail"] == "row id already seen"
+
+
+def test_validate_rows_rejects_candidate_counts_out_of_range(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    rows[0]["question"]["criteria"] = {"only": "one candidate"}
+    rows[0]["target"] = [1.0]
+    with pytest.raises(ValueError, match="Candidate count out of range"):
+        validate_rows(rows)
+
+
 def load_script():
     spec = importlib.util.spec_from_file_location(
         "prepare_gui_data", Path(__file__).parents[1] / "scripts/prepare_gui_data.py"
@@ -1500,7 +1520,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(50 passed,1 skipped — 若本地存在 `example-data/` 则为 51 passed)
+Expected: PASS(52 passed,1 skipped — 若本地存在 `example-data/` 则为 53 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1685,7 +1705,7 @@ def main(argv=None):
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(53 passed)
+Expected: PASS(55 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 

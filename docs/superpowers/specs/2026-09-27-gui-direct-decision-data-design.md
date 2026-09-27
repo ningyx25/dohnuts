@@ -211,7 +211,7 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
      `.gitignore` 忽略的 `example-data/`,保证 CI 可跑;
    - 断言产出 3 行(action/button/complete)、schema 正确、target 与词表对齐、id 与
      group 符合规则;
-   - 确定性:同一输入两次转换,输出文件 sha256 相同;
+   - 确定性:同一输入在同一 `--output` 目录重复转换,输出文件 sha256 相同;
    - 排除用例:未知 action、缺图、无 `<tool_call>`、swipe 平局、多图、state 不可解析、
      缺 id;
    - 另加一条集成断言:`example-data/raw_data.json` 存在时(本地)转换该样例,断言
@@ -255,6 +255,8 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 
 - 转换是确定性的:输入文件哈希 + 固定词表/规则 + `SPLIT_SEED` 决定输出;任何规则、
   词表或比例变更都会改变输出 sha256,必须重新训练(`train.py` 会比对四文件 SHA)。
+  可复现性以**相同输入文件、相同记录顺序、相同 `--output`** 为前提(见 §7:行内嵌
+  输出目录下的图片路径,内容重复时保留首个)。
 - `schema_version=1`;未来新增问题类型(区域、时长、三分类 terminate)时递增,并在
   manifest 记录。
 
