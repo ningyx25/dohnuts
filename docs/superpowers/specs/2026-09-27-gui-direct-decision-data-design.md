@@ -164,8 +164,9 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 
 ## 7. split、group 隔离与采样权重
 
-- `group = "task:" + 任务id`,`任务id` 由记录 id 去掉 `_step\d+$` 后缀得到
-  (无法匹配时整条 id 作任务 id)。同一任务的所有 step 共用一个 group。
+- `group = "task:" + 任务id`,`任务id` 由记录 id 去掉 `_step\d+` **及其后的任何尾巴**
+  (如批量来源标记 `__from0208_...`)得到;无法匹配时整条 id 作任务 id。同一任务的所有
+  step 共用一个 group——尾巴若不去掉,同一任务的步骤会各自成组并散落到不同 split。
 - 分桶(常量:`SPLIT_SEED = "doh-gui-split-2026"`):
   `bucket = int(digest(SPLIT_SEED + ":" + group)[:8], 16) % 100`
   → `< 10` calibration,`< 20` dev,`< 30` test,其余 train(≈70/10/10/10)。

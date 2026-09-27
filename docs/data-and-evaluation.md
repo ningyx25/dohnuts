@@ -187,7 +187,8 @@ Fixed rules:
   action text are kept in `reference` for provenance and never enter model input.
   Records must hold exactly one user and one assistant message; anything else is
   excluded instead of guessed.
-- Task ids strip the `_step<N>` suffix and form the isolation group. Split
+- Task ids strip the `_step<N>` suffix and any trailing batch marker after it
+  (e.g. `__from0208_...`) and form the isolation group. Split
   buckets are `int(sha256("doh-gui-split-2026:" + group)[:8], 16) % 100`:
   calibration < 10, dev < 20, test < 30, train otherwise. Image bytes join groups
   before the split priority (`train < calibration < dev < test`) is resolved, and
