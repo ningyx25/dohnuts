@@ -240,6 +240,30 @@ def test_parse_step_prefers_earlier_checks(image_root):
     assert parse_step(record, image_root=image_root) == (None, "unknown_tool")
 
 
+def test_parse_step_rejects_overlong_image_names(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1}, image="x" * 300 + ".png")
+    assert parse_step(record, image_root=image_root) == (None, "missing_image")
+
+
+def test_parse_step_rejects_invalid_tool_call_bodies(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"][2]["content"] = "Thought: x\nAction: y\n<tool_call>\nnot json\n</tool_call>"
+    assert parse_step(record, image_root=image_root) == (None, "missing_tool_call")
+    record["messages"][2]["content"] = (
+        'Thought: x\nAction: y\n<tool_call>\n{"name": "mobile_use"}\n</tool_call>'
+    )
+    assert parse_step(record, image_root=image_root) == (None, "missing_tool_call")
+
+
+def test_parse_step_maps_missing_role_to_multi_turn(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"][1]["content"] = None
+    assert parse_step(record, image_root=image_root) == (None, "multi_turn")
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"][2]["content"] = 42
+    assert parse_step(record, image_root=image_root) == (None, "multi_turn")
+
+
 def test_parse_step_never_raises_on_malformed_records(image_root):
     malformed = [
         None,
@@ -435,7 +459,7 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
         return None, "missing_tool_call"
     try:
         call = json.loads(call_match.group("call"))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         return None, "missing_tool_call"
     if not isinstance(call, dict) or not isinstance(call.get("arguments"), dict):
         return None, "missing_tool_call"
@@ -465,12 +489,13 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
     if relative.is_absolute() or ".." in relative.parts:
         return None, "missing_image"
     image = Path(image_root) / relative
-    if not image.is_file():
-        return None, "missing_image"
     try:
+        if not image.is_file():
+            return None, "missing_image"
         with Image.open(image) as handle:
             handle.convert("RGB")
-    except OSError:
+        image_sha256 = image_digest(image)
+    except (OSError, ValueError, Image.DecompressionBombError):
         return None, "missing_image"
     return (
         Step(
@@ -481,7 +506,7 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
                 "task_progress": match.group("progress"),
             },
             image=image,
-            image_sha256=image_digest(image),
+            image_sha256=image_sha256,
             arguments=arguments,
             reference=reference(assistant, call),
         ),
@@ -492,7 +517,7 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(20 passed)
+Expected: PASS(23 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -696,7 +721,7 @@ def rows_for_step(step: Step, image_path: str) -> list[dict]:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(25 passed)
+Expected: PASS(28 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -927,7 +952,7 @@ def validate_rows(rows: Iterable[dict]) -> None:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(32 passed)
+Expected: PASS(35 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1026,6 +1051,25 @@ def test_cli_records_exclusions(image_root):
     assert manifest["exclusions"] == {"parse:missing_tool_call": 1}
     entry = json.loads((output / "excluded.jsonl").read_text().splitlines()[0])
     assert entry["id"] == "002_TaskB_step1"
+    assert entry["stage"] == "parse"
+
+
+def test_cli_survives_unexpected_failures(image_root, monkeypatch):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    output = image_root / "out"
+
+    def explode(record, *, image_root):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(prepare, "parse_step", explode)
+    manifest = prepare.convert(source, output)
+    assert manifest["exclusions"] == {"parse:unexpected": 1}
+    assert sum(row["n"] for row in manifest["counts"]) == 0
+    entry = json.loads((output / "excluded.jsonl").read_text().splitlines()[0])
+    assert entry["reason"] == "unexpected"
+    assert entry["detail"] == "RuntimeError: boom"
     assert entry["stage"] == "parse"
 
 
@@ -1134,20 +1178,33 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     excluded = []
     rows = []
     for record in records(paths):
-        step, reason = parse_step(record, image_root=image_root)
-        if step is None:
-            audit[f"parse:{reason}"] += 1
+        try:
+            step, reason = parse_step(record, image_root=image_root)
+            if step is None:
+                audit[f"parse:{reason}"] += 1
+                excluded.append(
+                    {
+                        "id": record.get("id") if isinstance(record, dict) else None,
+                        "reason": reason,
+                        "detail": "",
+                        "stage": "parse",
+                    }
+                )
+                continue
+            stored = store_image(step, output)
+            rows.extend(rows_for_step(step, os.path.relpath(stored, root)))
+        except Exception as error:
+            # Filesystem and decode failures outside parse_step must not abort a run.
+            audit["parse:unexpected"] += 1
             excluded.append(
                 {
                     "id": record.get("id") if isinstance(record, dict) else None,
-                    "reason": reason,
-                    "detail": "",
+                    "reason": "unexpected",
+                    "detail": f"{type(error).__name__}: {error}",
                     "stage": "parse",
                 }
             )
             continue
-        stored = store_image(step, output)
-        rows.extend(rows_for_step(step, os.path.relpath(stored, root)))
     dropped: list = []
     kept = list(isolate(rows, audit, dropped))
     validate_rows(kept)
@@ -1222,7 +1279,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(36 passed,1 skipped — 若本地存在 `example-data/` 则为 37 passed)
+Expected: PASS(39 passed,1 skipped — 若本地存在 `example-data/` 则为 40 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1339,33 +1396,46 @@ def token_length(processor, row: dict) -> int:
 
 ```python
 for record in records(paths):
-    step, reason = parse_step(record, image_root=image_root)
-    if step is None:
-        audit[f"parse:{reason}"] += 1
-        excluded.append(
-            {
-                "id": record.get("id") if isinstance(record, dict) else None,
-                "reason": reason,
-                "detail": "",
-                "stage": "parse",
-            }
-        )
-        continue
-    if processor is not None:
-        lengths = [token_length(processor, row) for row in rows_for_step(step, str(step.image))]
-        if any(length > MAX_LENGTH for length in lengths):
-            audit["parse:token_budget"] += 1
+    try:
+        step, reason = parse_step(record, image_root=image_root)
+        if step is None:
+            audit[f"parse:{reason}"] += 1
             excluded.append(
                 {
-                    "id": step.id,
-                    "reason": "token_budget",
-                    "detail": str(max(lengths)),
+                    "id": record.get("id") if isinstance(record, dict) else None,
+                    "reason": reason,
+                    "detail": "",
                     "stage": "parse",
                 }
             )
             continue
-    stored = store_image(step, output)
-    rows.extend(rows_for_step(step, os.path.relpath(stored, root)))
+        if processor is not None:
+            lengths = [token_length(processor, row) for row in rows_for_step(step, str(step.image))]
+            if any(length > MAX_LENGTH for length in lengths):
+                audit["parse:token_budget"] += 1
+                excluded.append(
+                    {
+                        "id": step.id,
+                        "reason": "token_budget",
+                        "detail": str(max(lengths)),
+                        "stage": "parse",
+                    }
+                )
+                continue
+        stored = store_image(step, output)
+        rows.extend(rows_for_step(step, os.path.relpath(stored, root)))
+    except Exception as error:
+        # Filesystem and decode failures outside parse_step must not abort a run.
+        audit["parse:unexpected"] += 1
+        excluded.append(
+            {
+                "id": record.get("id") if isinstance(record, dict) else None,
+                "reason": "unexpected",
+                "detail": f"{type(error).__name__}: {error}",
+                "stage": "parse",
+            }
+        )
+        continue
 ```
 
 并把 `main` 改成:
@@ -1389,7 +1459,7 @@ def main(argv=None):
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(38 passed)
+Expected: PASS(42 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 

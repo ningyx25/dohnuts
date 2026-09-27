@@ -93,6 +93,10 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 
 ## 5. 派生规则
 
+检查顺序固定为:**结构**(记录是对象、`messages` 是列表、条目都是对象)→ **轮次**
+(恰好 1 user + 1 assistant)→ **state 模板** → **tool_call** → **记录 id** →
+**action** → **button** → **swipe** → **图片**;先命中的原因码胜出。
+
 解析一条原始记录:
 
 1. `state`:取 user 消息,只去掉**尾部的** `<image>` 标记(`re.sub(r"<image>\s*$", "", ...)`,
@@ -104,8 +108,9 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
    排除 `unparsable_state`。
    记录必须**恰好含一条 user 与一条 assistant 消息**;条数不为 1(多轮)或结构非法
    (记录不是对象、`messages` 不是列表、条目不是对象)→ 排除 `multi_turn` /
-   `unparsable_state`。条目是对象但 `content` 非字符串时不计入轮次统计;若因此凑不出
-   合法的 user/assistant 轮次,同样 `unparsable_state`。本版一记录一步,不猜测该取哪一轮。
+   `unparsable_state`。条目是对象但 `content` 非字符串时不计入轮次统计:一条合法轮次
+   都没有 → `unparsable_state`;有合法轮次但 user/assistant 各自不为 1 → `multi_turn`。
+   本版一记录一步,不猜测该取哪一轮。
 2. `tool_call`:取 assistant 消息中**第一个** `<tool_call>...</tool_call>` 块解析 JSON。
    缺失或不是合法 JSON → `missing_tool_call`;`name != "mobile_use"` → `unknown_tool`。
    记录自身必须带非空字符串 `id` → 否则 `missing_id`。
@@ -132,7 +137,11 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 排除原因(写入 `excluded.jsonl` 与 manifest 计数):
 `unparsable_state`、`multi_turn`、`missing_tool_call`、`unknown_tool`、`missing_id`、
 `unknown_action`、`invalid_button`、`invalid_swipe`、`multi_image`、`missing_image`、
-`token_budget`、`duplicate_input`、`cross_split_group`。
+`token_budget`、`duplicate_input`、`cross_split_group`、`unexpected`。
+
+`unexpected` 是 CLI 记录级兜底:转换器在单条记录上除 `parse_step` 之外仍可能遇到
+文件系统或解码层面的异常(超长文件名、解压炸弹、深层嵌套 JSON 等);该记录按
+`unexpected` 排除并在 `detail` 记录异常类型与消息,转换继续,不中断整批。
 
 **键名与落盘(统一方案)**:manifest 的 `exclusions` 是扁平计数表,键统一为
 `<来源>:<原因>` —— 解析期与 token 预算为 `parse:<原因>`,隔离期为
@@ -177,7 +186,8 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
   sha256)、`counts`(dataset × split)、每 split 的动作类别分布、`exclusions` 计数、
   候选词表与 instructions 原文、`dataset_weighting`、`path_convention`、
   四个输出文件的 sha256。
-- `excluded.jsonl`:每行 `{id, reason, detail}`。
+- `excluded.jsonl`:每行 `{id, reason, detail, stage}`(解析期 `stage=parse`,隔离期
+`stage=isolate`)。
 - `images/<sha256>.png`:按内容去重的截图副本。
 
 ## 9. 验证
@@ -229,6 +239,9 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 坐标生成器;文档与模型卡不得宣称坐标级 grounding 能力。
 
 ## 12. 复现性与版本
+
+已知限制:输入的 `images` 若是指向输入根之外的**符号链接**,仍会被成功读取(只拒绝
+绝对路径与 `..` 上跳);如需要可后续版本用 `Path.resolve()` 再校验。
 
 - 转换是确定性的:输入文件哈希 + 固定词表/规则 + `SPLIT_SEED` 决定输出;任何规则、
   词表或比例变更都会改变输出 sha256,必须重新训练(`train.py` 会比对四文件 SHA)。
