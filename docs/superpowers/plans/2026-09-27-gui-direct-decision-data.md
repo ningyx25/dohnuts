@@ -264,6 +264,37 @@ def test_parse_step_maps_missing_role_to_multi_turn(image_root):
     assert parse_step(record, image_root=image_root) == (None, "multi_turn")
 
 
+def test_parse_step_pins_empty_turn_reason(image_root):
+    record = {"id": "a_step1", "messages": [{"role": "user", "content": None}]}
+    assert parse_step(record, image_root=image_root) == (None, "unparsable_state")
+
+
+def test_parse_step_rejects_decompression_bombs(image_root):
+    import struct
+    import zlib
+
+    def chunk(kind, payload):
+        body = kind + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body))
+
+    header = struct.pack(">IIBBBBB", 50000, 50000, 8, 2, 0, 0, 0)
+    (image_root / "shot.png").write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(b"\x00" * 10))
+        + chunk(b"IEND", b"")
+    )
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    assert parse_step(record, image_root=image_root) == (None, "missing_image")
+
+
+def test_parse_step_rejects_deeply_nested_tool_calls(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    nested = "[" * 200_000 + "]" * 200_000
+    record["messages"][2]["content"] = f"Thought: x\nAction: y\n<tool_call>\n{nested}\n</tool_call>"
+    assert parse_step(record, image_root=image_root) == (None, "missing_tool_call")
+
+
 def test_parse_step_never_raises_on_malformed_records(image_root):
     malformed = [
         None,
@@ -517,7 +548,7 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(23 passed)
+Expected: PASS(26 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -721,7 +752,7 @@ def rows_for_step(step: Step, image_path: str) -> list[dict]:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(28 passed)
+Expected: PASS(31 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -952,7 +983,7 @@ def validate_rows(rows: Iterable[dict]) -> None:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(35 passed)
+Expected: PASS(38 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1279,7 +1310,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(39 passed,1 skipped — 若本地存在 `example-data/` 则为 40 passed)
+Expected: PASS(42 passed,1 skipped — 若本地存在 `example-data/` 则为 43 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1459,7 +1490,7 @@ def main(argv=None):
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(42 passed)
+Expected: PASS(45 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
