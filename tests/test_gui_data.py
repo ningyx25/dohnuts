@@ -535,6 +535,27 @@ def test_isolate_keeps_same_split_screenshots_untouched():
     assert not audit
 
 
+def test_validate_rows_rejects_screenshots_across_splits(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    # A distinct task keeps the group check quiet, so the alias check is the one
+    # that must fire: two rows of one step always share both group and alias.
+    rows[1]["group"] = "task:other"
+    rows[1]["split"] = "test" if rows[0]["split"] == "train" else "train"
+    with pytest.raises(ValueError, match="Screenshots span multiple splits"):
+        validate_rows(rows)
+
+
+def test_isolate_drops_a_row_whose_extra_alias_is_leaked():
+    audit, dropped = Counter(), []
+    leaked = row_stub("a:action", group="task:a", split="train", alias="image-bytes:own")
+    leaked["aliases"].append("image-bytes:shared")
+    rows = [leaked, row_stub("b:action", group="task:b", split="test", alias="image-bytes:shared")]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["b:action"]
+    assert dropped[0]["id"] == "a:action"
+
+
 def test_validate_rows_rejects_unnormalized_target(image_root):
     step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
     rows = rows_for_step(step, str(step.image))
@@ -604,6 +625,12 @@ def test_validate_rows_rejects_candidate_counts_out_of_range(image_root):
     rows = rows_for_step(step, str(step.image))
     rows[0]["question"]["criteria"] = {"only": "one candidate"}
     rows[0]["target"] = [1.0]
+    with pytest.raises(ValueError, match="Candidate count out of range"):
+        validate_rows(rows)
+    rows = rows_for_step(step, str(step.image))
+    criteria = {f"c{index}": f"candidate {index}" for index in range(129)}
+    rows[0]["question"]["criteria"] = criteria
+    rows[0]["target"] = [1.0] + [0.0] * 128
     with pytest.raises(ValueError, match="Candidate count out of range"):
         validate_rows(rows)
 

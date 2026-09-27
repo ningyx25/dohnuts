@@ -378,7 +378,7 @@ def isolate(rows: Iterable[dict], audit: Counter, dropped: list[dict[str, str]])
 
 
 def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
-    """Self-check ids, splits, targets, candidate counts, images, group isolation.
+    """Self-check ids, splits, targets, counts, images, group and alias isolation.
 
     Every failure is a `ValueError` naming the offending row, so callers can
     abort with one actionable line. `root` resolves the stored image paths
@@ -387,6 +387,7 @@ def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
     root = Path.cwd() if root is None else root
     seen_ids = set()
     splits_by_group: dict[str, set] = {}
+    splits_by_alias: dict[str, set] = {}
     for row in rows:
         if row["id"] in seen_ids:
             raise ValueError(f"Duplicate row id: {row['id']}")
@@ -408,7 +409,12 @@ def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
             raise ValueError(
                 f"Image is not readable: {row['id']} ({row['image']}): {error}"
             ) from error
+        for alias in row["aliases"]:
+            splits_by_alias.setdefault(alias, set()).add(row["split"])
         splits_by_group.setdefault(row["group"], set()).add(row["split"])
     leaked = [group for group, splits in splits_by_group.items() if len(splits) > 1]
     if leaked:
         raise ValueError(f"Groups span multiple splits: {sorted(leaked)[:5]}")
+    leaked_aliases = [alias for alias, splits in splits_by_alias.items() if len(splits) > 1]
+    if leaked_aliases:
+        raise ValueError(f"Screenshots span multiple splits: {sorted(leaked_aliases)[:5]}")
