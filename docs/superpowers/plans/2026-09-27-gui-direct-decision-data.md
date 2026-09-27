@@ -1302,6 +1302,87 @@ def test_cli_survives_unexpected_failures(image_root, monkeypatch):
     assert entry["stage"] == "parse"
 
 
+def test_cli_reads_every_json_in_a_directory(tmp_path, image_root):
+    (image_root / "b_second.json").write_text(
+        json.dumps(
+            [make_record("002_Gallery_step1", {"action": "wait", "time": 2}, image="other.png")]
+        )
+    )
+    (image_root / "a_first.json").write_text(
+        json.dumps([make_record("001_TaskA_step1", {"action": "wait", "time": 2})])
+    )
+    output = image_root / "out"
+    manifest = prepare.convert(image_root, output)
+    assert [Path(entry["path"]).name for entry in manifest["source"]["files"]] == [
+        "a_first.json",
+        "b_second.json",
+    ]
+    assert sum(entry["n"] for entry in manifest["counts"]) == 4
+
+
+def test_cli_split_files_match_the_manifest(tmp_path, image_root):
+    steps = [
+        make_record("001_TaskA_step1", {"action": "wait", "time": 2}),
+        make_record(
+            "002_Gallery_step1", {"action": "system_button", "button": "Home"}, image="other.png"
+        ),
+    ]
+    output = convert(image_root, steps)
+    manifest = json.loads((output / "manifest.json").read_text())
+    counts = Counter()
+    for split in prepare.SPLITS:
+        path = output / f"{split}.jsonl"
+        assert manifest["sha256"][split] == prepare.digest_file(path)
+        for line in path.read_text().splitlines():
+            row = json.loads(line)
+            assert row["split"] == split
+            counts[row["dataset"], split] += 1
+    assert {f"{dataset}:{split}": n for (dataset, split), n in counts.items()} == {
+        f"{entry['dataset']}:{entry['split']}": entry["n"] for entry in manifest["counts"]
+    }
+
+
+def test_cli_records_isolate_drops_and_shares_image_files(tmp_path, image_root):
+    steps = [
+        make_record("645_BrowserMaze_step1", {"action": "wait", "time": 2}),
+        make_record("demo_step1", {"action": "wait", "time": 2}),
+    ]
+    output = convert(image_root, steps)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert len(manifest["images"]) == 1  # one screenshot file, two records
+    assert manifest["exclusions"] == {
+        "gui_action:train:cross_split_group": 1,
+        "gui_complete:train:cross_split_group": 1,
+    }
+    entries = [json.loads(line) for line in (output / "excluded.jsonl").read_text().splitlines()]
+    assert [entry["stage"] for entry in entries] == ["isolate", "isolate"]
+    assert sum(entry["n"] for entry in manifest["counts"]) == 2
+
+
+def test_cli_refuses_to_run_outside_the_repository_root(tmp_path, image_root, monkeypatch):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit, match="Run from the repository root"):
+        prepare.convert(source, image_root / "out")
+
+
+def test_cli_rejects_inputs_without_step_records(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(SystemExit, match="No step record"):
+        prepare.convert(empty, tmp_path / "out")
+    with pytest.raises(SystemExit, match="No step record"):
+        prepare.convert(tmp_path / "missing", tmp_path / "out")
+
+
+def test_cli_names_unreadable_input_files(tmp_path, image_root):
+    (image_root / "broken.json").write_text("{not json")
+    with pytest.raises(SystemExit, match="Unreadable step record file"):
+        prepare.convert(image_root, image_root / "out")
+
+
 def test_example_data_converts_when_present():
     source = Path(__file__).parents[1] / "example-data" / "raw_data.json"
     if not source.exists():
@@ -1344,6 +1425,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -1370,9 +1452,12 @@ def digest_file(path: Path) -> str:
 
 
 def repository_root() -> Path:
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True
-    )
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as error:
+        raise SystemExit("Run from the dohnuts repository root: no git repository found") from error
     return Path(result.stdout.strip()).resolve()
 
 
@@ -1382,9 +1467,14 @@ def input_files(source: Path) -> list[Path]:
 
 def records(paths: list[Path]):
     for path in paths:
-        data = json.loads(path.read_text())
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"Unreadable step record file: {path} ({type(error).__name__}: {error})"
+            ) from error
         if not isinstance(data, list):
-            raise ValueError(f"Expected a JSON array of step records: {path}")
+            raise SystemExit(f"Unreadable step record file: {path} (expected a JSON array)")
         yield from data
 
 
@@ -1403,6 +1493,8 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     source = Path(source)
     image_root = source if source.is_dir() else source.parent
     paths = input_files(source)
+    if not paths:
+        raise SystemExit(f"No step record *.json found under {source}")
     output.mkdir(parents=True, exist_ok=True)
     audit: Counter = Counter()
     excluded = []
@@ -1459,6 +1551,13 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     with (output / "excluded.jsonl").open("w") as stream:
         for entry in [*excluded, *dropped]:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    empty = [split for split in SPLITS if not any(key[1] == split for key in counts)]
+    if empty:
+        print(
+            json.dumps({"warning": "empty splits: " + ", ".join(empty)}),
+            file=sys.stderr,
+            flush=True,
+        )
     manifest = {
         "schema_version": 1,
         "split_seed": SPLIT_SEED,
@@ -1520,7 +1619,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(52 passed,1 skipped — 若本地存在 `example-data/` 则为 53 passed)
+Expected: PASS(58 passed,1 skipped — 若本地存在 `example-data/` 则为 59 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1633,7 +1732,9 @@ def token_length(processor, row: dict) -> int:
 ```
 
 在 `convert` 中,把以 `for record in records(paths):` 开头的整个循环替换为下面这段
-(唯一新增的是 `if processor is not None:` 分支,其余不变):
+(唯一新增的是 `if processor is not None:` 分支,其余不变;下面按模块级缩进书写以便 ruff
+检查,落盘时要整体缩进 4 格作为 `convert` 的函数体,并且**必须保留**
+`images_written.add(stored.name)` —— 否则 `manifest["images"]` 会永远是空列表):
 
 ```python
 for record in records(paths):
@@ -1664,6 +1765,7 @@ for record in records(paths):
                 )
                 continue
         stored = store_image(step, output)
+        images_written.add(stored.name)
         rows.extend(rows_for_step(step, os.path.relpath(stored, root)))
     except Exception as error:
         # Filesystem and decode failures outside parse_step must not abort a run.
@@ -1705,7 +1807,7 @@ def main(argv=None):
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(55 passed)
+Expected: PASS(60 passed,1 skipped — 若本地存在 `example-data/` 则为 61 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 

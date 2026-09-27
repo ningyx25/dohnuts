@@ -196,6 +196,9 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
   四个输出文件的 sha256。
 - `excluded.jsonl`:每行 `{id, reason, detail, stage}`(解析期 `stage=parse`,隔离期
 `stage=isolate`)。
+- `images` 的语义是**本次运行写入的文件**(按内容去重、先写后筛),因此可能包含其行随后
+  被隔离阶段丢弃的截图;它不是"数据集引用到的图片集合"。某个 split 为空时会向 stderr
+  打一行告警。
 - `images/<sha256>.png`:按内容去重的截图副本。
 
 ## 9. 验证
