@@ -44,6 +44,7 @@
 ```python
 """GUI step conversion: parsing, row derivation, isolation, and CLI output."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -111,7 +112,8 @@ def test_parse_step_reads_state_and_tool_call(image_root):
     assert step.arguments == {"action": "system_button", "button": "Back"}
     assert step.reference["thought"] == "Clear the dialog first."
     assert step.reference["tool_call"]["name"] == "mobile_use"
-    assert len(step.image_sha256) == 64
+    assert step.image == image_root / "shot.png"
+    assert step.image_sha256 == hashlib.sha256((image_root / "shot.png").read_bytes()).hexdigest()
 
 
 def test_parse_step_rejects_unparsable_state(image_root):
@@ -167,6 +169,96 @@ def test_parse_step_rejects_multi_image(image_root):
 def test_parse_step_rejects_missing_image(image_root):
     record = make_record("a_step1", {"action": "wait", "time": 1}, image="gone.png")
     assert parse_step(record, image_root=image_root) == (None, "missing_image")
+
+
+def test_parse_step_rejects_multi_turn_records(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"].append({"role": "assistant", "content": "Thought: again\nAction: y"})
+    assert parse_step(record, image_root=image_root) == (None, "multi_turn")
+
+
+def test_parse_step_keeps_messages_of_other_roles(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"].insert(0, {"role": "system", "content": "tools"})
+    step, reason = parse_step(record, image_root=image_root)
+    assert reason is None
+    assert step.state["user_query"] == QUERY
+
+
+def test_parse_step_rejects_malformed_containers(image_root):
+    assert parse_step("not a record", image_root=image_root) == (None, "unparsable_state")
+    assert parse_step({"messages": "hello", "id": "a_step1"}, image_root=image_root) == (
+        None,
+        "unparsable_state",
+    )
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"] = [record["messages"][1], record["messages"][2], "junk"]
+    assert parse_step(record, image_root=image_root) == (None, "unparsable_state")
+
+
+def test_parse_step_rejects_non_string_action_and_button(image_root):
+    assert parse_step(make_record("a_step1", {"action": ["click"]}), image_root=image_root) == (
+        None,
+        "unknown_action",
+    )
+    assert parse_step(
+        make_record("a_step1", {"action": "system_button", "button": ["Back"]}),
+        image_root=image_root,
+    ) == (None, "invalid_button")
+
+
+def test_parse_step_rejects_malformed_images_container(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["images"] = {"0": "shot.png"}
+    assert parse_step(record, image_root=image_root) == (None, "multi_image")
+    record["images"] = "shot.png"
+    assert parse_step(record, image_root=image_root) == (None, "multi_image")
+    record["images"] = [""]
+    assert parse_step(record, image_root=image_root) == (None, "multi_image")
+
+
+def test_parse_step_rejects_image_paths_outside_the_input_root(image_root):
+    assert parse_step(
+        make_record("a_step1", {"action": "wait", "time": 1}, image="../shot.png"),
+        image_root=image_root,
+    ) == (None, "missing_image")
+    assert parse_step(
+        make_record("a_step1", {"action": "wait", "time": 1}, image="/etc/hostname"),
+        image_root=image_root,
+    ) == (None, "missing_image")
+
+
+def test_parse_step_rejects_undecodable_image(image_root):
+    (image_root / "shot.png").write_bytes(b"not an image")
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    assert parse_step(record, image_root=image_root) == (None, "missing_image")
+
+
+def test_parse_step_prefers_earlier_checks(image_root):
+    record = make_record("a_step1", {"action": "double_click"}, name="computer_use")
+    record["images"] = []
+    assert parse_step(record, image_root=image_root) == (None, "unknown_tool")
+
+
+def test_parse_step_never_raises_on_malformed_records(image_root):
+    malformed = [
+        None,
+        [],
+        "record",
+        {},
+        {"id": "a_step1"},
+        {"id": "a_step1", "messages": None},
+        {"id": "a_step1", "messages": [None, 1, "x"]},
+        {"id": "a_step1", "messages": [{"role": "user", "content": None}]},
+        make_record("a_step1", {"action": {"nested": "dict"}}),
+        make_record(
+            "a_step1", {"action": "swipe", "coordinate": [[1], [2]], "coordinate2": [[3], [4]]}
+        ),
+    ]
+    for record in malformed:
+        step, reason = parse_step(record, image_root=image_root)
+        assert step is None
+        assert isinstance(reason, str)
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -250,6 +342,11 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def image_digest(path: Path) -> str:
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 @dataclass(frozen=True)
 class Step:
     id: str
@@ -286,8 +383,14 @@ def swipe_direction(arguments: dict) -> str | None:
 
 
 def message_content(messages: list, role: str) -> str | None:
+    if not isinstance(messages, list):
+        return None
     for message in messages:
-        if message.get("role") == role and isinstance(message.get("content"), str):
+        if (
+            isinstance(message, dict)
+            and message.get("role") == role
+            and isinstance(message.get("content"), str)
+        ):
             return message["content"]
     return None
 
@@ -302,12 +405,27 @@ def reference(assistant: str, call: dict) -> dict:
 
 
 def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | None]:
-    """Return the parsed step, or (None, exclusion reason)."""
-    user = message_content(record.get("messages") or [], "user")
-    assistant = message_content(record.get("messages") or [], "assistant")
+    """Return the parsed step, or (None, exclusion reason); never raises on bad input."""
+    if not isinstance(record, dict):
+        return None, "unparsable_state"
+    messages = record.get("messages")
+    if not isinstance(messages, list):
+        return None, "unparsable_state"
+    roles = [
+        message.get("role")
+        for message in messages
+        if isinstance(message, dict) and isinstance(message.get("content"), str)
+    ]
+    users, assistants = roles.count("user"), roles.count("assistant")
+    if not users and not assistants:
+        return None, "unparsable_state"
+    if users != 1 or assistants != 1:
+        return None, "multi_turn"
+    user = message_content(messages, "user")
+    assistant = message_content(messages, "assistant")
     if user is None or assistant is None:
         return None, "unparsable_state"
-    match = STATE_PATTERN.match(user.replace("<image>", "").strip())
+    match = STATE_PATTERN.match(re.sub(r"<image>\s*$", "", user).strip())
     if match is None:
         return None, "unparsable_state"
     call_match = TOOL_CALL_PATTERN.search(assistant)
@@ -326,16 +444,25 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
         return None, "missing_id"
     arguments = call["arguments"]
     action = arguments.get("action")
-    if action not in ACTIONS:
+    if not isinstance(action, str) or action not in ACTIONS:
         return None, "unknown_action"
-    if action == "system_button" and arguments.get("button") not in BUTTONS:
+    button = arguments.get("button")
+    if action == "system_button" and (not isinstance(button, str) or button not in BUTTONS):
         return None, "invalid_button"
     if action == "swipe" and swipe_direction(arguments) is None:
         return None, "invalid_swipe"
-    images = record.get("images") or []
-    if len(images) != 1:
+    images = record.get("images")
+    if (
+        not isinstance(images, list)
+        or len(images) != 1
+        or not isinstance(images[0], str)
+        or not images[0]
+    ):
         return None, "multi_image"
-    image = Path(image_root) / str(images[0])
+    relative = Path(images[0])
+    if relative.is_absolute() or ".." in relative.parts:
+        return None, "missing_image"
+    image = Path(image_root) / relative
     if not image.is_file():
         return None, "missing_image"
     try:
@@ -352,7 +479,7 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
                 "task_progress": match.group("progress"),
             },
             image=image,
-            image_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+            image_sha256=image_digest(image),
             arguments=arguments,
             reference=reference(assistant, call),
         ),
@@ -363,7 +490,7 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(11 passed)
+Expected: PASS(20 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -567,7 +694,7 @@ def rows_for_step(step: Step, image_path: str) -> list[dict]:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(16 passed)
+Expected: PASS(25 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -634,21 +761,24 @@ def row_stub(
 
 
 def test_isolate_keeps_highest_priority_partition_for_shared_images():
-    audit = Counter()
+    audit, dropped = Counter(), []
     rows = [
         row_stub("a:action", group="task:a", split="train"),
         row_stub("b:action", group="task:b", split="test"),
     ]
-    kept = list(isolate(rows, audit))
+    kept = list(isolate(rows, audit, dropped))
     assert [row["id"] for row in kept] == ["b:action"]
     assert kept[0]["split"] == "test"
     assert kept[0]["group"] == "task:a"  # rewritten to the union root
     assert sum(audit.values()) == 1
     assert "cross_split_group" in next(iter(audit))
+    assert dropped == [
+        {"id": "a:action", "reason": "cross_split_group", "detail": "", "stage": "isolate"}
+    ]
 
 
 def test_isolate_drops_duplicate_inputs():
-    audit = Counter()
+    audit, dropped = Counter(), []
     question = {"type": "choice", "instructions": "q", "criteria": {"a": "a", "b": "b"}}
     rows = [
         row_stub(
@@ -658,9 +788,11 @@ def test_isolate_drops_duplicate_inputs():
             "a:action", group="task:a", split="train", alias="image-bytes:1", question=question
         ),
     ]
-    kept = list(isolate(rows, audit))
+    kept = list(isolate(rows, audit, dropped))
     assert len(kept) == 1
     assert "duplicate_input" in next(iter(audit))
+    assert dropped[0]["reason"] == "duplicate_input"
+    assert dropped[0]["stage"] == "isolate"
 
 
 def test_validate_rows_rejects_unnormalized_target(image_root):
@@ -717,8 +849,12 @@ from collections.abc import Iterable, Iterator
 在文件末尾追加:
 
 ```python
-def isolate(rows: Iterable[dict], audit: Counter) -> Iterator[dict]:
-    """Union groups sharing image bytes, keep the top partition, drop duplicates."""
+def isolate(rows: Iterable[dict], audit: Counter, dropped: list) -> Iterator[dict]:
+    """Union groups sharing image bytes, keep the top partition, drop duplicates.
+
+    Every dropped row is appended to `dropped` so the CLI can report it in
+    excluded.jsonl, with the same detail as parse-time exclusions.
+    """
     pending = list(rows)
     parents: dict[str, str] = {}
 
@@ -743,6 +879,9 @@ def isolate(rows: Iterable[dict], audit: Counter) -> Iterator[dict]:
         row["group"] = find(row["group"])
         if SPLIT_ORDER[row["split"]] != priority[row["group"]]:
             audit[f"{row['dataset']}:{row['split']}:cross_split_group"] += 1
+            dropped.append(
+                {"id": row["id"], "reason": "cross_split_group", "detail": "", "stage": "isolate"}
+            )
             continue
         key = digest(
             json.dumps(
@@ -751,6 +890,9 @@ def isolate(rows: Iterable[dict], audit: Counter) -> Iterator[dict]:
         )
         if key in seen:
             audit[f"{row['dataset']}:{row['split']}:duplicate_input"] += 1
+            dropped.append(
+                {"id": row["id"], "reason": "duplicate_input", "detail": "", "stage": "isolate"}
+            )
             continue
         seen.add(key)
         yield row
@@ -783,7 +925,7 @@ def validate_rows(rows: Iterable[dict]) -> None:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(23 passed)
+Expected: PASS(32 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -879,10 +1021,10 @@ def test_cli_records_exclusions(image_root):
     steps[1]["messages"][2]["content"] = "Thought: x\nAction: y"
     output = convert(image_root, steps)
     manifest = json.loads((output / "manifest.json").read_text())
-    assert manifest["exclusions"] == {"missing_tool_call": 1}
-    assert json.loads((output / "excluded.jsonl").read_text().splitlines()[0])["id"] == (
-        "002_TaskB_step1"
-    )
+    assert manifest["exclusions"] == {"parse:missing_tool_call": 1}
+    entry = json.loads((output / "excluded.jsonl").read_text().splitlines()[0])
+    assert entry["id"] == "002_TaskB_step1"
+    assert entry["stage"] == "parse"
 
 
 def test_example_data_converts_when_present():
@@ -992,12 +1134,20 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     for record in records(paths):
         step, reason = parse_step(record, image_root=image_root)
         if step is None:
-            audit[reason] += 1
-            excluded.append({"id": record.get("id"), "reason": reason, "detail": ""})
+            audit[f"parse:{reason}"] += 1
+            excluded.append(
+                {
+                    "id": record.get("id") if isinstance(record, dict) else None,
+                    "reason": reason,
+                    "detail": "",
+                    "stage": "parse",
+                }
+            )
             continue
         stored = store_image(step, output)
         rows.extend(rows_for_step(step, os.path.relpath(stored, root)))
-    kept = list(isolate(rows, audit))
+    dropped: list = []
+    kept = list(isolate(rows, audit, dropped))
     validate_rows(kept)
     handles = {split: (output / f"{split}.jsonl").open("w") for split in SPLITS}
     counts: Counter = Counter()
@@ -1013,7 +1163,7 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
         for handle in handles.values():
             handle.close()
     with (output / "excluded.jsonl").open("w") as stream:
-        for entry in excluded:
+        for entry in [*excluded, *dropped]:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
     manifest = {
         "schema_version": 1,
@@ -1070,7 +1220,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(27 passed,1 skipped — 若本地存在 `example-data/` 则为 28 passed)
+Expected: PASS(36 passed,1 skipped — 若本地存在 `example-data/` 则为 37 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1124,12 +1274,13 @@ def test_token_budget_excludes_whole_record(tmp_path, image_root):
     output = image_root / "out"
     manifest = prepare.convert(source, output, processor=StubProcessor())
     assert manifest["token_check"] == "enabled"
-    assert manifest["exclusions"] == {"token_budget": 1}
-    assert sum(entry["n"] for entry in manifest["counts"]) == 2
+    assert manifest["exclusions"] == {"parse:token_budget": 1}
+    assert sum(row["n"] for row in manifest["counts"]) == 2
     assert len(manifest["images"]) == 1
     entry = json.loads((output / "excluded.jsonl").read_text().splitlines()[0])
     assert entry["id"] == "001_TaskA_step1"
     assert entry["reason"] == "token_budget"
+    assert entry["stage"] == "parse"
     assert int(entry["detail"]) > 2048
 
 
@@ -1188,14 +1339,28 @@ def token_length(processor, row: dict) -> int:
 for record in records(paths):
     step, reason = parse_step(record, image_root=image_root)
     if step is None:
-        audit[reason] += 1
-        excluded.append({"id": record.get("id"), "reason": reason, "detail": ""})
+        audit[f"parse:{reason}"] += 1
+        excluded.append(
+            {
+                "id": record.get("id") if isinstance(record, dict) else None,
+                "reason": reason,
+                "detail": "",
+                "stage": "parse",
+            }
+        )
         continue
     if processor is not None:
         lengths = [token_length(processor, row) for row in rows_for_step(step, str(step.image))]
         if any(length > MAX_LENGTH for length in lengths):
-            audit["token_budget"] += 1
-            excluded.append({"id": step.id, "reason": "token_budget", "detail": str(max(lengths))})
+            audit["parse:token_budget"] += 1
+            excluded.append(
+                {
+                    "id": step.id,
+                    "reason": "token_budget",
+                    "detail": str(max(lengths)),
+                    "stage": "parse",
+                }
+            )
             continue
     stored = store_image(step, output)
     rows.extend(rows_for_step(step, os.path.relpath(stored, root)))
@@ -1222,7 +1387,7 @@ def main(argv=None):
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(30 passed)
+Expected: PASS(38 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 

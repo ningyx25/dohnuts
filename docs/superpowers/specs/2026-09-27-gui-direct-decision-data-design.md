@@ -95,37 +95,50 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 
 解析一条原始记录:
 
-1. `state`:取 user 消息,去掉尾部 `<image>` 标记;用一条锚定模板的正则解析(允许
-   query 与 history 自身含换行):
+1. `state`:取 user 消息,只去掉**尾部的** `<image>` 标记(`re.sub(r"<image>\s*$", "", ...)`,
+   文本其余部分逐字保留);用一条锚定模板的正则解析(允许 query 与 history 自身含换行):
    `^The user query:\s*(?P<q>.*?)\nTask progress\s*(?P<p>.*?)\s*$`(DOTALL)。
    `user_query` 为 `The user query:` 之后的文本;`task_progress` 为 `Task progress`
    标签之后的全部文本——含源文本里的 `(You have done ... device):` 引导语与结尾的
    `; .`,不做标点清理或括号剥离(与现有 smoke 行仅差源文本自带的括号)。不匹配 →
    排除 `unparsable_state`。
+   记录必须**恰好含一条 user 与一条 assistant 消息**;条数不为 1(多轮)或结构非法
+   (记录不是对象、`messages` 不是列表、条目不是对象)→ 排除 `multi_turn` / 
+   `unparsable_state`。本版一记录一步,不猜测该取哪一轮。
 2. `tool_call`:取 assistant 消息中**第一个** `<tool_call>...</tool_call>` 块解析 JSON。
    缺失或不是合法 JSON → `missing_tool_call`;`name != "mobile_use"` → `unknown_tool`。
    记录自身必须带非空字符串 `id` → 否则 `missing_id`。
-3. `action` = `arguments.action`,必须在 8 类词表内,否则 `unknown_action`。
-4. `button` 行:仅当 `action == "system_button"`;`arguments.button` 必须在 4 类词表内,
-   否则 `invalid_button`。
+3. `action` = `arguments.action`;必须是非字符串以外都判非法——即**仅当它是 8 类词表中的
+   字符串**(`isinstance(action, str) and action in ACTIONS`)才接受,否则 `unknown_action`。
+   非字符串值(list/dict 等)同样落到 `unknown_action`,不抛异常。
+4. `button` 行:仅当 `action == "system_button"`;`arguments.button` 必须是 4 类词表中的
+   字符串,否则 `invalid_button`(同样先做 `isinstance` 检查)。
 5. `complete` 行:每步都产出;target = `[0.0, 1.0]` 当且仅当 `action == "terminate"`,
    否则 `[1.0, 0.0]`。正例 ≈ 任务数,类不平衡如实报告,不做标签感知采样。
 6. `swipe_dir` 行:仅当 `action == "swipe"`;取 `arguments.coordinate` 与
    `arguments.coordinate2`(各两个数值)。`dx = x2 - x`,`dy = y2 - y`:
    `|dx| > |dy|` → 按 `dx` 符号取 left/right;`|dy| > |dx|` → 按 `dy` 符号取 up/down;
    `|dx| == |dy|` 或坐标缺失/非数值/长度不对 → `invalid_swipe`(平局排除,不猜测)。
-7. `image`:`images` 必须是长度恰为 1 的列表 → 否则 `multi_image`;相对输入目录解析,
-   必须存在且能以 RGB 打开 → 否则 `missing_image`。图片复制到 `<out>/images/<sha256>.png`
-   (按内容去重),行内存**相对仓库根目录**的路径(仓库根 = `git rev-parse
-   --show-toplevel`,转换与训练都必须从仓库根运行,与现有 smoke 行一致);manifest
-   记录 `path_convention`。若基准目录不同则拒绝运行,保证输出确定性。
+7. `image`:`images` 必须是长度恰为 1、且元素为非空字符串的列表 → 否则 `multi_image`;
+   该路径必须是**相对路径**且不含 `..` 上跳(绝对路径或越界一律拒绝,保证输出只由输入
+   内容决定);相对输入目录解析后必须存在且能以 RGB 打开 → 否则 `missing_image`。
+   图片复制到 `<out>/images/<sha256>.png`(按内容去重),行内存**相对仓库根目录**的路径
+   (仓库根 = `git rev-parse --show-toplevel`,转换与训练都必须从仓库根运行,与现有
+   smoke 行一致);manifest 记录 `path_convention`。若基准目录不同则拒绝运行。
 
 ## 6. 排除与审计
 
-排除原因键(写入 `excluded.jsonl` 与 manifest 计数):
-`unparsable_state`、`missing_tool_call`、`unknown_tool`、`missing_id`、`unknown_action`、
-`invalid_button`、`invalid_swipe`、`multi_image`、`missing_image`、
+排除原因(写入 `excluded.jsonl` 与 manifest 计数):
+`unparsable_state`、`multi_turn`、`missing_tool_call`、`unknown_tool`、`missing_id`、
+`unknown_action`、`invalid_button`、`invalid_swipe`、`multi_image`、`missing_image`、
 `token_budget`、`duplicate_input`、`cross_split_group`。
+
+**键名与落盘(统一方案)**:manifest 的 `exclusions` 是扁平计数表,键统一为
+`<来源>:<原因>` —— 解析期与 token 预算为 `parse:<原因>`,隔离期为
+`<dataset>:<split>:<原因>`(沿用 `scripts/prepare_data.py` 的命名习惯)。
+`excluded.jsonl` 每行 `{id, reason, detail, stage}`:`stage` 取 `parse` 或 `isolate`,
+**解析期与隔离期的丢弃都要写入**(隔离期丢弃时 `id` 用该行的 `id`,`reason` 为
+`duplicate_input` 或 `cross_split_group`)。
 
 - 一条原始记录若任一必需问题无法派生,整条记录排除(不产出部分行)——避免"某步只训
   一半问题"造成的分布偏斜;`button`/`swipe_dir` 本就是条件行,其缺失不算失败。
