@@ -673,6 +673,87 @@ def test_cli_survives_unexpected_failures(image_root, monkeypatch):
     assert entry["stage"] == "parse"
 
 
+def test_cli_reads_every_json_in_a_directory(tmp_path, image_root):
+    (image_root / "b_second.json").write_text(
+        json.dumps(
+            [make_record("002_Gallery_step1", {"action": "wait", "time": 2}, image="other.png")]
+        )
+    )
+    (image_root / "a_first.json").write_text(
+        json.dumps([make_record("001_TaskA_step1", {"action": "wait", "time": 2})])
+    )
+    output = image_root / "out"
+    manifest = prepare.convert(image_root, output)
+    assert [Path(entry["path"]).name for entry in manifest["source"]["files"]] == [
+        "a_first.json",
+        "b_second.json",
+    ]
+    assert sum(entry["n"] for entry in manifest["counts"]) == 4
+
+
+def test_cli_split_files_match_the_manifest(tmp_path, image_root):
+    steps = [
+        make_record("001_TaskA_step1", {"action": "wait", "time": 2}),
+        make_record(
+            "002_Gallery_step1", {"action": "system_button", "button": "Home"}, image="other.png"
+        ),
+    ]
+    output = convert(image_root, steps)
+    manifest = json.loads((output / "manifest.json").read_text())
+    counts = Counter()
+    for split in prepare.SPLITS:
+        path = output / f"{split}.jsonl"
+        assert manifest["sha256"][split] == prepare.digest_file(path)
+        for line in path.read_text().splitlines():
+            row = json.loads(line)
+            assert row["split"] == split
+            counts[row["dataset"], split] += 1
+    assert {f"{dataset}:{split}": n for (dataset, split), n in counts.items()} == {
+        f"{entry['dataset']}:{entry['split']}": entry["n"] for entry in manifest["counts"]
+    }
+
+
+def test_cli_records_isolate_drops_and_shares_image_files(tmp_path, image_root):
+    steps = [
+        make_record("645_BrowserMaze_step1", {"action": "wait", "time": 2}),
+        make_record("demo_step1", {"action": "wait", "time": 2}),
+    ]
+    output = convert(image_root, steps)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert len(manifest["images"]) == 1  # one screenshot file, two records
+    assert manifest["exclusions"] == {
+        "gui_action:train:cross_split_group": 1,
+        "gui_complete:train:cross_split_group": 1,
+    }
+    entries = [json.loads(line) for line in (output / "excluded.jsonl").read_text().splitlines()]
+    assert [entry["stage"] for entry in entries] == ["isolate", "isolate"]
+    assert sum(entry["n"] for entry in manifest["counts"]) == 2
+
+
+def test_cli_refuses_to_run_outside_the_repository_root(tmp_path, image_root, monkeypatch):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit, match="Run from the dohnuts repository root"):
+        prepare.convert(source, image_root / "out")
+
+
+def test_cli_rejects_inputs_without_step_records(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(SystemExit, match="No step record"):
+        prepare.convert(empty, tmp_path / "out")
+    with pytest.raises(SystemExit, match="No step record"):
+        prepare.convert(tmp_path / "missing", tmp_path / "out")
+
+
+def test_cli_names_unreadable_input_files(tmp_path, image_root):
+    (image_root / "broken.json").write_text("{not json")
+    with pytest.raises(SystemExit, match="Unreadable step record file"):
+        prepare.convert(image_root, image_root / "out")
+
+
 def test_example_data_converts_when_present():
     source = Path(__file__).parents[1] / "example-data" / "raw_data.json"
     if not source.exists():

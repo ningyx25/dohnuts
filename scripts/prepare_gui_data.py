@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -36,9 +37,12 @@ def digest_file(path: Path) -> str:
 
 
 def repository_root() -> Path:
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True
-    )
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as error:
+        raise SystemExit("Run from the dohnuts repository root: no git repository found") from error
     return Path(result.stdout.strip()).resolve()
 
 
@@ -48,9 +52,14 @@ def input_files(source: Path) -> list[Path]:
 
 def records(paths: list[Path]):
     for path in paths:
-        data = json.loads(path.read_text())
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"Unreadable step record file: {path} ({type(error).__name__}: {error})"
+            ) from error
         if not isinstance(data, list):
-            raise ValueError(f"Expected a JSON array of step records: {path}")
+            raise SystemExit(f"Unreadable step record file: {path} (expected a JSON array)")
         yield from data
 
 
@@ -69,6 +78,8 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     source = Path(source)
     image_root = source if source.is_dir() else source.parent
     paths = input_files(source)
+    if not paths:
+        raise SystemExit(f"No step record *.json found under {source}")
     output.mkdir(parents=True, exist_ok=True)
     audit: Counter = Counter()
     excluded = []
@@ -125,6 +136,13 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     with (output / "excluded.jsonl").open("w") as stream:
         for entry in [*excluded, *dropped]:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    empty = [split for split in SPLITS if not any(key[1] == split for key in counts)]
+    if empty:
+        print(
+            json.dumps({"warning": "empty splits: " + ", ".join(empty)}),
+            file=sys.stderr,
+            flush=True,
+        )
     manifest = {
         "schema_version": 1,
         "split_seed": SPLIT_SEED,
