@@ -411,6 +411,8 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
     messages = record.get("messages")
     if not isinstance(messages, list):
         return None, "unparsable_state"
+    if any(not isinstance(message, dict) for message in messages):
+        return None, "unparsable_state"
     roles = [
         message.get("role")
         for message in messages

@@ -103,8 +103,9 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
    `; .`,不做标点清理或括号剥离(与现有 smoke 行仅差源文本自带的括号)。不匹配 →
    排除 `unparsable_state`。
    记录必须**恰好含一条 user 与一条 assistant 消息**;条数不为 1(多轮)或结构非法
-   (记录不是对象、`messages` 不是列表、条目不是对象)→ 排除 `multi_turn` / 
-   `unparsable_state`。本版一记录一步,不猜测该取哪一轮。
+   (记录不是对象、`messages` 不是列表、条目不是对象)→ 排除 `multi_turn` /
+   `unparsable_state`。条目是对象但 `content` 非字符串时不计入轮次统计;若因此凑不出
+   合法的 user/assistant 轮次,同样 `unparsable_state`。本版一记录一步,不猜测该取哪一轮。
 2. `tool_call`:取 assistant 消息中**第一个** `<tool_call>...</tool_call>` 块解析 JSON。
    缺失或不是合法 JSON → `missing_tool_call`;`name != "mobile_use"` → `unknown_tool`。
    记录自身必须带非空字符串 `id` → 否则 `missing_id`。
