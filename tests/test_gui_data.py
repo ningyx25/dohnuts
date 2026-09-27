@@ -1,6 +1,7 @@
 """GUI step conversion: parsing, row derivation, isolation, and CLI output."""
 
 import hashlib
+import importlib.util
 import itertools
 import json
 from collections import Counter
@@ -552,3 +553,138 @@ def test_validate_rows_rejects_group_across_splits(image_root):
 def test_validate_rows_accepts_converted_rows(image_root):
     step = step_for(image_root, "demo_step1", {"action": "system_button", "button": "Home"})
     validate_rows(rows_for_step(step, str(step.image)))
+
+
+def test_isolate_prefers_the_row_id_reason_over_the_content_reason():
+    audit, dropped = Counter(), []
+    rows = [
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:1"),
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:2"),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["a:action"]
+    assert dropped[0]["detail"] == "row id already seen"
+
+
+def test_validate_rows_rejects_candidate_counts_out_of_range(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    rows[0]["question"]["criteria"] = {"only": "one candidate"}
+    rows[0]["target"] = [1.0]
+    with pytest.raises(ValueError, match="Candidate count out of range"):
+        validate_rows(rows)
+
+
+def load_script():
+    spec = importlib.util.spec_from_file_location(
+        "prepare_gui_data", Path(__file__).parents[1] / "scripts/prepare_gui_data.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+prepare = load_script()
+
+
+def convert(tmp_path, steps):
+    source = tmp_path / "steps.json"
+    source.write_text(json.dumps(steps))
+    output = tmp_path / "out"
+    prepare.main(["--input", str(source), "--output", str(output)])
+    return output
+
+
+def test_cli_writes_splits_manifest_and_images(tmp_path, image_root):
+    steps = [
+        make_record("001_TaskA_step1", {"action": "system_button", "button": "Back"}),
+        make_record(
+            "002_TaskB_step2",
+            {"action": "swipe", "coordinate": [500, 800], "coordinate2": [500, 200]},
+            image="other.png",
+        ),
+    ]
+    output = convert(image_root, steps)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["schema_version"] == 1
+    assert manifest["split_limits"] == [["calibration", 10], ["dev", 20], ["test", 30]]
+    assert manifest["token_check"] == "skipped"
+    assert manifest["exclusions"] == {}
+    assert set(manifest["sha256"]) == set(prepare.SPLITS)
+    assert sum(entry["n"] for entry in manifest["counts"]) == 6
+    assert len(manifest["images"]) == 2
+    assert (output / "excluded.jsonl").read_text() == ""
+    rows = [
+        json.loads(line)
+        for split in prepare.SPLITS
+        for line in (output / f"{split}.jsonl").read_text().splitlines()
+    ]
+    assert len(rows) == 6
+    validate_rows(rows)
+    for row in rows:
+        with Image.open(Path(row["image"])) as image:
+            image.convert("RGB")
+
+
+def test_cli_is_deterministic(tmp_path, image_root):
+    # The four split hashes are reproducible from the same --output: a row's
+    # `image` field embeds the output directory, so a different --output
+    # legitimately produces different bytes.
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    first = convert(image_root, steps)
+    before = json.loads((first / "manifest.json").read_text())
+    second = convert(image_root, steps)
+    assert first == second
+    after = json.loads((second / "manifest.json").read_text())
+    assert after["sha256"] == before["sha256"]
+    assert after["images"] == before["images"]
+
+
+def test_cli_records_exclusions(image_root):
+    steps = [
+        make_record("001_TaskA_step1", {"action": "wait", "time": 2}),
+        make_record("002_TaskB_step1", {"action": "long_press", "coordinate": [1, 2], "time": 1}),
+    ]
+    steps[1]["messages"][2]["content"] = "Thought: x\nAction: y"
+    output = convert(image_root, steps)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["exclusions"] == {"parse:missing_tool_call": 1}
+    entry = json.loads((output / "excluded.jsonl").read_text().splitlines()[0])
+    assert entry["id"] == "002_TaskB_step1"
+    assert entry["stage"] == "parse"
+
+
+def test_cli_survives_unexpected_failures(image_root, monkeypatch):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    output = image_root / "out"
+
+    def explode(record, *, image_root):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(prepare, "parse_step", explode)
+    manifest = prepare.convert(source, output)
+    assert manifest["exclusions"] == {"parse:unexpected": 1}
+    assert sum(row["n"] for row in manifest["counts"]) == 0
+    entry = json.loads((output / "excluded.jsonl").read_text().splitlines()[0])
+    assert entry["reason"] == "unexpected"
+    assert entry["detail"] == "RuntimeError: boom"
+    assert entry["stage"] == "parse"
+
+
+def test_example_data_converts_when_present():
+    source = Path(__file__).parents[1] / "example-data" / "raw_data.json"
+    if not source.exists():
+        pytest.skip("example-data is local-only")
+    step, reason = parse_step(json.loads(source.read_text())[0], image_root=source.parent)
+    assert reason is None
+    rows = rows_for_step(step, "example-data/raw_images/screenshot_step3.png")
+    assert [row["id"] for row in rows] == [
+        "645_BrowserMaze_step3:action",
+        "645_BrowserMaze_step3:button",
+        "645_BrowserMaze_step3:complete",
+    ]
+    assert rows[0]["target"][list(ACTIONS).index("system_button")] == 1.0
+    assert rows[1]["target"][list(BUTTONS).index("Back")] == 1.0
+    assert rows[2]["target"] == [1.0, 0.0]
