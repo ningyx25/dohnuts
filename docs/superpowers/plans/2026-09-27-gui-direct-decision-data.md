@@ -1809,6 +1809,56 @@ def main(argv=None):
 Run: `pdm run pytest tests/test_gui_data.py -q`
 Expected: PASS(60 passed,1 skipped — 若本地存在 `example-data/` 则为 61 passed)
 
+- [ ] **Step 4b: 用真实处理器核对长度估算(必须一致)**
+
+stub 测试只钉住算术形状;训练侧 `DecisionCollator` 在任何一行超预算时直接抛
+`Token budget exceeded`,所以估算必须与真实处理器逐一相等。跑:
+
+```bash
+pdm run python - <<'PY'
+import json
+from pathlib import Path
+
+from PIL import Image
+from transformers import AutoProcessor
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
+from dohnuts.gui_data import parse_step, rows_for_step
+from dohnuts.predictor import render, render_question
+from dohnuts.recipe import IMAGE_PIXELS
+
+processor = AutoProcessor.from_pretrained("Qwen/Qwen3.5-0.8B", local_files_only=True)
+factor = processor.image_processor.patch_size * processor.image_processor.merge_size
+record = json.loads(Path("example-data/raw_data.json").read_text())[0]
+step, reason = parse_step(record, image_root=Path("example-data"))
+assert reason is None
+row = rows_for_step(step, "example-data/raw_images/screenshot_step3.png")[0]
+prompt, _ = render_question(render(row["state"]), row["question"], has_image=True)
+text_tokens = len(processor.tokenizer(prompt, truncation=False)["input_ids"])
+with Image.open(row["image"]) as image:
+    width, height = smart_resize(
+        image.height, image.width, factor=factor, min_pixels=IMAGE_PIXELS, max_pixels=IMAGE_PIXELS
+    )[::-1]
+estimated = text_tokens + (height // factor) * (width // factor) - 1
+with Image.open(row["image"]) as image:
+    inputs = processor.image_processor(
+        images=[image.convert("RGB")],
+        return_tensors="pt",
+        size={"shortest_edge": IMAGE_PIXELS, "longest_edge": IMAGE_PIXELS},
+    )
+replacement = processor.replace_image_token(inputs, 0)
+expanded = len(
+    processor.tokenizer(prompt.replace(processor.image_token, replacement, 1))["input_ids"]
+)
+print({"estimated": estimated, "training_equivalent": expanded})
+assert estimated == expanded, "converter token estimate disagrees with the training processor"
+PY
+```
+
+Expected(本机 `Qwen/Qwen3.5-0.8B` + example-data,已预先验证):`{'estimated': 473,
+'training_equivalent': 473}`。其它截图数值不同,但两者必须相等。真实处理器是
+`patch_size=16`、`merge_size=2`(factor 32),与 stub 测试里的 factor 28 无关。
+
 - [ ] **Step 5: 格式化、lint、typecheck**
 
 Run: `pdm run format && pdm run lint && pdm run typecheck`
