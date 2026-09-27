@@ -215,3 +215,87 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
         ),
         None,
     )
+
+
+def one_hot(width: int, index: int) -> list[float]:
+    return [float(position == index) for position in range(width)]
+
+
+def split_for(group: str) -> str:
+    bucket = int(digest(f"{SPLIT_SEED}:{group}")[:8], 16) % 100
+    for name, limit in SPLIT_LIMITS:
+        if bucket < limit:
+            return name
+    return "train"
+
+
+def rows_for_step(step: Step, image_path: str) -> list[dict]:
+    """One action row per step, plus button, complete, and swipe_dir rows."""
+    arguments = step.arguments
+    action = arguments["action"]
+
+    def row(name: str, question: dict, target: list[float]) -> dict:
+        return {
+            "id": f"{step.id}:{name}",
+            "dataset": DATASETS[name],
+            "group": step.group,
+            "aliases": ["image-bytes:" + step.image_sha256],
+            "split": split_for(step.group),
+            "state": step.state,
+            "image": image_path,
+            "question": question,
+            "target": target,
+            "reference": step.reference,
+        }
+
+    rows = [
+        row(
+            "action",
+            {
+                "type": "choice",
+                "instructions": INSTRUCTIONS["action"],
+                "criteria": dict(ACTIONS),
+            },
+            one_hot(len(ACTIONS), list(ACTIONS).index(action)),
+        )
+    ]
+    if action == "system_button":
+        buttons = list(BUTTONS)
+        rows.append(
+            row(
+                "button",
+                {
+                    "type": "choice",
+                    "instructions": INSTRUCTIONS["button"],
+                    "criteria": dict(BUTTONS),
+                },
+                one_hot(len(buttons), buttons.index(arguments["button"])),
+            )
+        )
+    rows.append(
+        row(
+            "complete",
+            {
+                "type": "noul",
+                "instructions": INSTRUCTIONS["complete"],
+                "criteria": dict(COMPLETE_CRITERIA),
+            },
+            [0.0, 1.0] if action == "terminate" else [1.0, 0.0],
+        )
+    )
+    if action == "swipe":
+        directions = list(SWIPE_DIRECTIONS)
+        direction = swipe_direction(arguments)
+        assert direction is not None  # parse_step rejects invalid swipes
+        rows.append(
+            row(
+                "swipe_dir",
+                {
+                    "type": "choice",
+                    "instructions": INSTRUCTIONS["swipe_dir"],
+                    "criteria": dict(SWIPE_DIRECTIONS),
+                },
+                one_hot(len(directions), directions.index(direction)),
+            )
+        )
+    return rows
