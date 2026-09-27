@@ -1,6 +1,6 @@
 """Deterministic conversion of GUI step records into Dohnuts decision rows.
 
-One step record yields two to four rows that share state and image. Rows are
+One step record yields two or three rows that share state and image. Rows are
 built only from the ground-truth tool call: no candidate list, element tree, or
 model output is required. See
 docs/superpowers/specs/2026-09-27-gui-direct-decision-data-design.md.
