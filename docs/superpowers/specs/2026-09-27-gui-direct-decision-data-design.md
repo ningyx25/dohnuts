@@ -230,7 +230,7 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 
 ## 10. 实现落点
 
-- `src/dohnuts/gui_data.py`:纯函数核心(解析、派生、split、并查隔离、去重),
+- `src/dohnuts/gui_data.py`:纯函数核心(解析、派生、split、隔离(截图逐记录消歧)、去重),
   只依赖标准库与 PIL;可被测试直接导入。
 - `scripts/prepare_gui_data.py`:CLI 外壳(`--input`、`--output`、`--model`、
   `--no-token-check`),输入发现(`*.json`,文件名排序保证确定性)、写文件与 manifest。

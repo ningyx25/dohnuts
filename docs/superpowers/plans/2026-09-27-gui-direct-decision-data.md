@@ -24,7 +24,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/dohnuts/gui_data.py`(新建) | 词表与规则常量、`Step` 解析(`parse_step`)、行派生(`rows_for_step`)、分桶(`split_for`)、并查隔离(`isolate`)、自检(`validate_rows`) |
+| `src/dohnuts/gui_data.py`(新建) | 词表与规则常量、`Step` 解析(`parse_step`)、行派生(`rows_for_step`)、分桶(`split_for`)、隔离(截图逐记录消歧,`isolate`)、自检(`validate_rows`) |
 | `scripts/prepare_gui_data.py`(新建) | CLI:输入发现、图像按内容哈希复制、token 预算检查、写四个 jsonl + `excluded.jsonl` + `manifest.json` |
 | `tests/test_gui_data.py`(新建) | 合成 fixture 驱动的单元测试与 CLI 集成测试(CI 可跑,不依赖被 gitignore 的 `example-data/`) |
 | `docs/data-and-evaluation.md`(修改) | 追加 "GUI step conversion" 小节 |
@@ -809,7 +809,7 @@ git commit -m "Derive GUI decision rows and task-hashed splits" -- src/dohnuts/g
 
 ---
 
-## Task 3: 并查隔离与自检(`isolate`、`validate_rows`)
+## Task 3: 隔离与自检(`isolate`、`validate_rows`)
 
 **Files:**
 - Modify: `src/dohnuts/gui_data.py`(追加函数 + `Counter`/`Iterable` 导入)
@@ -2193,8 +2193,9 @@ PY
 Expected: `480 steps`
 
 注意:每个合成任务必须用**不同的图片字节**(脚本按 task/index 变化颜色正是为此)。
-若所有任务共用同一张截图,并查会把它们并成一个组、只保留最高优先级分区,四个 split 里
-会有三个为空,后面的"四个 split 均非空"断言会以与 bug 无关的原因失败。
+若所有任务共用同一张截图,逐记录消歧会把除最高优先级 split 之外的记录全部按
+`cross_split_group` 丢弃,四个 split 里会有三个为空,后面的"四个 split 均非空"断言会以
+与 bug 无关的原因失败。
 
 - [ ] **Step 2: 转换并检查每个 split 非空**
 
@@ -2344,11 +2345,11 @@ PY
 1. `gui_complete` 在 dev / calibration / test 每个 split 都非空,且 calibration 的
    `gui_action`(choice)与 `gui_complete`(noul)行数各 ≥ 10,否则 `fit_temperatures`
    会保持对应类型温度 1.0(不报错,但失去校准)。
-2. 排除计数逐条可解释。**重点看 `*:cross_split_group`**:截图字节相同的步骤会被并查
-   成一个隔离组、只保留最高优先级 split,其余按此原因丢弃——若该计数占输入比例很大
-   (真实数据里首屏/锁屏/初始状态重复很常见),说明大量任务被合并,必须用
-   `excluded.jsonl` 里 `stage=isolate` 的行 id 追查受影响的任务,再决定是接受损失还是
-   先剔除这些重复截图步骤(后者会改变输出哈希,必须在训练前做)。
+2. 排除计数逐条可解释。**重点看 `*:cross_split_group`**:截图字节相同的记录里,只有
+   携带该截图最高优先级 split 的那些保留,其余按此原因丢弃(任务的其他记录不受影响)
+   ——真实数据里首屏/锁屏/初始状态重复很常见,该计数通常非零;用 `excluded.jsonl` 里
+   `stage=isolate` 的行 id 追查具体丢的是哪些步骤,确认丢的是"重复截图那一行"而不是
+   整段轨迹。若某个 split 因此变空,stderr 会给出 `empty splits` 告警。
 3. `action_classes` 各 split 的类别分布与整体相近;若某 split 缺关键类别(如
    `system_button`),记录在案并考虑扩大数据或调整分桶比例常量 `SPLIT_LIMITS`。
 4. `token_check` 应为 `"enabled"`(即确实传了 `--model`);若存在 `parse:token_budget`
