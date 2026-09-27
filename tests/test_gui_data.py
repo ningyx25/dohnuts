@@ -769,3 +769,51 @@ def test_example_data_converts_when_present():
     assert rows[0]["target"][list(ACTIONS).index("system_button")] == 1.0
     assert rows[1]["target"][list(BUTTONS).index("Back")] == 1.0
     assert rows[2]["target"] == [1.0, 0.0]
+
+
+class StubImageProcessor:
+    patch_size = 14
+    merge_size = 2
+
+
+class StubTokenizer:
+    def __call__(self, text, truncation=False):
+        return {"input_ids": list(range(len(text.split())))}
+
+
+class StubProcessor:
+    image_processor = StubImageProcessor()
+    tokenizer = StubTokenizer()
+
+
+def test_token_budget_excludes_whole_record(tmp_path, image_root):
+    long_progress = "(You have done the following operation on the current device): " + " ".join(
+        ["step"] * 5000
+    )
+    over_budget = make_record("001_TaskA_step1", {"action": "wait", "time": 2})
+    over_budget["messages"][1]["content"] = user_content(progress=long_progress)
+    fine = make_record("002_TaskB_step1", {"action": "wait", "time": 2}, image="other.png")
+    source = image_root / "steps.json"
+    source.write_text(json.dumps([over_budget, fine]))
+    output = image_root / "out"
+    manifest = prepare.convert(source, output, processor=StubProcessor())
+    assert manifest["token_check"] == "enabled"
+    assert manifest["exclusions"] == {"parse:token_budget": 1}
+    assert sum(row["n"] for row in manifest["counts"]) == 2
+    assert len(manifest["images"]) == 1
+    entry = json.loads((output / "excluded.jsonl").read_text().splitlines()[0])
+    assert entry["id"] == "001_TaskA_step1"
+    assert entry["reason"] == "token_budget"
+    assert entry["stage"] == "parse"
+    assert int(entry["detail"]) > 2048
+
+
+def test_token_length_counts_words_and_image_patches(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    row = rows_for_step(step, str(step.image))[0]
+    prompt, _ = prepare.render_question(
+        prepare.render(row["state"]), row["question"], has_image=True
+    )
+    # An 8x8 screenshot resizes to 532x532: 19x19 = 361 patches at factor 28, minus
+    # the single placeholder token already present in the rendered prompt.
+    assert prepare.token_length(StubProcessor(), row) == len(prompt.split()) + 360

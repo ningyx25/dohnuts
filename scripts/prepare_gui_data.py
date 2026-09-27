@@ -14,6 +14,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from PIL import Image
+from transformers import AutoProcessor
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
 from dohnuts.gui_data import (
     ACTIONS,
     BUTTONS,
@@ -27,6 +31,8 @@ from dohnuts.gui_data import (
     rows_for_step,
     validate_rows,
 )
+from dohnuts.predictor import render, render_question
+from dohnuts.recipe import IMAGE_PIXELS, MAX_LENGTH
 
 SPLITS = ["train", "dev", "calibration", "test"]
 
@@ -71,6 +77,22 @@ def store_image(step, output: Path) -> Path:
     return target
 
 
+def token_length(processor, row: dict) -> int:
+    """Rendered tokens plus expanded image placeholders, as prepare_data.filter_data counts."""
+    prompt, _ = render_question(render(row["state"]), row["question"], has_image=True)
+    length = len(processor.tokenizer(prompt, truncation=False)["input_ids"])
+    factor = processor.image_processor.patch_size * processor.image_processor.merge_size
+    with Image.open(row["image"]) as image:
+        width, height = smart_resize(
+            image.height,
+            image.width,
+            factor=factor,
+            min_pixels=IMAGE_PIXELS,
+            max_pixels=IMAGE_PIXELS,
+        )[::-1]
+    return length + (height // factor) * (width // factor) - 1
+
+
 def convert(source: Path, output: Path, *, processor=None) -> dict:
     root = repository_root()
     if Path.cwd().resolve() != root:
@@ -99,6 +121,21 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
                     }
                 )
                 continue
+            if processor is not None:
+                lengths = [
+                    token_length(processor, row) for row in rows_for_step(step, str(step.image))
+                ]
+                if any(length > MAX_LENGTH for length in lengths):
+                    audit["parse:token_budget"] += 1
+                    excluded.append(
+                        {
+                            "id": step.id,
+                            "reason": "token_budget",
+                            "detail": str(max(lengths)),
+                            "stage": "parse",
+                        }
+                    )
+                    continue
             stored = store_image(step, output)
             images_written.add(stored.name)
             rows.extend(rows_for_step(step, os.path.relpath(stored, root)))
@@ -191,7 +228,10 @@ def main(argv=None):
     )
     parser.add_argument("--no-token-check", dest="token_check", action="store_false")
     args = parser.parse_args(argv)
-    convert(args.input, args.output)
+    processor = None
+    if args.model is not None and args.token_check:
+        processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
+    convert(args.input, args.output, processor=processor)
 
 
 if __name__ == "__main__":
