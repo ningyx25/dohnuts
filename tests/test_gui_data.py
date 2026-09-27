@@ -196,6 +196,30 @@ def test_parse_step_prefers_earlier_checks(image_root):
     assert parse_step(record, image_root=image_root) == (None, "unknown_tool")
 
 
+def test_parse_step_rejects_overlong_image_names(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1}, image="x" * 300 + ".png")
+    assert parse_step(record, image_root=image_root) == (None, "missing_image")
+
+
+def test_parse_step_rejects_invalid_tool_call_bodies(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"][2]["content"] = "Thought: x\nAction: y\n<tool_call>\nnot json\n</tool_call>"
+    assert parse_step(record, image_root=image_root) == (None, "missing_tool_call")
+    record["messages"][2]["content"] = (
+        'Thought: x\nAction: y\n<tool_call>\n{"name": "mobile_use"}\n</tool_call>'
+    )
+    assert parse_step(record, image_root=image_root) == (None, "missing_tool_call")
+
+
+def test_parse_step_maps_missing_role_to_multi_turn(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"][1]["content"] = None
+    assert parse_step(record, image_root=image_root) == (None, "multi_turn")
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    record["messages"][2]["content"] = 42
+    assert parse_step(record, image_root=image_root) == (None, "multi_turn")
+
+
 def test_parse_step_never_raises_on_malformed_records(image_root):
     malformed = [
         None,

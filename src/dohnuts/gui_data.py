@@ -162,7 +162,7 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
         return None, "missing_tool_call"
     try:
         call = json.loads(call_match.group("call"))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         return None, "missing_tool_call"
     if not isinstance(call, dict) or not isinstance(call.get("arguments"), dict):
         return None, "missing_tool_call"
@@ -192,12 +192,13 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
     if relative.is_absolute() or ".." in relative.parts:
         return None, "missing_image"
     image = Path(image_root) / relative
-    if not image.is_file():
-        return None, "missing_image"
     try:
+        if not image.is_file():
+            return None, "missing_image"
         with Image.open(image) as handle:
             handle.convert("RGB")
-    except OSError:
+        image_sha256 = image_digest(image)
+    except (OSError, ValueError, Image.DecompressionBombError):
         return None, "missing_image"
     return (
         Step(
@@ -208,7 +209,7 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
                 "task_progress": match.group("progress"),
             },
             image=image,
-            image_sha256=image_digest(image),
+            image_sha256=image_sha256,
             arguments=arguments,
             reference=reference(assistant, call),
         ),
