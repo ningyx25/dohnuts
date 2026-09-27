@@ -779,6 +779,7 @@ git commit -m "Derive GUI decision rows and task-hashed splits" -- src/dohnuts/g
 先改顶部 import 区块,把文件开头的 import 部分整体替换为:
 
 ```python
+import hashlib
 import json
 from collections import Counter
 from pathlib import Path
