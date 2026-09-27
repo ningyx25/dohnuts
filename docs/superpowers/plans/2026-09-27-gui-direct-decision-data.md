@@ -2203,7 +2203,10 @@ run = Path("/tmp/gui-smoke/run")
 report = json.loads((run / "evaluation.json").read_text())
 print("temperatures:", json.loads((run / "temperatures.json").read_text()))
 print("selected_step:", report["selected_step"])
-print("calibrated:", {k: round(v["accuracy"], 3) for k, v in report["calibrated"].items()})
+print(
+    "calibrated:",
+    {k: round(v["accuracy"], 3) for k, v in report["calibrated"].items() if isinstance(v, dict)},
+)
 print("slices:", [(s["primitive"], s["candidates"], round(s["accuracy"], 3)) for s in report["primitive_candidate_slices"]])
 PY
 ```
