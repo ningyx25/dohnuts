@@ -89,7 +89,9 @@ class Step:
 
 
 def task_id(step_id: str) -> str:
-    return re.sub(r"_step\d+$", "", step_id) or step_id
+    # Trailing provenance markers after the step number belong to the batch, not
+    # the task: 42_App_step5__from0208_batch and 42_App_step5 must share a group.
+    return re.sub(r"_step\d+.*$", "", step_id) or step_id
 
 
 def point(value: object) -> tuple[float, float] | None:

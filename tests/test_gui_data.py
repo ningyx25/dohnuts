@@ -263,6 +263,15 @@ def test_parse_step_rejects_deeply_nested_tool_calls(image_root):
     assert parse_step(record, image_root=image_root) == (None, "missing_tool_call")
 
 
+def test_parse_step_groups_steps_with_provenance_suffixes(image_root):
+    record = make_record(
+        "1001_MarkorEditNote_step13__from0208_qwen3vl_supple_new", {"action": "wait", "time": 1}
+    )
+    step, reason = parse_step(record, image_root=image_root)
+    assert reason is None
+    assert step.group == "task:1001_MarkorEditNote"
+
+
 def test_parse_step_rejects_non_finite_swipe_coordinates(image_root):
     record = make_record(
         "a_step1", {"action": "swipe", "coordinate": [float("nan"), 0], "coordinate2": [1, 1]}
