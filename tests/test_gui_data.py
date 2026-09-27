@@ -220,6 +220,37 @@ def test_parse_step_maps_missing_role_to_multi_turn(image_root):
     assert parse_step(record, image_root=image_root) == (None, "multi_turn")
 
 
+def test_parse_step_pins_empty_turn_reason(image_root):
+    record = {"id": "a_step1", "messages": [{"role": "user", "content": None}]}
+    assert parse_step(record, image_root=image_root) == (None, "unparsable_state")
+
+
+def test_parse_step_rejects_decompression_bombs(image_root):
+    import struct
+    import zlib
+
+    def chunk(kind, payload):
+        body = kind + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body))
+
+    header = struct.pack(">IIBBBBB", 50000, 50000, 8, 2, 0, 0, 0)
+    (image_root / "shot.png").write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(b"\x00" * 10))
+        + chunk(b"IEND", b"")
+    )
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    assert parse_step(record, image_root=image_root) == (None, "missing_image")
+
+
+def test_parse_step_rejects_deeply_nested_tool_calls(image_root):
+    record = make_record("a_step1", {"action": "wait", "time": 1})
+    nested = "[" * 200_000 + "]" * 200_000
+    record["messages"][2]["content"] = f"Thought: x\nAction: y\n<tool_call>\n{nested}\n</tool_call>"
+    assert parse_step(record, image_root=image_root) == (None, "missing_tool_call")
+
+
 def test_parse_step_never_raises_on_malformed_records(image_root):
     malformed = [
         None,
