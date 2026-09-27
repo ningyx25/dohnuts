@@ -869,6 +869,12 @@ def test_isolate_drops_duplicate_inputs():
     assert dropped[0]["stage"] == "isolate"
 
 
+def test_swipe_direction_vertical_axis(image_root):
+    arguments = {"action": "swipe", "coordinate": [500, 200], "coordinate2": [500, 800]}
+    rows = rows_for_step(step_for(image_root, "demo_step1", arguments), "img.png")
+    assert rows[-1]["target"][list(SWIPE_DIRECTIONS).index("down")] == 1.0
+
+
 def test_isolate_group_naming_is_order_independent():
     audit, dropped = Counter(), []
     rows = [
@@ -970,13 +976,20 @@ def isolate(rows: Iterable[dict], audit: Counter, dropped: list) -> Iterator[dic
             key = parents[key]
         return key
 
+    # Aliases never become union nodes: they only record which group a screenshot
+    # was first seen with, so a merged group keeps a task-group name instead of an
+    # image hash.
+    first_group: dict[str, str] = {}
     for row in pending:
         for alias in row["aliases"]:
-            left, right = find(row["group"]), find(alias)
-            if left != right:
-                # Name a merged group after its lexicographically smallest member
-                # so the result never depends on the input order of the shards.
-                parents[max(left, right)] = min(left, right)
+            if alias in first_group:
+                left, right = find(first_group[alias]), find(row["group"])
+                if left != right:
+                    # Name a merged group after its lexicographically smallest
+                    # member so the result never depends on input shard order.
+                    parents[max(left, right)] = min(left, right)
+            else:
+                first_group[alias] = row["group"]
     priority: dict[str, int] = {}
     for row in pending:
         root = find(row["group"])
@@ -1046,7 +1059,7 @@ def validate_rows(rows: Iterable[dict]) -> None:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(40 passed)
+Expected: PASS(41 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1376,7 +1389,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(44 passed,1 skipped — 若本地存在 `example-data/` 则为 45 passed)
+Expected: PASS(45 passed,1 skipped — 若本地存在 `example-data/` 则为 46 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1556,7 +1569,7 @@ def main(argv=None):
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(47 passed)
+Expected: PASS(48 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
