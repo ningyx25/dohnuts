@@ -163,3 +163,69 @@ rows. The per-group training cap yields 143,238 eligible training rows.
 fingerprints in `data/manifests/evaluation-text-sha256.json` are exclusion inputs,
 never training examples. `scripts/prepare_data.py` builds this mixture without
 requiring a trained checkpoint or a previous training run.
+
+## GUI step conversion
+
+`scripts/prepare_gui_data.py` converts step-level GUI agent trajectories (user
+query, completed-step history, screenshot, and the ground-truth tool call) into
+decision rows. It needs no candidate list, element tree, or model output: every
+row follows from the tool call alone.
+
+One step yields two to four rows that share state and image, one question per
+row:
+
+| Question | Type | Candidates | Target |
+| --- | --- | --- | --- |
+| `action` | choice | click, long_press, swipe, type, answer, system_button, wait, terminate | the tool call's action |
+| `button` | choice | Back, Home, Menu, Enter | the pressed button (system_button steps only) |
+| `complete` | noul | false, true | whether the next action terminates the task |
+| `swipe_dir` | choice | up, down, left, right | dominant axis of the swipe (swipe steps only) |
+
+Fixed rules:
+
+- `state` keeps the source `user_query` and `task_progress` verbatim; thought and
+  action text are kept in `reference` for provenance and never enter model input.
+  Records must hold exactly one user and one assistant message; anything else is
+  excluded instead of guessed.
+- Task ids strip the `_step<N>` suffix and form the isolation group. Split
+  buckets are `int(sha256("doh-gui-split-2026:" + group)[:8], 16) % 100`:
+  calibration < 10, dev < 20, test < 30, train otherwise. Image bytes join groups
+  before the split priority (`train < calibration < dev < test`) is resolved, and
+  a merged group keeps the lexicographically smallest task name (aliases never
+  become group names). Task groups never straddle splits.
+- Dataset names split by question (`gui_action`, `gui_button`, `gui_complete`,
+  `gui_swipe`) so macro-F1 stays within one fixed candidate vocabulary. The
+  uniform dataset sampler therefore gives each question family roughly equal
+  weight, which relatively upweights button and swipe rows.
+- Swipes whose axes tie on absolute delta are excluded instead of guessed.
+- The token budget is checked when `--model` names a local snapshot (skip with
+  `--no-token-check`). The estimate mirrors the training collator: rendered text
+  tokens plus the expanded image placeholders at `IMAGE_PIXELS`. Over-budget rows
+  are excluded whole, before their screenshot is stored.
+- Exclusions are audited, never silent. The parse stage drops whole records
+  (`unparsable_state`, `multi_turn`, `missing_tool_call`, `unknown_tool`,
+  `missing_id`, `unknown_action`, `invalid_button`, `invalid_swipe`,
+  `multi_image`, `missing_image`, `token_budget`, `unexpected`); the isolate
+  stage drops rows (`cross_split_group`, `duplicate_input`). Both land in
+  `excluded.jsonl` with `{id, reason, detail, stage}` and in the manifest's
+  `exclusions` counts (`parse:<reason>` and `<dataset>:<split>:<reason>`).
+- Manifest `images` lists the files this run wrote (content-deduplicated); an
+  image can outlive rows that were later dropped by isolation, so it is not the
+  set of images the dataset references. Re-running into the same `--output`
+  reproduces the same four hashes; a different `--output` legitimately changes
+  them because rows embed the stored image path.
+
+Coordinates and typed text are payloads for the orchestrator, not decisions:
+this model answers what to do, which button to press, in which direction to
+swipe, and whether to stop. Region detection stays outside the converter.
+
+Known limits: only one screenshot per step; symbol links inside the input root
+can still resolve outside it; tasks that share a screen with another task are not
+detected as near-duplicates.
+
+```bash
+# Run from the repository root. --input is your own directory of step-record
+# *.json arrays; --model points at a local snapshot, or the token check is skipped.
+pdm run python scripts/prepare_gui_data.py \
+  --input data/raw/gui --output data/processed/gui-v1 --model Qwen/Qwen3.5-0.8B
+```
