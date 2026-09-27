@@ -1,6 +1,7 @@
 """GUI step conversion: parsing, row derivation, isolation, and CLI output."""
 
 import hashlib
+import itertools
 import json
 from collections import Counter
 from pathlib import Path
@@ -353,7 +354,14 @@ def test_split_for_is_stable_and_covers_partitions():
 
 
 def row_stub(
-    uid, *, group, split, alias="image-bytes:deadbeef", dataset="gui_action", question=None
+    uid,
+    *,
+    group,
+    split,
+    alias="image-bytes:deadbeef",
+    dataset="gui_action",
+    question=None,
+    state=None,
 ):
     return {
         "id": uid,
@@ -361,12 +369,64 @@ def row_stub(
         "group": group,
         "aliases": [alias],
         "split": split,
-        "state": {"user_query": uid},
+        "state": {"user_query": uid} if state is None else state,
         "image": "img.png",
         "question": question
         or {"type": "choice", "instructions": "q", "criteria": {"a": "a", "b": "b"}},
         "target": [1.0, 0.0],
     }
+
+
+def collision_rows():
+    """One shared-image pair across splits plus three independent groups."""
+    return [
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:1"),
+        row_stub("b:action", group="task:b", split="test", alias="image-bytes:1"),
+        row_stub("c:action", group="task:c", split="test", alias="image-bytes:2"),
+        row_stub("d:action", group="task:d", split="dev", alias="image-bytes:3"),
+        row_stub("e:action", group="task:e", split="calibration", alias="image-bytes:4"),
+    ]
+
+
+def test_isolate_drops_content_duplicates_with_distinct_ids():
+    audit, dropped = Counter(), []
+    state = {"user_query": "same"}
+    rows = [
+        row_stub("a:complete", group="task:a", split="train", alias="image-bytes:1", state=state),
+        row_stub("b:complete", group="task:a", split="train", alias="image-bytes:2", state=state),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["a:complete"]
+    assert dropped == [
+        {"id": "b:complete", "reason": "duplicate_input", "detail": "", "stage": "isolate"}
+    ]
+
+
+def test_isolate_accounts_for_every_input_row():
+    audit, dropped = Counter(), []
+    rows = collision_rows()
+    kept = list(isolate(rows, audit, dropped))
+    assert Counter(row["id"] for row in kept) + Counter(entry["id"] for entry in dropped) == (
+        Counter(row["id"] for row in rows)
+    )
+    assert sum(audit.values()) == len(dropped)
+    rerun_audit, rerun_dropped = Counter(), []
+    assert [row["id"] for row in isolate(kept, rerun_audit, rerun_dropped)] == [
+        row["id"] for row in kept
+    ]
+    assert not rerun_dropped
+    assert not rerun_audit
+
+
+def test_isolate_is_invariant_under_input_permutation():
+    fingerprints = set()
+    for order in itertools.permutations(range(5)):
+        rows = collision_rows()
+        kept = isolate([rows[index] for index in order], Counter(), [])
+        fingerprints.add(
+            json.dumps(sorted([[row["id"], row["group"], row["split"]] for row in kept]))
+        )
+    assert len(fingerprints) == 1
 
 
 def test_isolate_keeps_highest_priority_partition_for_shared_images():
@@ -462,6 +522,22 @@ def test_validate_rows_rejects_duplicate_ids(image_root):
     rows = rows_for_step(step, str(step.image))
     rows[0]["id"] = rows[1]["id"]
     with pytest.raises(ValueError, match="Duplicate row id"):
+        validate_rows(rows)
+
+
+def test_validate_rows_rejects_unknown_split(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    rows[0]["split"] = "validation"
+    with pytest.raises(ValueError, match="Unknown split"):
+        validate_rows(rows)
+
+
+def test_validate_rows_reports_unreadable_images(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    rows[0]["image"] = "does-not-exist.png"
+    with pytest.raises(ValueError, match="Image is not readable: demo_step1:action"):
         validate_rows(rows)
 
 

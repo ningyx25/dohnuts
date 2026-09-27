@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -313,11 +313,18 @@ def rows_for_step(step: Step, image_path: str) -> list[dict]:
     return rows
 
 
-def isolate(rows: Iterable[dict], audit: Counter, dropped: list) -> Iterator[dict]:
+def isolate(rows: Iterable[dict], audit: Counter, dropped: list[dict[str, str]]) -> list[dict]:
     """Union groups sharing image bytes, keep the top partition, drop duplicates.
 
-    Every dropped row is appended to `dropped` so the CLI can report it in
-    excluded.jsonl, with the same detail as parse-time exclusions.
+    Returns the kept rows and appends one `{id, reason, detail, stage}` entry per
+    dropped row to `dropped`, so the CLI can report both in excluded.jsonl.
+
+    This mutates every input row (dropped ones included): `row["group"]` becomes
+    the canonical union root, and deduplication deliberately runs after that
+    merge so merged tasks dedup against each other. Reason precedence is
+    cross-split, then duplicate row id, then duplicate content. Among mutually
+    duplicate rows the first in input order survives, so callers must pass rows
+    in a fixed order (the CLI sorts its input files).
     """
     pending = list(rows)
     parents: dict[str, str] = {}
@@ -347,7 +354,7 @@ def isolate(rows: Iterable[dict], audit: Counter, dropped: list) -> Iterator[dic
     for row in pending:
         root = find(row["group"])
         priority[root] = max(priority.get(root, 0), SPLIT_ORDER[row["split"]])
-    seen, seen_ids = set(), set()
+    seen, seen_ids, kept = set(), set(), []
     for row in pending:
         row["group"] = find(row["group"])
         if SPLIT_ORDER[row["split"]] != priority[row["group"]]:
@@ -382,17 +389,26 @@ def isolate(rows: Iterable[dict], audit: Counter, dropped: list) -> Iterator[dic
             )
             continue
         seen.add(key)
-        yield row
+        kept.append(row)
+    return kept
 
 
-def validate_rows(rows: Iterable[dict]) -> None:
-    """Self-check ids, targets, candidate counts, images, and group isolation."""
+def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
+    """Self-check ids, splits, targets, candidate counts, images, group isolation.
+
+    Every failure is a `ValueError` naming the offending row, so callers can
+    abort with one actionable line. `root` resolves the stored image paths
+    (they are repository-root relative) and defaults to the working directory.
+    """
+    root = Path.cwd() if root is None else root
     seen_ids = set()
     splits_by_group: dict[str, set] = {}
     for row in rows:
         if row["id"] in seen_ids:
             raise ValueError(f"Duplicate row id: {row['id']}")
         seen_ids.add(row["id"])
+        if row["split"] not in SPLIT_ORDER:
+            raise ValueError(f"Unknown split: {row['id']} ({row['split']})")
         question = row["question"]
         width = 2 if question["type"] == "noul" else len(question["criteria"])
         if not 2 <= width <= 128:
@@ -401,8 +417,13 @@ def validate_rows(rows: Iterable[dict]) -> None:
             raise ValueError(f"Target width does not match candidates: {row['id']}")
         if min(row["target"]) < 0 or abs(sum(row["target"]) - 1) > 1e-4:
             raise ValueError(f"Target is not a distribution: {row['id']}")
-        with Image.open(row["image"]) as image:
-            image.convert("RGB")
+        try:
+            with Image.open(root / row["image"]) as image:
+                image.convert("RGB")
+        except OSError as error:
+            raise ValueError(
+                f"Image is not readable: {row['id']} ({row['image']}): {error}"
+            ) from error
         splits_by_group.setdefault(row["group"], set()).add(row["split"])
     leaked = [group for group, splits in splits_by_group.items() if len(splits) > 1]
     if leaked:
