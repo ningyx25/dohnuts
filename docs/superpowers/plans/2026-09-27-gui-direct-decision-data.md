@@ -1387,6 +1387,29 @@ def test_cli_names_unreadable_input_files(tmp_path, image_root):
     (image_root / "broken.json").write_text("{not json")
     with pytest.raises(SystemExit, match="Unreadable step record file"):
         prepare.convert(image_root, image_root / "out")
+    (image_root / "broken.json").write_bytes(b'{"id": "\xe9"}')
+    with pytest.raises(SystemExit, match="Unreadable step record file"):
+        prepare.convert(image_root, image_root / "out")
+
+
+def test_cli_rejects_an_output_path_that_is_a_file(tmp_path, image_root):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    output = image_root / "out"
+    output.write_text("not a directory")
+    with pytest.raises(SystemExit, match="Cannot create the output directory"):
+        prepare.convert(source, output)
+
+
+def test_cli_stores_the_exact_screenshot_bytes(tmp_path, image_root):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    output = image_root / "out"
+    prepare.convert(source, output)
+    stored = output / "images" / (prepare.digest_file(image_root / "shot.png") + ".png")
+    assert stored.read_bytes() == (image_root / "shot.png").read_bytes()
 
 
 def test_example_data_converts_when_present():
@@ -1475,7 +1498,9 @@ def records(paths: list[Path]):
     for path in paths:
         try:
             data = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError) as error:
+        except (OSError, ValueError) as error:
+            # JSONDecodeError and UnicodeDecodeError are both ValueError; a torn or
+            # non-UTF-8 file must not abort the batch with a traceback.
             raise SystemExit(
                 f"Unreadable step record file: {path} ({type(error).__name__}: {error})"
             ) from error
@@ -1486,7 +1511,9 @@ def records(paths: list[Path]):
 
 def store_image(step, output: Path) -> Path:
     target = output / "images" / (step.image_sha256 + ".png")
-    if not target.exists():
+    if not target.exists() or digest_file(target) != step.image_sha256:
+        # Re-copy a target whose content does not match its name: a killed
+        # previous run can leave a truncated file that later runs would trust.
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(step.image, target)
     return target
@@ -1501,7 +1528,10 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     paths = input_files(source)
     if not paths:
         raise SystemExit(f"No step record *.json found under {source}")
-    output.mkdir(parents=True, exist_ok=True)
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise SystemExit(f"Cannot create the output directory {output}: {error}") from error
     audit: Counter = Counter()
     excluded = []
     rows = []
@@ -1541,19 +1571,22 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
         validate_rows(kept, root=root)
     except ValueError as error:
         raise SystemExit(f"Self-check failed: {error}") from error
-    handles = {split: (output / f"{split}.jsonl").open("w") for split in SPLITS}
     counts: Counter = Counter()
     classes: dict[str, Counter] = {}
     try:
-        for row in kept:
-            handles[row["split"]].write(json.dumps(row, ensure_ascii=False) + "\n")
-            counts[(row["dataset"], row["split"])] += 1
-            if row["dataset"] == "gui_action":
-                label = list(ACTIONS)[row["target"].index(1.0)]
-                classes.setdefault(row["split"], Counter())[label] += 1
-    finally:
-        for handle in handles.values():
-            handle.close()
+        handles = {split: (output / f"{split}.jsonl").open("w") for split in SPLITS}
+        try:
+            for row in kept:
+                handles[row["split"]].write(json.dumps(row, ensure_ascii=False) + "\n")
+                counts[(row["dataset"], row["split"])] += 1
+                if row["dataset"] == "gui_action":
+                    label = list(ACTIONS)[row["target"].index(1.0)]
+                    classes.setdefault(row["split"], Counter())[label] += 1
+        finally:
+            for handle in handles.values():
+                handle.close()
+    except OSError as error:
+        raise SystemExit(f"Cannot write the split files under {output}: {error}") from error
     with (output / "excluded.jsonl").open("w") as stream:
         for entry in [*excluded, *dropped]:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -1625,7 +1658,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(59 passed,1 skipped — 若本地存在 `example-data/` 则为 60 passed)
+Expected: PASS(66 passed,1 skipped — 若本地存在 `example-data/` 则为 67 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1687,6 +1720,55 @@ def test_token_budget_excludes_whole_record(tmp_path, image_root):
     assert entry["reason"] == "token_budget"
     assert entry["stage"] == "parse"
     assert int(entry["detail"]) > 2048
+
+
+def test_cli_warns_on_empty_splits(image_root, capsys):
+    steps = [make_record("645_BrowserMaze_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    prepare.convert(source, image_root / "out")
+    captured = capsys.readouterr()
+    assert json.loads(captured.err) == {"warning": "empty splits: dev, calibration, test"}
+    assert "warning" not in captured.out
+
+
+def test_cli_skips_the_model_when_token_checks_are_disabled(tmp_path, image_root, monkeypatch):
+    steps = [make_record("001_TaskA_step1", {"action": "wait", "time": 2})]
+    source = image_root / "steps.json"
+    source.write_text(json.dumps(steps))
+    output = image_root / "out"
+
+    def explode(*args, **kwargs):
+        raise AssertionError("the token-check model must not be loaded")
+
+    monkeypatch.setattr(prepare.AutoProcessor, "from_pretrained", explode)
+    prepare.main(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--model",
+            "/nonexistent",
+            "--no-token-check",
+        ]
+    )
+    assert json.loads((output / "manifest.json").read_text())["token_check"] == "skipped"
+
+
+def test_token_length_matches_the_training_collator(image_root):
+    model = Path("Qwen/Qwen3.5-0.8B")
+    if not model.is_dir():
+        pytest.skip("local Qwen3.5-0.8B snapshot is not available")
+    from dohnuts.training_data import DecisionCollator
+
+    record = make_record("001_TaskA_step1", {"action": "system_button", "button": "Home"})
+    step, reason = parse_step(record, image_root=image_root)
+    assert reason is None
+    rows = rows_for_step(step, str(image_root / "shot.png"))
+    processor = prepare.AutoProcessor.from_pretrained(model, local_files_only=True)
+    collated, *_ = DecisionCollator(model)([rows[0]])
+    assert prepare.token_length(processor, rows[0]) == int(collated["input_ids"].shape[1])
 
 
 def test_token_length_counts_words_and_image_patches(image_root):
@@ -1813,7 +1895,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     processor = None
     if args.model is not None and args.token_check:
-        processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
+        try:
+            processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"Cannot load the token-check model {args.model}: {error}") from error
     convert(args.input, args.output, processor=processor)
 
 
@@ -1921,23 +2006,47 @@ Fixed rules:
 
 - `state` keeps the source `user_query` and `task_progress` verbatim; thought and
   action text are kept in `reference` for provenance and never enter model input.
+  Records must hold exactly one user and one assistant message; anything else is
+  excluded instead of guessed.
 - Task ids strip the `_step<N>` suffix and form the isolation group. Split
-  buckets are `sha256("doh-gui-split-2026:" + group)` modulo 100: calibration
-  < 10, dev < 20, test < 30, train otherwise. Image bytes join groups before the
-  split priority (`train < calibration < dev < test`) is resolved.
+  buckets are `int(sha256("doh-gui-split-2026:" + group)[:8], 16) % 100`:
+  calibration < 10, dev < 20, test < 30, train otherwise. Image bytes join groups
+  before the split priority (`train < calibration < dev < test`) is resolved, and
+  a merged group keeps the lexicographically smallest task name (aliases never
+  become group names). Task groups never straddle splits.
 - Dataset names split by question (`gui_action`, `gui_button`, `gui_complete`,
   `gui_swipe`) so macro-F1 stays within one fixed candidate vocabulary. The
   uniform dataset sampler therefore gives each question family roughly equal
   weight, which relatively upweights button and swipe rows.
 - Swipes whose axes tie on absolute delta are excluded instead of guessed.
-- Records that cannot produce a required question are excluded whole; reasons and
-  counts land in the manifest and `excluded.jsonl`.
+- The token budget is checked when `--model` names a local snapshot (skip with
+  `--no-token-check`). The estimate mirrors the training collator: rendered text
+  tokens plus the expanded image placeholders at `IMAGE_PIXELS`. Over-budget rows
+  are excluded whole, before their screenshot is stored.
+- Exclusions are audited, never silent. The parse stage drops whole records
+  (`unparsable_state`, `multi_turn`, `missing_tool_call`, `unknown_tool`,
+  `missing_id`, `unknown_action`, `invalid_button`, `invalid_swipe`,
+  `multi_image`, `missing_image`, `token_budget`, `unexpected`); the isolate
+  stage drops rows (`cross_split_group`, `duplicate_input`). Both land in
+  `excluded.jsonl` with `{id, reason, detail, stage}` and in the manifest's
+  `exclusions` counts (`parse:<reason>` and `<dataset>:<split>:<reason>`).
+- Manifest `images` lists the files this run wrote (content-deduplicated); an
+  image can outlive rows that were later dropped by isolation, so it is not the
+  set of images the dataset references. Re-running into the same `--output`
+  reproduces the same four hashes; a different `--output` legitimately changes
+  them because rows embed the stored image path.
 
 Coordinates and typed text are payloads for the orchestrator, not decisions:
 this model answers what to do, which button to press, in which direction to
 swipe, and whether to stop. Region detection stays outside the converter.
 
+Known limits: only one screenshot per step; symbol links inside the input root
+can still resolve outside it; tasks that share a screen with another task are not
+detected as near-duplicates.
+
 ```bash
+# Run from the repository root. --input is your own directory of step-record
+# *.json arrays; --model points at a local snapshot, or the token check is skipped.
 pdm run python scripts/prepare_gui_data.py \
   --input data/raw/gui --output data/processed/gui-v1 --model Qwen/Qwen3.5-0.8B
 ```
@@ -2079,6 +2188,9 @@ Expected: 输出含 `{"kind": "dev", ...}` 与 `{"kind": "train_complete", ...}`
 
 - [ ] **Step 4: 校准、评估、导出**
 
+注意:重试 Step 3–5 时必须换一个全新的 `--run` 目录(否则会因
+`Existing run requires --resume` 退出);checkpoint 的路径见 Step 5(Run 的兄弟目录)。
+
 Run:
 
 ```bash
@@ -2101,6 +2213,10 @@ Expected: 退出码 0;`primitive_candidate_slices` 出现 `("choice", 8)`、`("n
 
 - [ ] **Step 5: 用导出的 checkpoint 推理一条**
 
+`train.py` 把导出写进 **`run` 的兄弟目录** `run.parent / "checkpoint"`(与仓库里
+`runs/notebook/checkpoint` 的惯例一致),所以 `--run /tmp/gui-smoke/run` 对应的 checkpoint
+是 `/tmp/gui-smoke/checkpoint`,不是 `run/checkpoint`。
+
 Run:
 
 ```bash
@@ -2113,7 +2229,7 @@ from PIL import Image
 from dohnuts.predictor import Predictor
 from dohnuts.training_data import load_records
 
-predictor = Predictor.from_checkpoint("/tmp/gui-smoke/run/checkpoint")
+predictor = Predictor.from_checkpoint("/tmp/gui-smoke/checkpoint")
 groups = load_records(Path("/tmp/gui-smoke/data/train.jsonl"))
 record = groups[sorted(groups)[0]][0]
 state = {**record["state"], "image": Image.open(record["image"])}
