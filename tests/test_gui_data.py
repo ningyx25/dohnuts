@@ -739,6 +739,12 @@ def test_cli_refuses_to_run_outside_the_repository_root(tmp_path, image_root, mo
         prepare.convert(source, image_root / "out")
 
 
+def test_cli_requires_the_repository_root_as_the_working_directory(monkeypatch):
+    monkeypatch.chdir(Path(__file__).parents[1] / "scripts")
+    with pytest.raises(SystemExit, match="Run from the repository root"):
+        prepare.convert(Path("scripts"), Path("/tmp/gui-cwd-check"))
+
+
 def test_cli_rejects_inputs_without_step_records(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
