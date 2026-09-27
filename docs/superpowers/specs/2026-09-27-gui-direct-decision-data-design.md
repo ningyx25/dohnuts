@@ -206,7 +206,8 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 
 1. **转换器内置自检(默认开启)**:id 全局唯一;`split` 字段与所在文件一致(未知 split
    也判失败);target 归一且长度等于候选数;候选数 2–128;图片可 RGB 打开;group 不跨
-   split。自检失败一律抛**带行 id** 的 `ValueError`(含未知 split 与图片不可读),转换器
+   split;**截图 alias 也不跨 split**(逐记录消歧的两条硬保证都在每次转换时检查)。
+   自检失败一律抛**带行 id** 的 `ValueError`(含未知 split 与图片不可读),转换器
    把它转成一行 `SystemExit` 信息并非零退出,而不是裸回溯。
 2. **token 预算检查**:传了 `--model` 时执行并在 manifest 记录 `token_check: "enabled"`;
    未传 `--model`(或显式 `--no-token-check`)时跳过并记录 `"skipped"`。传了 `--model`

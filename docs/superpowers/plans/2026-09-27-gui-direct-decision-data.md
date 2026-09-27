@@ -574,7 +574,7 @@ def parse_step(record: dict, *, image_root: Path) -> tuple[Step | None, str | No
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(27 passed)
+Expected: PASS(28 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -793,7 +793,7 @@ def rows_for_step(step: Step, image_path: str) -> list[dict]:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(32 passed)
+Expected: PASS(33 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1005,6 +1005,24 @@ def test_isolate_keeps_same_split_screenshots_untouched():
     assert not audit
 
 
+def test_validate_rows_rejects_screenshots_across_splits(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    rows[1]["split"] = "test" if rows[0]["split"] == "train" else "train"
+    with pytest.raises(ValueError, match="Screenshots span multiple splits"):
+        validate_rows(rows)
+
+
+def test_isolate_drops_a_row_whose_extra_alias_is_leaked():
+    audit, dropped = Counter(), []
+    leaked = row_stub("a:action", group="task:a", split="train", alias="image-bytes:own")
+    leaked["aliases"].append("image-bytes:shared")
+    rows = [leaked, row_stub("b:action", group="task:b", split="test", alias="image-bytes:shared")]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["b:action"]
+    assert dropped[0]["id"] == "a:action"
+
+
 def test_validate_rows_rejects_unnormalized_target(image_root):
     step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
     rows = rows_for_step(step, str(step.image))
@@ -1134,7 +1152,7 @@ def isolate(rows: Iterable[dict], audit: Counter, dropped: list[dict[str, str]])
 
 
 def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
-    """Self-check ids, splits, targets, candidate counts, images, group isolation.
+    """Self-check ids, splits, targets, counts, images, group and alias isolation.
 
     Every failure is a `ValueError` naming the offending row, so callers can
     abort with one actionable line. `root` resolves the stored image paths
@@ -1143,6 +1161,7 @@ def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
     root = Path.cwd() if root is None else root
     seen_ids = set()
     splits_by_group: dict[str, set] = {}
+    splits_by_alias: dict[str, set] = {}
     for row in rows:
         if row["id"] in seen_ids:
             raise ValueError(f"Duplicate row id: {row['id']}")
@@ -1164,16 +1183,21 @@ def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
             raise ValueError(
                 f"Image is not readable: {row['id']} ({row['image']}): {error}"
             ) from error
+        for alias in row["aliases"]:
+            splits_by_alias.setdefault(alias, set()).add(row["split"])
         splits_by_group.setdefault(row["group"], set()).add(row["split"])
     leaked = [group for group, splits in splits_by_group.items() if len(splits) > 1]
     if leaked:
         raise ValueError(f"Groups span multiple splits: {sorted(leaked)[:5]}")
+    leaked_aliases = [alias for alias, splits in splits_by_alias.items() if len(splits) > 1]
+    if leaked_aliases:
+        raise ValueError(f"Screenshots span multiple splits: {sorted(leaked_aliases)[:5]}")
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(48 passed)
+Expected: PASS(51 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1217,6 +1241,12 @@ def test_validate_rows_rejects_candidate_counts_out_of_range(image_root):
     rows = rows_for_step(step, str(step.image))
     rows[0]["question"]["criteria"] = {"only": "one candidate"}
     rows[0]["target"] = [1.0]
+    with pytest.raises(ValueError, match="Candidate count out of range"):
+        validate_rows(rows)
+    rows = rows_for_step(step, str(step.image))
+    criteria = {f"c{index}": f"candidate {index}" for index in range(129)}
+    rows[0]["question"]["criteria"] = criteria
+    rows[0]["target"] = [1.0] + [0.0] * 128
     with pytest.raises(ValueError, match="Candidate count out of range"):
         validate_rows(rows)
 
@@ -1718,7 +1748,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(66 passed — 本机同时具备 `Qwen/Qwen3.5-0.8B` 与 `example-data/` 时;缺任一项则相应用例 skip,数量减少)
+Expected: PASS(69 passed — 本机同时具备 `Qwen/Qwen3.5-0.8B` 与 `example-data/` 时;缺任一项则相应用例 skip,数量减少)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1969,7 +1999,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(71 passed — 缺本地 `Qwen/Qwen3.5-0.8B` 快照时 collator 一致性用例 skip,数量减少)
+Expected: PASS(74 passed — 缺本地 `Qwen/Qwen3.5-0.8B` 快照时 collator 一致性用例 skip,数量减少)
 
 - [ ] **Step 4b: 用真实处理器核对长度估算(必须一致)**
 

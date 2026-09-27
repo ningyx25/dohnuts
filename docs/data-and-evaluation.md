@@ -236,8 +236,9 @@ carrying it in lower-priority splits are dropped as `cross_split_group`. The res
 of a task's rows stay in the task's own split, and task groups are never renamed.
 A launcher screen, lock screen, or repeated initial state therefore costs only
 the rows that literally repeat that screenshot — on a 27k-record trajectory set
-this dropped 4,870 of 59,449 rows (1,876 records fully dropped, 7%), where
-merging whole task groups would have cost about half the records. Read `manifest["exclusions"]`
+this dropped 4,870 of 59,449 rows (8.2%), affecting 1,876 of 27,360 records
+(6.9%), where merging whole task groups would have cost about half the records.
+Read `manifest["exclusions"]`
 (especially `cross_split_group:…`) and `excluded.jsonl` (`stage=isolate`) to see
 exactly which rows went and why before trusting the split sizes.
 
