@@ -9,6 +9,8 @@ docs/superpowers/specs/2026-09-27-gui-direct-decision-data-design.md.
 import hashlib
 import json
 import re
+from collections import Counter
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -309,3 +311,99 @@ def rows_for_step(step: Step, image_path: str) -> list[dict]:
             )
         )
     return rows
+
+
+def isolate(rows: Iterable[dict], audit: Counter, dropped: list) -> Iterator[dict]:
+    """Union groups sharing image bytes, keep the top partition, drop duplicates.
+
+    Every dropped row is appended to `dropped` so the CLI can report it in
+    excluded.jsonl, with the same detail as parse-time exclusions.
+    """
+    pending = list(rows)
+    parents: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        parents.setdefault(key, key)
+        while key != parents[key]:
+            parents[key] = parents[parents[key]]
+            key = parents[key]
+        return key
+
+    # Aliases never become union nodes: they only record which group a screenshot
+    # was first seen with, so a merged group keeps a task-group name instead of an
+    # image hash.
+    first_group: dict[str, str] = {}
+    for row in pending:
+        for alias in row["aliases"]:
+            if alias in first_group:
+                left, right = find(first_group[alias]), find(row["group"])
+                if left != right:
+                    # Name a merged group after its lexicographically smallest
+                    # member so the result never depends on input shard order.
+                    parents[max(left, right)] = min(left, right)
+            else:
+                first_group[alias] = row["group"]
+    priority: dict[str, int] = {}
+    for row in pending:
+        root = find(row["group"])
+        priority[root] = max(priority.get(root, 0), SPLIT_ORDER[row["split"]])
+    seen, seen_ids = set(), set()
+    for row in pending:
+        row["group"] = find(row["group"])
+        if SPLIT_ORDER[row["split"]] != priority[row["group"]]:
+            audit[f"{row['dataset']}:{row['split']}:cross_split_group"] += 1
+            dropped.append(
+                {"id": row["id"], "reason": "cross_split_group", "detail": "", "stage": "isolate"}
+            )
+            continue
+        if row["id"] in seen_ids:
+            # Two records minted the same row id: exclude the later one instead of
+            # letting validate_rows abort the whole conversion.
+            audit[f"{row['dataset']}:{row['split']}:duplicate_input"] += 1
+            dropped.append(
+                {
+                    "id": row["id"],
+                    "reason": "duplicate_input",
+                    "detail": "row id already seen",
+                    "stage": "isolate",
+                }
+            )
+            continue
+        seen_ids.add(row["id"])
+        key = digest(
+            json.dumps(
+                [row["dataset"], row["group"], row["state"], row["question"]], sort_keys=True
+            )
+        )
+        if key in seen:
+            audit[f"{row['dataset']}:{row['split']}:duplicate_input"] += 1
+            dropped.append(
+                {"id": row["id"], "reason": "duplicate_input", "detail": "", "stage": "isolate"}
+            )
+            continue
+        seen.add(key)
+        yield row
+
+
+def validate_rows(rows: Iterable[dict]) -> None:
+    """Self-check ids, targets, candidate counts, images, and group isolation."""
+    seen_ids = set()
+    splits_by_group: dict[str, set] = {}
+    for row in rows:
+        if row["id"] in seen_ids:
+            raise ValueError(f"Duplicate row id: {row['id']}")
+        seen_ids.add(row["id"])
+        question = row["question"]
+        width = 2 if question["type"] == "noul" else len(question["criteria"])
+        if not 2 <= width <= 128:
+            raise ValueError(f"Candidate count out of range: {row['id']}")
+        if len(row["target"]) != width:
+            raise ValueError(f"Target width does not match candidates: {row['id']}")
+        if min(row["target"]) < 0 or abs(sum(row["target"]) - 1) > 1e-4:
+            raise ValueError(f"Target is not a distribution: {row['id']}")
+        with Image.open(row["image"]) as image:
+            image.convert("RGB")
+        splits_by_group.setdefault(row["group"], set()).add(row["split"])
+    leaked = [group for group, splits in splits_by_group.items() if len(splits) > 1]
+    if leaked:
+        raise ValueError(f"Groups span multiple splits: {sorted(leaked)[:5]}")

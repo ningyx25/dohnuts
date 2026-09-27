@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -11,9 +12,11 @@ from dohnuts.gui_data import (
     ACTIONS,
     BUTTONS,
     SWIPE_DIRECTIONS,
+    isolate,
     parse_step,
     rows_for_step,
     split_for,
+    validate_rows,
 )
 
 QUERY = (
@@ -347,3 +350,129 @@ def test_split_for_is_stable_and_covers_partitions():
     assert split_for("task:beta") == "test"
     assert split_for("task:002_Gallery") == "dev"
     assert split_for("task:delta") == "calibration"
+
+
+def row_stub(
+    uid, *, group, split, alias="image-bytes:deadbeef", dataset="gui_action", question=None
+):
+    return {
+        "id": uid,
+        "dataset": dataset,
+        "group": group,
+        "aliases": [alias],
+        "split": split,
+        "state": {"user_query": uid},
+        "image": "img.png",
+        "question": question
+        or {"type": "choice", "instructions": "q", "criteria": {"a": "a", "b": "b"}},
+        "target": [1.0, 0.0],
+    }
+
+
+def test_isolate_keeps_highest_priority_partition_for_shared_images():
+    audit, dropped = Counter(), []
+    rows = [
+        row_stub("a:action", group="task:a", split="train"),
+        row_stub("b:action", group="task:b", split="test"),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["b:action"]
+    assert kept[0]["split"] == "test"
+    assert kept[0]["group"] == "task:a"  # rewritten to the union root
+    assert sum(audit.values()) == 1
+    assert "cross_split_group" in next(iter(audit))
+    assert dropped == [
+        {"id": "a:action", "reason": "cross_split_group", "detail": "", "stage": "isolate"}
+    ]
+
+
+def test_isolate_drops_duplicate_inputs():
+    audit, dropped = Counter(), []
+    question = {"type": "choice", "instructions": "q", "criteria": {"a": "a", "b": "b"}}
+    rows = [
+        row_stub(
+            "a:action", group="task:a", split="train", alias="image-bytes:1", question=question
+        ),
+        row_stub(
+            "a:action", group="task:a", split="train", alias="image-bytes:1", question=question
+        ),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert len(kept) == 1
+    assert "duplicate_input" in next(iter(audit))
+    assert dropped[0]["reason"] == "duplicate_input"
+    assert dropped[0]["stage"] == "isolate"
+
+
+def test_swipe_direction_vertical_axis(image_root):
+    arguments = {"action": "swipe", "coordinate": [500, 200], "coordinate2": [500, 800]}
+    rows = rows_for_step(step_for(image_root, "demo_step1", arguments), "img.png")
+    assert rows[-1]["target"][list(SWIPE_DIRECTIONS).index("down")] == 1.0
+
+
+def test_isolate_group_naming_is_order_independent():
+    audit, dropped = Counter(), []
+    rows = [
+        row_stub("b:action", group="task:b", split="test"),
+        row_stub("a:action", group="task:a", split="train"),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["b:action"]
+    assert kept[0]["group"] == "task:a"  # canonical minimum, not the last seen
+    assert dropped[0]["id"] == "a:action"
+
+
+def test_isolate_drops_duplicate_row_ids():
+    audit, dropped = Counter(), []
+    other = {"type": "choice", "instructions": "other", "criteria": {"a": "a", "b": "b"}}
+    rows = [
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:1"),
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:2", question=other),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["a:action"]
+    assert dropped == [
+        {
+            "id": "a:action",
+            "reason": "duplicate_input",
+            "detail": "row id already seen",
+            "stage": "isolate",
+        }
+    ]
+
+
+def test_validate_rows_rejects_unnormalized_target(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    rows[0]["target"] = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+    with pytest.raises(ValueError, match="not a distribution"):
+        validate_rows(rows)
+
+
+def test_validate_rows_rejects_target_width_mismatch(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    rows[0]["target"] = [1.0, 0.0]
+    with pytest.raises(ValueError, match="width"):
+        validate_rows(rows)
+
+
+def test_validate_rows_rejects_duplicate_ids(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    rows[0]["id"] = rows[1]["id"]
+    with pytest.raises(ValueError, match="Duplicate row id"):
+        validate_rows(rows)
+
+
+def test_validate_rows_rejects_group_across_splits(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
+    rows = rows_for_step(step, str(step.image))
+    rows[1]["split"] = "test" if rows[0]["split"] == "train" else "train"
+    with pytest.raises(ValueError, match="span multiple splits"):
+        validate_rows(rows)
+
+
+def test_validate_rows_accepts_converted_rows(image_root):
+    step = step_for(image_root, "demo_step1", {"action": "system_button", "button": "Home"})
+    validate_rows(rows_for_step(step, str(step.image)))
