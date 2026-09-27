@@ -1364,8 +1364,14 @@ def test_cli_refuses_to_run_outside_the_repository_root(tmp_path, image_root, mo
     source = image_root / "steps.json"
     source.write_text(json.dumps(steps))
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(SystemExit, match="Run from the repository root"):
+    with pytest.raises(SystemExit, match="Run from the dohnuts repository root"):
         prepare.convert(source, image_root / "out")
+
+
+def test_cli_requires_the_repository_root_as_the_working_directory(monkeypatch):
+    monkeypatch.chdir(Path(__file__).parents[1] / "scripts")
+    with pytest.raises(SystemExit, match="Run from the repository root"):
+        prepare.convert(Path("scripts"), Path("/tmp/gui-cwd-check"))
 
 
 def test_cli_rejects_inputs_without_step_records(tmp_path):
@@ -1619,7 +1625,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(58 passed,1 skipped — 若本地存在 `example-data/` 则为 59 passed)
+Expected: PASS(59 passed,1 skipped — 若本地存在 `example-data/` 则为 60 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1697,11 +1703,16 @@ def test_token_length_counts_words_and_image_patches(image_root):
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `pdm run pytest tests/test_gui_data.py -q -k token`
-Expected: FAIL —`AttributeError: module 'prepare_gui_data' has no attribute 'token_length'`
+Expected: 两个用例都失败 —— `test_token_length_counts_words_and_image_patches` 报
+`AttributeError: module 'prepare_gui_data' has no attribute 'render_question'`(导入缺失);
+`test_token_budget_excludes_whole_record` 则在断言处失败(`assert {} == {'parse:token_budget': 1}`),
+因为 `convert` 此时还忽略 `processor`。
 
 - [ ] **Step 3: 实现最小代码**
 
-在 `scripts/prepare_gui_data.py` 的导入区补上:
+在 `scripts/prepare_gui_data.py` 的导入区补上下面这组(注意 isort 顺序:第三方
+`PIL`/`transformers` 在前、`dohnuts.*` 在后,所以这几行会分别落到现有导入块的两段里,
+不是连成一块):
 
 ```python
 from PIL import Image
@@ -1734,7 +1745,9 @@ def token_length(processor, row: dict) -> int:
 在 `convert` 中,把以 `for record in records(paths):` 开头的整个循环替换为下面这段
 (唯一新增的是 `if processor is not None:` 分支,其余不变;下面按模块级缩进书写以便 ruff
 检查,落盘时要整体缩进 4 格作为 `convert` 的函数体,并且**必须保留**
-`images_written.add(stored.name)` —— 否则 `manifest["images"]` 会永远是空列表):
+`images_written.add(stored.name)` —— 否则 `manifest["images"]` 会永远是空列表。
+注意 `lengths = [...]` 那一行在模块缩进下恰好 100 字符、缩进 4 格后是 104 字符,所以落盘
+后再跑 `pdm run format` 会把它折成三行 —— 这是预期的,折行后的形态才是仓库里的最终形态):
 
 ```python
 for record in records(paths):
@@ -1802,12 +1815,16 @@ def main(argv=None):
     if args.model is not None and args.token_check:
         processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
     convert(args.input, args.output, processor=processor)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(60 passed,1 skipped — 若本地存在 `example-data/` 则为 61 passed)
+Expected: PASS(61 passed,1 skipped — 若本地存在 `example-data/` 则为 62 passed)
 
 - [ ] **Step 4b: 用真实处理器核对长度估算(必须一致)**
 
