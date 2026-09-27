@@ -320,50 +320,28 @@ def rows_for_step(step: Step, image_path: str) -> list[dict]:
 
 
 def isolate(rows: Iterable[dict], audit: Counter, dropped: list[dict[str, str]]) -> list[dict]:
-    """Union groups sharing image bytes, keep the top partition, drop duplicates.
+    """Resolve screenshot collisions across splits, then drop duplicates.
 
     Returns the kept rows and appends one `{id, reason, detail, stage}` entry per
     dropped row to `dropped`, so the CLI can report both in excluded.jsonl.
 
-    This mutates every input row (dropped ones included): `row["group"]` becomes
-    the canonical union root, and deduplication deliberately runs after that
-    merge so merged tasks dedup against each other. Reason precedence is
-    cross-split, then duplicate row id, then duplicate content. Among mutually
-    duplicate rows the first in input order survives, so callers must pass rows
-    in a fixed order (the CLI sorts its input files).
+    A screenshot (identical image bytes, carried as an alias) may only live in one
+    split: for every alias the highest-priority split among the rows carrying it
+    wins (`train < calibration < dev < test`), and the rows carrying that alias in
+    lower-priority splits are dropped as `cross_split_group`. A task's other rows
+    stay in the task's own split and `group` is never rewritten. Reason precedence
+    is cross-split, then duplicate row id, then duplicate content. Among mutually
+    duplicate rows the first in input order survives, so callers must pass rows in
+    a fixed order (the CLI sorts its input files).
     """
     pending = list(rows)
-    parents: dict[str, str] = {}
-
-    def find(key: str) -> str:
-        parents.setdefault(key, key)
-        while key != parents[key]:
-            parents[key] = parents[parents[key]]
-            key = parents[key]
-        return key
-
-    # Aliases never become union nodes: they only record which group a screenshot
-    # was first seen with, so a merged group keeps a task-group name instead of an
-    # image hash.
-    first_group: dict[str, str] = {}
+    best: dict[str, int] = {}
     for row in pending:
         for alias in row["aliases"]:
-            if alias in first_group:
-                left, right = find(first_group[alias]), find(row["group"])
-                if left != right:
-                    # Name a merged group after its lexicographically smallest
-                    # member so the result never depends on input shard order.
-                    parents[max(left, right)] = min(left, right)
-            else:
-                first_group[alias] = row["group"]
-    priority: dict[str, int] = {}
-    for row in pending:
-        root = find(row["group"])
-        priority[root] = max(priority.get(root, 0), SPLIT_ORDER[row["split"]])
+            best[alias] = max(best.get(alias, 0), SPLIT_ORDER[row["split"]])
     seen, seen_ids, kept = set(), set(), []
     for row in pending:
-        row["group"] = find(row["group"])
-        if SPLIT_ORDER[row["split"]] != priority[row["group"]]:
+        if any(SPLIT_ORDER[row["split"]] < best[alias] for alias in row["aliases"]):
             audit[f"{row['dataset']}:{row['split']}:cross_split_group"] += 1
             dropped.append(
                 {"id": row["id"], "reason": "cross_split_group", "detail": "", "stage": "isolate"}

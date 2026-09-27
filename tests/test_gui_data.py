@@ -450,7 +450,7 @@ def test_isolate_is_invariant_under_input_permutation():
     assert len(fingerprints) == 1
 
 
-def test_isolate_keeps_highest_priority_partition_for_shared_images():
+def test_isolate_drops_only_the_lower_priority_rows_of_a_shared_screenshot():
     audit, dropped = Counter(), []
     rows = [
         row_stub("a:action", group="task:a", split="train"),
@@ -459,7 +459,7 @@ def test_isolate_keeps_highest_priority_partition_for_shared_images():
     kept = list(isolate(rows, audit, dropped))
     assert [row["id"] for row in kept] == ["b:action"]
     assert kept[0]["split"] == "test"
-    assert kept[0]["group"] == "task:a"  # rewritten to the union root
+    assert kept[0]["group"] == "task:b"  # groups are never rewritten
     assert sum(audit.values()) == 1
     assert "cross_split_group" in next(iter(audit))
     assert dropped == [
@@ -491,7 +491,7 @@ def test_swipe_direction_vertical_axis(image_root):
     assert rows[-1]["target"][list(SWIPE_DIRECTIONS).index("down")] == 1.0
 
 
-def test_isolate_group_naming_is_order_independent():
+def test_isolate_is_order_independent_for_shared_screenshots():
     audit, dropped = Counter(), []
     rows = [
         row_stub("b:action", group="task:b", split="test"),
@@ -499,7 +499,7 @@ def test_isolate_group_naming_is_order_independent():
     ]
     kept = list(isolate(rows, audit, dropped))
     assert [row["id"] for row in kept] == ["b:action"]
-    assert kept[0]["group"] == "task:a"  # canonical minimum, not the last seen
+    assert kept[0]["group"] == "task:b"
     assert dropped[0]["id"] == "a:action"
 
 
@@ -522,7 +522,7 @@ def test_isolate_drops_duplicate_row_ids():
     ]
 
 
-def test_isolate_merges_groups_without_dropping_rows():
+def test_isolate_keeps_same_split_screenshots_untouched():
     audit, dropped = Counter(), []
     rows = [
         row_stub("a:action", group="task:a", split="train", alias="image-bytes:9"),
@@ -530,7 +530,7 @@ def test_isolate_merges_groups_without_dropping_rows():
     ]
     kept = list(isolate(rows, audit, dropped))
     assert [row["id"] for row in kept] == ["a:action", "b:action"]
-    assert {row["group"] for row in kept} == {"task:a"}
+    assert {row["group"] for row in kept} == {"task:a", "task:b"}
     assert not dropped
     assert not audit
 
