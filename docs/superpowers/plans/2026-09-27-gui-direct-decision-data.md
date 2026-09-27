@@ -4,7 +4,7 @@
 
 **Goal:** 把 GUI 逐步 SFT 轨迹(`raw_data.json`,每步一条)确定性地转成 Dohnuts 决策行(action 8 类 / button 4 类 / complete noul / swipe_dir 4 类),产出四个 split 与审计清单,可直接喂给 `train.ipynb` 的 C 流程。
 
-**Architecture:** 纯函数核心放 `src/dohnuts/gui_data.py`(解析、派生、分桶、并查隔离、自检),CLI 外壳放 `scripts/prepare_gui_data.py`(输入发现、图像复制、token 预算、manifest)。一步产 2–4 行,共享 state/image/group,一行一问题,完全复用现有 `DecisionCollator`/`Predictor`/`train.py`/`metrics.py`。规格:`docs/superpowers/specs/2026-09-27-gui-direct-decision-data-design.md`。
+**Architecture:** 纯函数核心放 `src/dohnuts/gui_data.py`(解析、派生、分桶、并查隔离、自检),CLI 外壳放 `scripts/prepare_gui_data.py`(输入发现、图像复制、token 预算、manifest)。一步产 2–3 行,共享 state/image/group,一行一问题,完全复用现有 `DecisionCollator`/`Predictor`/`train.py`/`metrics.py`。规格:`docs/superpowers/specs/2026-09-27-gui-direct-decision-data-design.md`。
 
 **Tech Stack:** Python 3.12、PIL、transformers(AutoProcessor/smart_resize)、pytest、ruff、pdm。
 
@@ -328,7 +328,7 @@ Expected: FAIL —`ModuleNotFoundError: No module named 'dohnuts.gui_data'`
 ```python
 """Deterministic conversion of GUI step records into Dohnuts decision rows.
 
-One step record yields two to four rows that share state and image. Rows are
+One step record yields two or three rows that share state and image. Rows are
 built only from the ground-truth tool call: no candidate list, element tree, or
 model output is required. See
 docs/superpowers/specs/2026-09-27-gui-direct-decision-data-design.md.
@@ -1992,7 +1992,7 @@ query, completed-step history, screenshot, and the ground-truth tool call) into
 decision rows. It needs no candidate list, element tree, or model output: every
 row follows from the tool call alone.
 
-One step yields two to four rows that share state and image, one question per
+One step yields two or three rows that share state and image, one question per
 row:
 
 | Question | Type | Candidates | Target |

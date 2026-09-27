@@ -26,7 +26,7 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 ### 2.1 v1 覆盖
 
 - 输入:每步一条记录,一条记录恰好一张截图。
-- 每步产出 2–4 行决策:`action`(8 类)、`button`(4 类,仅 system_button 步)、
+- 每步产出 2–3 行决策:`action`(8 类)、`button`(4 类,仅 system_button 步)、
   `complete`(noul)、`swipe_dir`(4 类,仅 swipe 步)。
 - 任务级 group 隔离、确定性 split、排除计数、清单与哈希。
 
@@ -48,7 +48,7 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 
 ## 4. 数据行 schema 与示例
 
-`645_BrowserMaze_step3` 产出 3 行(swipe 步才有第 4 行):
+`645_BrowserMaze_step3` 产出 3 行(action + button + complete;普通 click 步只有 2 行):
 
 ```json
 {"id": "645_BrowserMaze_step3:action",

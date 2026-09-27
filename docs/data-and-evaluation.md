@@ -171,7 +171,7 @@ query, completed-step history, screenshot, and the ground-truth tool call) into
 decision rows. It needs no candidate list, element tree, or model output: every
 row follows from the tool call alone.
 
-One step yields two to four rows that share state and image, one question per
+One step yields two or three rows that share state and image, one question per
 row:
 
 | Question | Type | Candidates | Target |
