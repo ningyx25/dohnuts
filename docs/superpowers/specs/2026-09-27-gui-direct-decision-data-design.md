@@ -148,7 +148,9 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
 `<dataset>:<split>:<原因>`(沿用 `scripts/prepare_data.py` 的命名习惯)。
 `excluded.jsonl` 每行 `{id, reason, detail, stage}`:`stage` 取 `parse` 或 `isolate`,
 **解析期与隔离期的丢弃都要写入**(隔离期丢弃时 `id` 用该行的 `id`,`reason` 为
-`duplicate_input` 或 `cross_split_group`)。
+`duplicate_input` 或 `cross_split_group`)。`duplicate_input` 覆盖两种情形:同一
+`(dataset, group, state, question)` 的重复输入,以及两条记录铸出同一行 `id`(后者在
+`detail` 记 `row id already seen`,排除后出现的那条,避免自检直接中止整批)。
 
 - 一条原始记录若任一必需问题无法派生,整条记录排除(不产出部分行)——避免"某步只训
   一半问题"造成的分布偏斜;`button`/`swipe_dir` 本就是条件行,其缺失不算失败。
@@ -167,7 +169,8 @@ GT tool_call 自动派生、与现有 `DecisionCollator`/`Predictor`/`train.py`/
   → `< 10` calibration,`< 20` dev,`< 30` test,其余 train(≈70/10/10/10)。
 - 图片内容 `sha256` 作为 alias 参与 group 并查(union-find),防止同一张截图出现在两个
   split;并查后的组按优先级 `train < calibration < dev < test` 保留最高优先级分区,
-  其余行排除并计数 `cross_split_group`。
+  其余行排除并计数 `cross_split_group`。合并后的组名取该组成员的**字典序最小值**,
+  与输入分片顺序无关——输出哈希只由输入内容决定。
 - dataset 命名:`gui_action` / `gui_button` / `gui_complete` / `gui_swipe`,按问题类型
   分开。理由:`metrics.py` 只对固定候选词表计算 macro-F1,混在一个 dataset 里会失真。
   代价:`TrainingBatches` 按 dataset 名均匀采样,4 个问题族各得约 1/4 更新,少量

@@ -598,7 +598,7 @@ def step_for(image_root, uid, arguments):
 
 def test_system_button_step_rows(image_root):
     step = step_for(
-        image_root, "645_BrowserMaze_step3", {"action": "system_button", "button": "Back"}
+        image_root, "645_BrowserMaze_step3", {"action": "system_button", "button": "Home"}
     )
     rows = rows_for_step(step, "data/processed/gui-v1/images/x.png")
     assert [row["id"] for row in rows] == [
@@ -610,17 +610,17 @@ def test_system_button_step_rows(image_root):
     assert {row["group"] for row in rows} == {"task:645_BrowserMaze"}
     assert {row["image"] for row in rows} == {"data/processed/gui-v1/images/x.png"}
     action, button, complete = rows
-    assert action["question"]["criteria"] == ACTIONS
+    assert list(action["question"]["criteria"]) == list(ACTIONS)
     assert action["question"]["type"] == "choice"
     assert action["target"][list(ACTIONS).index("system_button")] == 1.0
     assert sum(action["target"]) == 1.0
-    assert button["target"] == [1.0, 0.0, 0.0, 0.0]
+    assert button["target"] == [0.0, 1.0, 0.0, 0.0]
     assert list(button["question"]["criteria"]) == list(BUTTONS)
     assert complete["question"]["type"] == "noul"
     assert complete["target"] == [1.0, 0.0]
     assert action["split"] == split_for("task:645_BrowserMaze")
     assert action["aliases"] == ["image-bytes:" + step.image_sha256]
-    assert action["reference"]["tool_call"]["arguments"]["button"] == "Back"
+    assert action["reference"]["tool_call"]["arguments"]["button"] == "Home"
 
 
 def test_terminate_step_rows(image_root):
@@ -632,13 +632,17 @@ def test_terminate_step_rows(image_root):
 
 
 def test_swipe_step_rows_use_dominant_axis(image_root):
-    arguments = {"action": "swipe", "coordinate": [500, 800], "coordinate2": [500, 200]}
+    arguments = {"action": "swipe", "coordinate": [500, 800], "coordinate2": [200, 800]}
     rows = rows_for_step(step_for(image_root, "demo_step1", arguments), "img.png")
-    assert [row["id"] for row in rows][-1] == "demo_step1:swipe_dir"
+    assert [row["id"] for row in rows] == [
+        "demo_step1:action",
+        "demo_step1:complete",
+        "demo_step1:swipe_dir",
+    ]
     swipe = rows[-1]
     assert swipe["dataset"] == "gui_swipe"
     assert list(swipe["question"]["criteria"]) == list(SWIPE_DIRECTIONS)
-    assert swipe["target"][list(SWIPE_DIRECTIONS).index("up")] == 1.0
+    assert swipe["target"][list(SWIPE_DIRECTIONS).index("left")] == 1.0
 
 
 def test_wait_step_rows_have_no_conditional_row(image_root):
@@ -652,6 +656,7 @@ def test_split_for_is_stable_and_covers_partitions():
     assert split_for("task:645_BrowserMaze") == "train"
     assert split_for("task:demo") == "test"
     assert split_for("task:beta") == "test"
+    assert split_for("task:002_Gallery") == "dev"
     assert split_for("task:delta") == "calibration"
 ```
 
@@ -678,7 +683,14 @@ def split_for(group: str) -> str:
 
 
 def rows_for_step(step: Step, image_path: str) -> list[dict]:
-    """One action row per step, plus button, complete, and swipe_dir rows."""
+    """One action row per step, plus button, complete, and swipe_dir rows.
+
+    `step` must come from `parse_step` (it guarantees the arguments this function
+    relies on); `image_path` is the repository-root relative path of the stored
+    image copy, not `step.image`. Rows come back in the order action, button,
+    complete, swipe_dir. Every row of a step shares `state` and `reference` **by
+    reference**: treat row values as read-only.
+    """
     arguments = step.arguments
     action = arguments["action"]
 
@@ -734,7 +746,10 @@ def rows_for_step(step: Step, image_path: str) -> list[dict]:
     if action == "swipe":
         directions = list(SWIPE_DIRECTIONS)
         direction = swipe_direction(arguments)
-        assert direction is not None  # parse_step rejects invalid swipes
+        if direction is None:
+            raise ValueError(
+                "rows_for_step requires distinct swipe axes; parse_step rejects the rest"
+            )
         rows.append(
             row(
                 "swipe_dir",
@@ -854,6 +869,37 @@ def test_isolate_drops_duplicate_inputs():
     assert dropped[0]["stage"] == "isolate"
 
 
+def test_isolate_group_naming_is_order_independent():
+    audit, dropped = Counter(), []
+    rows = [
+        row_stub("b:action", group="task:b", split="test"),
+        row_stub("a:action", group="task:a", split="train"),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["b:action"]
+    assert kept[0]["group"] == "task:a"  # canonical minimum, not the last seen
+    assert dropped[0]["id"] == "a:action"
+
+
+def test_isolate_drops_duplicate_row_ids():
+    audit, dropped = Counter(), []
+    other = {"type": "choice", "instructions": "other", "criteria": {"a": "a", "b": "b"}}
+    rows = [
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:1"),
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:2", question=other),
+    ]
+    kept = list(isolate(rows, audit, dropped))
+    assert [row["id"] for row in kept] == ["a:action"]
+    assert dropped == [
+        {
+            "id": "a:action",
+            "reason": "duplicate_input",
+            "detail": "row id already seen",
+            "stage": "isolate",
+        }
+    ]
+
+
 def test_validate_rows_rejects_unnormalized_target(image_root):
     step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
     rows = rows_for_step(step, str(step.image))
@@ -928,12 +974,14 @@ def isolate(rows: Iterable[dict], audit: Counter, dropped: list) -> Iterator[dic
         for alias in row["aliases"]:
             left, right = find(row["group"]), find(alias)
             if left != right:
-                parents[right] = left
+                # Name a merged group after its lexicographically smallest member
+                # so the result never depends on the input order of the shards.
+                parents[max(left, right)] = min(left, right)
     priority: dict[str, int] = {}
     for row in pending:
         root = find(row["group"])
         priority[root] = max(priority.get(root, 0), SPLIT_ORDER[row["split"]])
-    seen = set()
+    seen, seen_ids = set(), set()
     for row in pending:
         row["group"] = find(row["group"])
         if SPLIT_ORDER[row["split"]] != priority[row["group"]]:
@@ -942,6 +990,20 @@ def isolate(rows: Iterable[dict], audit: Counter, dropped: list) -> Iterator[dic
                 {"id": row["id"], "reason": "cross_split_group", "detail": "", "stage": "isolate"}
             )
             continue
+        if row["id"] in seen_ids:
+            # Two records minted the same row id: exclude the later one instead of
+            # letting validate_rows abort the whole conversion.
+            audit[f"{row['dataset']}:{row['split']}:duplicate_input"] += 1
+            dropped.append(
+                {
+                    "id": row["id"],
+                    "reason": "duplicate_input",
+                    "detail": "row id already seen",
+                    "stage": "isolate",
+                }
+            )
+            continue
+        seen_ids.add(row["id"])
         key = digest(
             json.dumps(
                 [row["dataset"], row["group"], row["state"], row["question"]], sort_keys=True
@@ -984,7 +1046,7 @@ def validate_rows(rows: Iterable[dict]) -> None:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(38 passed)
+Expected: PASS(40 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1044,6 +1106,7 @@ def test_cli_writes_splits_manifest_and_images(tmp_path, image_root):
     output = convert(image_root, steps)
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["schema_version"] == 1
+    assert manifest["split_limits"] == [["calibration", 10], ["dev", 20], ["test", 30]]
     assert manifest["token_check"] == "skipped"
     assert manifest["exclusions"] == {}
     assert set(manifest["sha256"]) == set(prepare.SPLITS)
@@ -1155,6 +1218,7 @@ from dohnuts.gui_data import (
     BUTTONS,
     COMPLETE_CRITERIA,
     INSTRUCTIONS,
+    SPLIT_LIMITS,
     SPLIT_SEED,
     SWIPE_DIRECTIONS,
     isolate,
@@ -1259,6 +1323,7 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     manifest = {
         "schema_version": 1,
         "split_seed": SPLIT_SEED,
+        "split_limits": SPLIT_LIMITS,
         "source": {
             "input": str(source),
             "files": [{"path": str(path), "sha256": digest_file(path)} for path in paths],
@@ -1311,7 +1376,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(42 passed,1 skipped — 若本地存在 `example-data/` 则为 43 passed)
+Expected: PASS(44 passed,1 skipped — 若本地存在 `example-data/` 则为 45 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
@@ -1491,7 +1556,7 @@ def main(argv=None):
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `pdm run pytest tests/test_gui_data.py -q`
-Expected: PASS(45 passed)
+Expected: PASS(47 passed)
 
 - [ ] **Step 5: 格式化、lint、typecheck**
 
