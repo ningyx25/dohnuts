@@ -1,9 +1,14 @@
 # Train and evaluate Dohnuts
 
-Use Python 3.12 and a working PyTorch ROCm installation on the RX 7900 XTX.
-The recorded training environment is preserved in
-`data/manifests/environment-freeze.txt`. Follow the [PDM setup](inference.md)
-first; the package sources and lock file select the ROCm wheels.
+> **NVIDIA branch.** This branch replaces the recorded ROCm install with
+> PyTorch 2.9.1 + CUDA 12.8. Recipe, data, and model code paths are unchanged;
+> `data/manifests/environment-freeze.txt` and the model card describe the
+> original RX 7900 XTX run.
+
+Use Python 3.12 and a working PyTorch CUDA installation. The recorded training
+environment is preserved in `data/manifests/environment-freeze.txt`. Follow the
+[PDM setup](inference.md) first; the package sources and lock file select the
+CUDA wheels.
 
 ```bash
 pdm install --check --prod -G train -G agent

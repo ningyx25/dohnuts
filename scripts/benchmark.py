@@ -99,7 +99,7 @@ def measure(args, agent, engine_label):
             "merged_lora": args.engine == "dohnuts" and args.checkpoint is not None,
             "trained_vision": args.engine == "laya-vision",
             "torch": torch.__version__,
-            "hip": torch.version.hip,
+            "cuda": torch.version.cuda,
             "torch_module": torch.__file__,
         },
     )

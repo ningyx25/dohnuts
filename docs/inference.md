@@ -1,7 +1,13 @@
 # Installation and inference
 
-The measured runtime uses Python 3.12, PyTorch 2.9.1 with ROCm 6.4, and an
-AMD Radeon RX 7900 XTX. Install [PDM](https://pdm-project.org/en/latest/#installation)
+> **NVIDIA branch.** This branch replaces the recorded ROCm install with
+> PyTorch 2.9.1 + CUDA 12.8. Only the GPU backend changed; model, data, and
+> recipe code paths are unchanged, so the numbers in the model card and the
+> [benchmarks](local-benchmarks.md) still refer to the original RX 7900 XTX run.
+
+The reference runtime uses Python 3.12, PyTorch 2.9.1, and an NVIDIA GPU with a
+driver that supports CUDA 12.8. Install
+[PDM](https://pdm-project.org/en/latest/#installation)
 2.29.2 or a newer 2.x release, then install from source:
 
 ```bash
@@ -12,7 +18,8 @@ pdm install --check --prod
 ```
 
 The lock file targets Python 3.12. The package sources in `pyproject.toml` bind
-PyTorch, torchvision, and PyTorch's Triton runtime to the ROCm 6.4 index.
+PyTorch and torchvision to the CUDA 12.8 index; the Triton runtime resolves from
+PyPI through torch's own dependency.
 Keep PDM's native resolver enabled: its experimental uv resolver does not support
 these package-to-index bindings. See [development](development.md) for dependency
 groups, checks, and updating the lock.

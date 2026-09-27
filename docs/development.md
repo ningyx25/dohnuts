@@ -1,7 +1,7 @@
 # Development
 
 Use Python 3.12 and [PDM](https://pdm-project.org/en/latest/#installation) 2.29.2
-or a newer 2.x release. The runtime targets the Linux/ROCm environment documented
+or a newer 2.x release. The runtime targets the Linux/CUDA environment documented
 in the [inference guide](inference.md). The quality and documentation groups can
 be installed without model dependencies.
 
@@ -21,7 +21,7 @@ Run `make help` to see the available targets.
 
 `pyproject.toml` owns the package metadata, dependencies, tool settings, and PDM
 commands. `pdm.lock` records the resolution for Python 3.12, including the pinned
-Bub Git revision and the ROCm package artifacts. The published experiment's
+Bub Git revision and the CUDA package artifacts. The published experiment's
 environment snapshot remains historical evidence, not an installation input.
 
 | Selection | Purpose |
@@ -39,7 +39,7 @@ lock rather than resolving different versions. Avoid replacing a trained run's
 environment while it is active.
 
 Keep `use_uv = false` in `pdm.toml`: PDM's experimental uv mode does not support
-the package-to-index bindings used for ROCm. Other packages resolve from PyPI.
+the package-to-index bindings used for CUDA. Other packages resolve from PyPI.
 
 ## Checks and builds
 
@@ -60,7 +60,7 @@ Run an individual file or case with `pdm run pytest tests/test_rlcd.py` or
 `pdm run pytest -k gradients`. Test discovery is limited to `tests/` in
 `pyproject.toml`.
 
-The test job installs the same locked ROCm wheels, checks types, and runs the tests
+The test job installs the same locked CUDA wheels, checks types, and runs the tests
 on CPU. It removes unused Android and .NET SDKs from its temporary Ubuntu runner to make
 room for Torch, and skips the large dependency cache. Quality and website jobs
 do not install the model runtime.

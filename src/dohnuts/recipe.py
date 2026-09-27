@@ -42,8 +42,7 @@ def training_recipe(*, model=BASE_MODEL, data=DATA, seed=42, rlcd=None, steps=TR
         "save_every": 100,
         "backend": {
             "linear_patch": True,
-            "triton_convolution": True,
-            "experimental_rocm_sdpa": True,
+            "triton_convolution": False,
             "fused_norm_and_swiglu": True,
             "shared_prefix": True,
             "frozen_vision_cache_MiB": 128,

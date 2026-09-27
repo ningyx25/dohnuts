@@ -1,2 +1,2 @@
-# Package-to-index bindings are required for the recorded ROCm runtime.
+# Package-to-index bindings are required for the recorded CUDA runtime.
 use_uv = false

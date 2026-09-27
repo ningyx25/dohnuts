@@ -44,8 +44,7 @@ def main():
     logs.mkdir(exist_ok=True)
     env = {
         **os.environ,
-        "ROCR_VISIBLE_DEVICES": "0",
-        "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+        "CUDA_VISIBLE_DEVICES": "0",
         "TRITON_CACHE_DIR": str(Path(".cache/triton").resolve()),
         "HF_HOME": str(Path(".cache/hf").resolve()),
         "TOKENIZERS_PARALLELISM": "false",

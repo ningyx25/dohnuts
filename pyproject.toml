@@ -11,13 +11,13 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.12"
 dependencies = [
-  "torch>=2.9",
-  "torchvision>=0.24",
+  "torch==2.9.1",
+  "torchvision==0.24.1",
   "transformers>=5.17,<5.18",
   "peft>=0.21,<0.22",
   "Pillow>=11",
   "huggingface-hub>=1.0,<2",
-  "flash-linear-attention[rocm]==0.5.2",
+  "flash-linear-attention[cuda]==0.5.2",
 ]
 
 [project.optional-dependencies]
@@ -51,12 +51,12 @@ source-includes = [
 [[tool.pdm.source]]
 name = "pypi"
 url = "https://pypi.org/simple"
-exclude_packages = ["torch", "torchvision", "pytorch-triton-rocm"]
+exclude_packages = ["torch", "torchvision"]
 
 [[tool.pdm.source]]
-name = "pytorch-rocm"
-url = "https://download.pytorch.org/whl/rocm6.4"
-include_packages = ["torch", "torchvision", "pytorch-triton-rocm"]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu128"
+include_packages = ["torch", "torchvision"]
 exclude_packages = ["*"]
 
 [tool.pdm.scripts]
