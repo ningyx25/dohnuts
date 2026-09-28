@@ -248,3 +248,171 @@ exactly which rows went and why before trusting the split sizes.
 pdm run python scripts/prepare_gui_data.py \
   --input data/raw/gui --output data/processed/gui-v1 --model Qwen/Qwen3.5-0.8B
 ```
+
+## Android Control conversion
+
+`scripts/prepare_android_control_data.py` converts
+[Android Control](https://console.cloud.google.com/storage/browser/gresearch/android_control)
+episodes into decision rows; it is the sibling of the GUI converter above. An
+episode is one directory: `metadata_{episode_id}.json` lists its steps, and every
+step points at a screenshot plus a `step_NNN_a11y.json` accessibility forest. The
+converter reuses the gui-v1 split seed, vocabularies, isolation and self-check,
+and adds one question family that needs the element tree: which element to act
+on. The parsed corpus holds 15,283 episodes and 99,131 steps, 83,848 of them with
+an action; output goes under the gitignored `data/processed/` (the `ac-v1`
+convention).
+
+Each step yields two or three rows that share state, group and image aliases, one
+question per row:
+
+| Question | Dataset | Type | Candidates | Target | Rows |
+| --- | --- | --- | --- | --- | --- |
+| `action` | `gui_action` | choice | the nine actions below | the step's action | every step |
+| `complete` | `gui_complete` | noul | false, true | whether the episode ends here | every step |
+| `element` | `screenshot_choice` | choice | the step's clickable elements | the element under the action's point | click, long_press |
+| `swipe_dir` | `gui_swipe` | choice | up, down, left, right | the finger's direction | scroll |
+| `button` | `gui_button` | choice | Back, Home, Menu, Enter | Back or Home | navigate_back, navigate_home |
+
+Row ids are `android_control_{episode}_step{n}:{family}`, with `n` the step's
+0-based position in the episode, and the group is
+`task:android_control_{episode}`, so one episode never straddles splits. Buckets
+are the shared `int(sha256("doh-gui-split-2026:" + group)[:8], 16) % 100`
+(calibration < 10, dev < 20, test < 30, train otherwise), and the shared split
+priority `train < calibration < dev < test` is resolved per record on screenshot
+bytes: a click step's rows carry two `image-bytes:` aliases (the raw screenshot
+and the marked copy), the other rows carry the raw one, and byte-identical
+screenshots never straddle splits, so a repeated initial screen costs only the
+rows that repeat it.
+
+**Action mapping.** Android Control actions map onto the mobile_use vocabulary:
+
+| Android Control action | mobile_use action | Extra row |
+| --- | --- | --- |
+| click(x, y), long_press(x, y) | click, long_press; the pixel point stays in `reference` | element |
+| scroll(direction) | swipe, direction inverted | swipe_dir |
+| input_text(text) | type; the text stays in `reference` | — |
+| wait | wait | — |
+| open_app(app_name) | open_app | — |
+| navigate_back, navigate_home | system_button (Back, Home) | button |
+| null action (the last step) | terminate | complete target is `true` |
+
+- `open_app` is appended after the eight gui-v1 actions as index 8, so indices
+  0–7 keep their gui-v1 meaning; its criterion is "open an app by name". The
+  vocabulary keeps all nine classes, so `answer` stays a criterion even though no
+  Android Control action maps to it.
+- Scroll directions are inverted deliberately. Android Control records where the
+  content moves — `scroll down` reveals content below the fold, so the finger
+  moves up — while gui-v1 derives `swipe_dir` from the finger's displacement.
+  Inverting keeps `up`/`down` meaning the same finger motion in both datasets,
+  and lives in one constant.
+- The last step of every episode carries a null action and becomes `terminate`
+  with `complete = true`. Episodes are treated as successful demonstrations; the
+  parsed corpus no longer carries the source `goal_status` field that would
+  confirm it.
+
+**Element questions.** Candidates are the nodes that are clickable and visible
+with a non-degenerate box on screen, in window order then node order. They are
+numbered contiguously `r0..r{N-1}`: a node that is not clickable, or has an
+unusable box, consumes no number, and nothing is deduplicated, so clickable
+containers with children stay candidates and the keys cannot be read off the raw
+node list. The ground truth is the candidate whose box contains the action's
+pixel point — smallest area first, earlier candidate on a tie — and a point that
+hits no candidate excludes the step (`no_target_element`) instead of guessing.
+Fewer than 2 or more than 128 candidates also exclude the step
+(`too_few_candidates`, `too_many_candidates`). A criterion is
+`"UI element {i}: {payload}"`, where the payload is JSON holding only a
+non-empty `text` and/or `content_description`, in that key order, and `{}` when
+the node has neither; node flags, class names and indices never reach the prompt.
+The instruction is "Which action should be taken next to complete the user's
+task?", the wording the dataset itself ships for this question.
+
+**Marked screenshots.** The element row ships a set-of-mark rendering: every
+candidate is boxed in green and numbered with a white chip in the same order as
+the criteria, nothing else is drawn, and the ground truth is not highlighted. The
+label size scales with the image height. The PNG drops the source image's
+metadata, so its bytes are a pure function of the pixels, the candidate list, and
+the Pillow version — content-addressed file names are only reproducible for a
+fixed Pillow, which is why each manifest records `environment.python` and
+`environment.pillow`. The element row points at the marked copy, every other row
+of the step points at the raw copy, and all of them carry both aliases.
+
+**State.** `user_query` is the episode goal verbatim. `task_progress` is a
+deterministic template over the completed steps' instructions —
+`"(You have done the following operation on the current device): Step 1: …; Step
+2: …; ."` — and never the current step's instruction; the numbering closes over
+the instructions that exist. The dataset's own narration was human-written and is
+not reproducible, so this wording differs from it by design.
+
+**Token budget.** The budget is checked when `--model` names a local snapshot
+(skip with `--no-token-check`), before anything is written. The estimate mirrors
+the training collator: rendered text tokens plus the expanded image placeholders
+at `IMAGE_PIXELS`, against `MAX_LENGTH = 2048`. A step over budget is excluded
+whole as `token_budget`, with the longest of its rows in `detail`, so a step is
+never partially converted. The check is load-bearing: `DecisionCollator` raises
+on an over-budget batch instead of truncating. Measured on the parsed corpus, 520
+of 49,924 element rows (1.04%) exceed the budget; the worst is 38,642 tokens
+(18.9 times the limit) because one accessibility node's `text` was an entire PDF.
+The median row is 624 tokens and p99 is 2,070. Probing the whole corpus (99,131
+steps) costs about six minutes.
+
+**Exclusions and audit.** The parse stage drops whole steps
+(`unparsable_metadata`, `missing_image`, `missing_a11y`, `unknown_action`,
+`too_few_candidates`, `too_many_candidates`, `no_target_element`, `token_budget`,
+`unexpected`); `unparsable_metadata` also covers an episode whose directory id
+and record id disagree. The isolate stage drops rows (`cross_split_group`,
+`duplicate_input`). Both land in `excluded.jsonl` with
+`{id, reason, detail, stage}` and in the manifest's `exclusions` counts.
+Parse-stage entries carry the step id or the episode directory name; isolate-stage
+entries carry the row id with its family suffix.
+
+**Manifest.** `element_stats` and `element_resolution` both describe the element
+family, both keyed by split and both carrying a `basis` field, but they answer
+different questions: `element_stats` (`basis: post_isolation`) counts the element
+rows that were actually written, with candidate min/mean/max and
+`empty_target_payload_rate`, while `element_resolution` (`basis: pre_isolation`)
+counts the steps that asked an element question before isolation, with
+`element_rows`, the three refusal counts and `hit_rate`; splits without element
+rows are absent from `element_stats`. `source.metadata_sha256` hashes only the
+readable metadata files, and `metadata_files_hashed` says how many those were.
+`images` lists exactly the PNG files this run wrote under `<output>/images/`
+(raw and marked, content-addressed): a step that fails is excluded before
+anything is stored, so the directory and the list agree. `vocabularies` carries
+the nine actions, buttons, swipe directions, instructions, complete criteria, and
+two plain-language entries — `element_rule` and `marked_images` — that state the
+candidate and marking rules without the source. `dataset_weighting` records that
+the five dataset names are drawn uniformly, so `gui_button` and `gui_swipe` rows,
+which exist only on the steps that press a button or scroll, are relatively
+upweighted.
+
+**Metrics.** `screenshot_choice` is in `metrics.py`'s macro-F1 suppression set,
+because its candidate labels are per-row (every row's `r0..r{N-1}` comes from its
+own screen) and macro-F1 over cross-row label indices would be meaningless.
+Per-row accuracy, `macro_accuracy` and checkpoint selection still include it.
+
+**Separate output directory.** AC rows are written to their own directory
+(`data/processed/ac-v1`) rather than into `gui-v1`, because `gui_action` here has
+nine classes where gui-v1 has eight. Under one dataset name the by-dataset
+aggregates would mix two label semantics, and both the temperature fit and the
+collator pad to the widest target of a batch or decision type, so the two
+vocabularies stay in separate trees. Indices 0–7 still mean the same action in
+both pipelines.
+
+**Known limits.** The terminal-step mapping assumes every episode is a successful
+demonstration. `task_progress` is mechanically templated. A large share of
+ground-truth element payloads are `{}` (measured at ~44–49% on real subsets)
+because many clickable nodes are unlabeled containers; the numbered screenshot
+carries the signal and `element_stats.empty_target_payload_rate` records it. The
+ground-truth element is inferred by hit test rather than given, so a point that
+lands in several boxes resolves by the smallest-area rule. Marked bytes depend on
+the Pillow version. The label numbering differs from the hand-built smoke row in
+`example-data/train.jsonl`, which numbers dataset indices with gaps instead of
+contiguous clickable-only candidates. As in the GUI converter, symbol links
+inside the input root can still resolve outside it.
+
+```bash
+# Run from the repository root. --input is the directory of {episode_id} episode
+# directories; --model points at a local snapshot, or the token check is skipped.
+pdm run python scripts/prepare_android_control_data.py \
+  --input example-data/android_control_parsered/parsered \
+  --output data/processed/ac-v1 --model Qwen/Qwen3.5-0.8B
+```
