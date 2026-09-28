@@ -1,6 +1,7 @@
 """Android Control step parsing, action mapping, element extraction, and row rules."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -755,7 +756,7 @@ def test_parse_step_reads_a_click_step_and_resolves_the_target(tmp_path):
             "arguments": {"action": "click", "coordinate": [75, 75]},
         },
         "ac_action": {"action_type": "click", "x": 75, "y": 75},
-        "element_index": 1,
+        "element_position": 1,
     }
 
 
@@ -781,10 +782,16 @@ def test_click_step_yields_action_complete_and_element_rows(tmp_path):
     assert [row["dataset"] for row in rows] == ["gui_action", "gui_complete", "screenshot_choice"]
     assert {row["group"] for row in rows} == {"task:android_control_7"}
     assert {row["split"] for row in rows} == {split_for("task:android_control_7")}
-    # state, aliases and reference are shared by every row of the step.
+    # state and reference are shared by every row of the step; the alias list
+    # is equal by content only, so annotating one row cannot touch the others.
     assert rows[0]["state"] is rows[2]["state"]
-    assert rows[0]["aliases"] is rows[2]["aliases"]
     assert rows[0]["reference"] is rows[2]["reference"]
+    assert rows[0]["aliases"] == rows[2]["aliases"]
+    assert rows[0]["aliases"] is not rows[2]["aliases"]
+    choice_aliases = rows[2]["aliases"].copy()
+    rows[2]["aliases"].append("image-bytes:annotated")
+    assert rows[0]["aliases"] == choice_aliases
+    rows[2]["aliases"][:] = choice_aliases
     action, complete, choice = rows
     assert action["question"]["type"] == "choice"
     assert action["question"]["instructions"] == INSTRUCTIONS["action"]
@@ -952,7 +959,7 @@ def test_terminal_step_yields_terminate_rows_without_an_accessibility_tree(tmp_p
         "action": "",
         "tool_call": {"name": "mobile_use", "arguments": {"action": "terminate"}},
         "ac_action": None,
-        "element_index": None,
+        "element_position": None,
     }
     rows = rows_for_ac_step(step, "episode/step_001_screenshot.png")
     assert [row["id"] for row in rows] == [
@@ -988,6 +995,31 @@ def test_rows_for_ac_step_requires_the_marked_screenshot_for_element_rows(tmp_pa
     assert rows_for_ac_step(waited, RAW_IMAGE, (MARKED_IMAGE, "marked"))[0]["aliases"] == [
         "image-bytes:" + waited.image_sha256
     ]
+
+
+def test_rows_for_ac_step_rejects_an_element_target_outside_the_candidates(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(
+            0,
+            {"action_type": "click", "x": 75, "y": 75},
+            "Tap",
+            directory=directory,
+            nodes=click_nodes(),
+        )
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    # A hand-built step must not mint an all-zeros target, which would silently
+    # teach the model that no candidate is the answer.
+    for broken in (
+        replace(step, target_element=None),
+        replace(step, target_element=len(step.elements)),
+        replace(step, target_element=-1),
+        replace(step, elements=[]),
+    ):
+        with pytest.raises(ValueError, match="element target"):
+            rows_for_ac_step(broken, RAW_IMAGE, (MARKED_IMAGE, "marked"))
+    assert rows_for_ac_step(step, RAW_IMAGE, (MARKED_IMAGE, "marked"))[2]["target"] == [0.0, 1.0]
 
 
 def test_state_template_is_empty_at_the_first_step(tmp_path):
@@ -1058,7 +1090,7 @@ def test_reference_keeps_the_raw_action_and_the_mapped_arguments(tmp_path):
             "arguments": {"action": "swipe", "direction": "right"},
         },
         "ac_action": {"action_type": "scroll", "direction": "left"},
-        "element_index": None,
+        "element_position": None,
     }
 
 
@@ -1081,10 +1113,30 @@ def test_parse_step_excludes_missing_and_undecodable_screenshots(tmp_path):
     assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
     record["steps"][0]["screenshot"] = "/etc/hostname"
     assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
+    # A screenshot name that is not a usable file name is a structure problem,
+    # so it is reported by the step check rather than by the reader.
     record["steps"][0]["screenshot"] = ""
-    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
+    assert parse_step(record, 0, episode_dir=directory) == (None, "unparsable_metadata")
     (directory / "junk.png").write_bytes(b"not an image")
     record["steps"][0]["screenshot"] = "junk.png"
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
+    (directory / "empty.png").write_bytes(b"")
+    record["steps"][0]["screenshot"] = "empty.png"
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
+
+
+def test_parse_step_excludes_truncated_screenshots(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(ac_step(0, {"action_type": "wait"}, "Wait", directory=directory))
+    whole = (directory / "step_000_screenshot.png").read_bytes()
+    # The header still reads, so only a container walk can tell the file is cut.
+    truncated = directory / "truncated.png"
+    truncated.write_bytes(whole[: len(whole) // 2])
+    record["steps"][0]["screenshot"] = "truncated.png"
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
+    header_only = directory / "header_only.png"
+    header_only.write_bytes(whole[: 8 + 25])
+    record["steps"][0]["screenshot"] = "header_only.png"
     assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
 
 
@@ -1209,7 +1261,7 @@ def test_parse_step_never_raises_on_junk_inside_a_valid_step(tmp_path):
     entry = ac_step(
         0,
         {"action_type": "click", "x": 75, "y": 75, "junk": object()},
-        42,  # a junk instruction reads as no instruction at all
+        "Tap",
         directory=directory,
         nodes=[
             {"boundsInScreen": "box", "isClickable": True, "isVisibleToUser": True},
@@ -1224,22 +1276,45 @@ def test_parse_step_never_raises_on_junk_inside_a_valid_step(tmp_path):
     step, reason = parse_step(record, 0, episode_dir=directory)
     assert reason is None
     assert step.target_element == 0
-    assert [entry["text"] for entry in step.elements] == ["ok", "also ok"]
-    # A junk instruction is not a past instruction: the history stays empty.
-    assert step.state["task_progress"].endswith("): .")
-    assert step.instruction is None
+    assert [element["text"] for element in step.elements] == ["ok", "also ok"]
     assert step.reference == {
         "thought": "",
-        "action": "",
+        "action": "Tap",
         "tool_call": {
             "name": "mobile_use",
             "arguments": {"action": "click", "coordinate": [75, 75]},
         },
         "ac_action": {"action_type": "click", "x": 75, "y": 75, "junk": entry["action"]["junk"]},
-        "element_index": 0,
+        "element_position": 0,
     }
     rows = rows_for_ac_step(step, RAW_IMAGE, (MARKED_IMAGE, "marked"))
     assert len(rows) == 3
+
+
+def test_parse_step_rejects_a_step_that_dropped_the_action_key(tmp_path):
+    directory = tmp_path / "episode"
+    entry = ac_step(0, None, None, directory=directory)
+    del entry["action"]
+    # A missing key is not a null action: it must never read as terminate, so
+    # the step is excluded and no row is minted for it.
+    assert parse_step(ac_episode(entry), 0, episode_dir=directory) == (
+        None,
+        "unparsable_metadata",
+    )
+    entry = ac_step(0, {"action_type": "wait"}, "Wait", directory=directory)
+    del entry["step_instruction"]
+    assert parse_step(ac_episode(entry), 0, episode_dir=directory) == (
+        None,
+        "unparsable_metadata",
+    )
+    # The real terminal shape keeps the key and still parses, with both rows.
+    terminal = ac_step(0, None, None, directory=directory)
+    step = parse_ac_step(ac_episode(terminal), 0, directory=directory)
+    assert step.action == "terminate"
+    assert [row["id"] for row in rows_for_ac_step(step, RAW_IMAGE)] == [
+        "android_control_7_step0:action",
+        "android_control_7_step0:complete",
+    ]
 
 
 def test_rows_for_ac_step_is_deterministic(tmp_path):

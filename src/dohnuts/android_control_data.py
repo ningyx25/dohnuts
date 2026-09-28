@@ -353,6 +353,16 @@ def read_screenshot(episode_dir: Path, name: object) -> tuple[Path, str, tuple[i
     never read outside its own episode. The returned size is the pixel size
     (width, height) the element rules measure bounds against, and the digest is
     of the file bytes on disk, which is what the row aliases carry.
+
+    Only the container is validated here: `Image.open` reads the header and
+    rejects decompression bombs, and `verify` walks the rest of the file, which
+    is everything the element bounds need and a fraction of the cost of a full
+    decode. Decoding every pixel here would be thrown away, because the stored
+    copy is what gets decoded again. Pixel decodability is proven later on
+    purpose: the marking step decodes every element screenshot, and
+    `validate_rows` re-opens every stored image at the end of a run, so a file
+    that only fails at decode time surfaces as a per-step `unexpected`
+    exclusion or a self-check failure instead of a silently wrong row.
     """
     if not isinstance(name, str) or not name:
         return None
@@ -364,10 +374,10 @@ def read_screenshot(episode_dir: Path, name: object) -> tuple[Path, str, tuple[i
         if not image.is_file():
             return None
         with Image.open(image) as handle:
-            handle.convert("RGB")
             size = handle.size
+            handle.verify()
         return image, image_digest(image), size
-    except (OSError, ValueError, Image.DecompressionBombError):
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
         return None
 
 
@@ -448,14 +458,15 @@ def parse_step(
     the step to parse. The envelope is checked again here, so a caller that
     skips `parse_metadata` gets a reason string instead of a traceback.
 
-    Reasons: `unparsable_metadata` (the envelope or the index is unusable),
-    `missing_image` (the screenshot is missing, undecodable, or outside the
-    episode directory), `unknown_action` (`map_action` does not know the
-    action), `missing_a11y` (a click or long_press step without a readable
-    accessibility forest), and `resolve_element_choice`'s `too_few_candidates`,
-    `too_many_candidates` and `no_target_element`. Any element reason excludes
-    the whole step: a step is never partially converted. The forest is opened
-    only for `click` and `long_press` steps.
+    Reasons: `unparsable_metadata` (the envelope, the index, or the step entry
+    is structurally unusable, checked with `validate_step`), `missing_image`
+    (the screenshot is missing, unreadable, or outside the episode directory),
+    `unknown_action` (`map_action` does not know the action), `missing_a11y` (a
+    click or long_press step without a readable accessibility forest), and
+    `resolve_element_choice`'s `too_few_candidates`, `too_many_candidates` and
+    `no_target_element`. Any element reason excludes the whole step: a step is
+    never partially converted. The forest is opened only for `click` and
+    `long_press` steps.
 
     The last step of an episode has a null action; it becomes a `terminate` step
     with an empty candidate list and no instruction.
@@ -470,7 +481,11 @@ def parse_step(
     if not isinstance(steps, list) or not is_integer(index) or not 0 <= index < len(steps):
         return None, "unparsable_metadata"
     step = steps[index]
-    if not isinstance(step, dict):
+    # The same structure check `parse_metadata` runs, applied here so both entry
+    # points agree by construction. It matters most for `action`: a step that
+    # dropped the key would otherwise read as the terminal step and mint a
+    # confident `terminate` answer for a step nobody knows the action of.
+    if not validate_step(step):
         return None, "unparsable_metadata"
     screenshot = read_screenshot(episode_dir, step.get("screenshot"))
     if screenshot is None:
@@ -532,7 +547,7 @@ def parse_step(
                 "action": instruction or "",
                 "tool_call": {"name": "mobile_use", "arguments": arguments},
                 "ac_action": ac_action,
-                "element_index": target_element,
+                "element_position": target_element,
             },
         ),
         None,
@@ -551,13 +566,14 @@ def rows_for_ac_step(
     is only read by the element family; it is ignored by the other families.
 
     Rows come back in the order action, complete, element or button or
-    swipe_dir. Every row of a step shares `state`, `group`, `aliases` and
-    `reference` **by reference**: treat row values as read-only.
+    swipe_dir. Every row of a step shares `state`, `group` and `reference`
+    **by reference** (treat those values as read-only) and carries its own copy
+    of the step's alias list.
 
-    Two programming errors raise a `ValueError`, with the same posture as
+    Three programming errors raise a `ValueError`, with the same posture as
     `gui_data.rows_for_step`'s swipe guard: an element step without `marked`,
-    and an element step whose `target_element` was never resolved (which
-    `parse_step` cannot produce).
+    and an element step whose `target_element` is missing or does not name one
+    of its candidates (neither of which `parse_step` can produce).
     """
     element_row = step.action in ("click", "long_press")
     if element_row and marked is None:
@@ -576,7 +592,7 @@ def rows_for_ac_step(
             "id": f"{step.id}:{name}",
             "dataset": DATASETS[name],
             "group": step.group,
-            "aliases": aliases,
+            "aliases": list(aliases),
             "split": split,
             "state": step.state,
             "image": image,
@@ -608,9 +624,10 @@ def rows_for_ac_step(
         ),
     ]
     if element_row:
-        if step.target_element is None:
+        if step.target_element is None or not 0 <= step.target_element < len(step.elements):
             raise ValueError(
-                "rows_for_ac_step requires a resolved element target; parse_step rejects the rest"
+                "rows_for_ac_step requires an element target that names a candidate;"
+                " parse_step rejects the rest"
             )
         rows.append(
             row(
