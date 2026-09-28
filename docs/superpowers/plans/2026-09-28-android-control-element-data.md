@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12、PIL、transformers(AutoProcessor/smart_resize)、pytest、ruff、ty、pdm。
 
-**状态(2026-09-28):** Task 1–7 已完成;Task 8(全语料转换)运行中。
+**状态(2026-09-28):** Task 1–8 均已完成(Task 7 端到端冒烟、Task 8 全语料转换都已跑通)。
 
 **约定(每个任务都适用):**
 
@@ -126,23 +126,41 @@ Task 4 `5accff3` `778c39d`;Task 5 `c528e5f` `307f9e1`;Task 6 文档提交(见下
 
 ## Task 8: 真实数据转换与交付检查
 
-- [ ] **Status:** 待执行 —— **全量转换运行中**(15,283 个 episode 的转换正在跑,数字在其完成后记录)
+- [x] **Status:** 完成
 
 ```bash
 pdm run python scripts/prepare_android_control_data.py \
   --input example-data/android_control_parsered/parsered \
-  --output data/processed/ac-v1 --model Qwen/Qwen3.5-0.8B
+  --output data/processed/ac-v1 --model Qwen/Qwen3.5-0.8B --workers 32
 ```
 
-**检查清单(执行后逐项确认):**
+**运行记录(2026-09-28):** 退出码 0,墙钟约 28 分钟(`--workers 32`;同规模的串行估计约
+5 小时),输出 74 GB(其中 `images/` 73 GB),运行未改动仓库内任何被跟踪文件。
 
-1. 四 split 非空,`screenshot_choice` 在各 split 有行;calibration 的 choice 与 noul 各 ≥10(否则温度保持 1.0)。
-2. `no_target_element`/`too_few_candidates` 排除率若 >10% 需复查命中规则。
-3. `action_classes` 各 split 分布相近,`open_app` 出现在 9 类分布里。
-4. `element_stats` 候选数均值与探索一致(约 12 起,21 episode 小样 21.8);`empty_target_payload_rate` 以该次运行自己的 `element_stats` 为准:全语料探针测得 21,507/49,924(43.08%)可解析 GT 目标无文案,150 episode 样本每 split 44–49%,小样本波动大(21 episode 小样整体 38/63 = 60.3%,train 0.607 / dev 0.40 / test 1.0)。
-5. `token_check: enabled`,`parse:token_budget` 逐条可解释(全语料预计约 520 条,与探针一致)。
-6. 磁盘:输出预计 ~40–50 GB(99k 原图 + 52k 标号图),先 `df -h` 确认。
-7. 转换后不要再改 `data/processed/ac-v1` 下的 jsonl(`train.py` 会比对 SHA-256)。
+**产物数字(独立检查脚本对 artifact 复核,并与 manifest 交叉核对):**
+
+| 项 | 值 |
+| --- | --- |
+| 行数 | 256,897 |
+| 按族 | `gui_action` 96,540 / `gui_complete` 96,540 / `screenshot_choice` 49,652 / `gui_swipe` 11,106 / `gui_button` 3,059 |
+| 按 split | train 179,797 / dev 26,790 / calibration 24,282 / test 26,028 |
+| jsonl 体积 | train 291.6 MB / dev 43.5 MB / calibration 39.2 MB / test 42.1 MB;`manifest.json` 11 MB(多为 145,427 个图片名的列表) |
+| `source` | episodes 15,283、`metadata_files_hashed` 15,283、`metadata_sha256` `8d574da9…` |
+| `element_resolution` | `element_rows` 49,760、`hit_rate` 0.9653(`basis: pre_isolation`) |
+| `element_stats`(post_isolation) | 每 split:候选数 mean 21.7–22.1、max 91–114;`empty_target_payload_rate` 0.403–0.426;`multi_hit_rate` 0.296–0.306;`max_hits` 8–14 |
+| 图片 | 磁盘 == manifest == 145,427;被行引用 145,399;28 个"列出但未引用" |
+
+**检查清单复核:**
+
+1. 四 split 非空;calibration 的 choice 与 noul 各 24,282 行(≥10);`screenshot_choice` 四 split 均有行(train 34,848 / dev 5,180 / calibration 4,672 / test 4,952)。
+2. 排除逐条可解释:`parse:no_target_element` 1,288、`parse:too_few_candidates` 496、`parse:too_many_candidates` 6、`parse:token_budget` 535(合计 96,540 步的 2.4%,命中规则无需复查);`missing_image`/`missing_a11y`/`unknown_action`/`unparsable_metadata`/`unexpected` 均为 0。隔离期 `cross_split_group` 共 668 行,集中在 train(`gui_action` train 220、`screenshot_choice` train 85),`duplicate_input` 为 0 —— 逐记录消歧按预期工作。
+3. `action_classes` 各 split 类别齐全,`open_app` 四个 split 都出现(517 / 590 / 561 / 3,999);`answer` 如预期从不出现。
+4. `element_stats` 候选数 mean 21.7–22.1(高于早期探索的"每屏约 12 个可点击元素"估计,以 manifest 为准);`empty_target_payload_rate` 0.403–0.426,整体 15,079/49,652 = 30.37% 的元素行是软标签(与转换前语料预期 30.38% 一致);目标自检 0 个和不为 1、0 个宽度不符。
+5. `token_check: enabled`;`parse:token_budget` 535 条,与探针的 ~520 条一致。
+6. 磁盘最终 74 GB,高于 40–50 GB 的预估(原图与标号图都按内容寻址、未压缩保存)。
+7. 转换后未再改动 `data/processed/ac-v1` 下的 jsonl(四文件 sha256 记在 manifest)。
+
+**运行说明(运维观察,非缺陷):** 自检的最后一步要对 73 GB PNG 逐个 `verify()`,是 I/O 密集的尾段(本文件系统上约 10–15 分钟);`--workers 32` 只在 episode 层并行,合并顺序固定,输出与 `--workers 1` 逐字节一致。
 
 ---
 
@@ -150,13 +168,13 @@ pdm run python scripts/prepare_android_control_data.py \
 
 | 条目 | 状态 | 证据 |
 | --- | --- | --- |
-| `pdm run test` 全绿、不依赖 GPU | 通过 | 193 passed(其中 AC 两个文件 105 个用例) |
+| `pdm run test` 全绿、不依赖 GPU | 通过 | 216 passed(其中 AC 两个文件 127 个用例;首轮结束时为 193 passed / 105 个用例) |
 | `pdm run check` | 通过(被跟踪文件) | `pdm run format-check`、`pdm run typecheck` 退出 0;`pdm run lint` 仅报未跟踪的 `train.ipynb` 自带 F541 |
 | 转换确定性 | 通过 | 同 `--input`/`--output` 重跑 manifest 与四文件 sha256 不变;标号图字节级确定性测试 |
 | token 估算与训练 collator 一致 | 通过 | 真实处理器逐行一致性用例(本地快照存在时运行) |
 | 真实小样转换 | 通过 | 21 episode → 384 行 / 206 图 / 2 排除 / 命中率 0.984 |
 | 端到端冒烟(Task 7) | 通过 | 120 合成 episode / 480 步 → 1,195 行,无排除,hit_rate 1.0;train/evaluate/predict 均退出 0 |
-| 全语料转换与检查单(Task 8) | 运行中 | 15,283 个 episode 的转换正在执行;检查单见本文件 Task 8 |
+| 全语料转换与检查单(Task 8) | 通过 | `data/processed/ac-v1`:256,897 行(四 split 179,797·26,790·24,282·26,028),74 GB,退出 0,约 28 分钟(`--workers 32`);排除与命中率见本文件 Task 8 |
 
 ---
 
@@ -178,3 +196,5 @@ pdm run python scripts/prepare_android_control_data.py \
   清理残留 `.tmp`、Ctrl-C 以一行 `SystemExit` 退出。
 - 因此 §16「GT 元素由命中测试反推(面积最小规则)」与验收表中"105 个用例"等数字
   已过时,以修订后的 `docs/data-and-evaluation.md` 与当轮测试为准。
+- Task 7 与 Task 8 的记录产生于上述修订之后(软标签与 `--workers` 版本),反映当前规则;
+  验收表中 Task 1–6 的条目仍按首轮规则保留。

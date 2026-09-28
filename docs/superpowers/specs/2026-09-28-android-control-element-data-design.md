@@ -1,7 +1,7 @@
 # Android Control 元素决策数据的构建设计(episode 目录 → Dohnuts direct decisions)
 
 日期:2026-09-28
-状态:已实现(转换管线、文档与端到端冒烟);全语料转换运行中
+状态:已实现(转换管线、文档、端到端冒烟与全语料转换)
 范围:一个确定性转换管线,把 Android Control 的 episode 目录
 (`metadata_{episode_id}.json` + 每步截图 + `step_NNN_a11y.json`)转成 Dohnuts
 决策行:5 个问题族、行级 split、排除审计、元素候选与标号截图,可直接喂给现有
@@ -215,8 +215,10 @@
 6. 端到端冒烟已跑通:120 个合成 episode / 480 步 → 1,195 行(train 842 / dev 130 /
    calibration 122 / test 101),无排除,`hit_rate` 1.0;train 2 步、evaluate、predict
    均退出 0(`selected_step: 2`,各切片 `schema_pass_rate` 1.0,5/5 dataset 可推理)。
-7. 运行中:全语料转换 `data/processed/ac-v1`(15,283 个 episode)及其检查清单
-   (见计划 Task 8),数字在其完成后记录。
+7. 全语料转换已完成:`data/processed/ac-v1` 产出 256,897 行(四 split 179,797 /
+   26,790 / 24,282 / 26,028),74 GB,退出 0,墙钟约 28 分钟(`--workers 32`);
+   `element_resolution.hit_rate` 0.9653,`empty_target_payload_rate` 0.403–0.426,
+   30.37% 的元素行是软标签(详见计划 Task 8 的检查清单复核)。
 
 ## 16. 已知限制
 

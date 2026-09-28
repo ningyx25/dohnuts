@@ -382,7 +382,8 @@ on an over-budget batch instead of truncating. Measured on the parsed corpus, 52
 of 49,924 element rows (1.04%) exceed the budget; the worst is 38,642 tokens
 (18.9 times the limit) because one accessibility node's `text` was an entire PDF.
 The median row is 624 tokens and p99 is 2,070. Probing the whole corpus (99,131
-steps) costs about six minutes.
+steps) costs about six minutes, and the full run excluded 535 steps as
+`token_budget`, in line with the probe's ~520 rows.
 
 **Exclusions and audit.** The parse stage drops whole steps
 (`unparsable_metadata`, `missing_image`, `missing_a11y`, `unknown_action`,
@@ -393,7 +394,11 @@ the schema (`step 1: missing key 'action'`). The isolate stage drops rows
 (`cross_split_group`, `duplicate_input`). Both land in `excluded.jsonl` with
 `{id, reason, detail, stage}` and in the manifest's `exclusions` counts.
 Parse-stage entries carry the step id or the episode directory name; isolate-stage
-entries carry the row id with its family suffix. `missing_image` is decided by a
+entries carry the row id with its family suffix. Over the full 15,283-episode
+corpus this dropped 1,288 steps as `no_target_element`, 496 as
+`too_few_candidates`, 6 as `too_many_candidates`, 535 as `token_budget`, and 668
+rows as `cross_split_group` (train-heavy, as the per-record rule implies);
+`duplicate_input` and `unexpected` were empty. `missing_image` is decided by a
 full decode of the screenshot, not by its container: a PNG whose CRCs are
 consistent over a stream the decoder rejects fails on its own step, where it
 costs one step, instead of surfacing at the end-of-run self-check, where it used
@@ -427,7 +432,10 @@ are minted before any file is written, so a step that fails before its stores
 writes nothing and the list never names an unreferenced file; a failure between
 the raw and the marked store leaves the raw PNG on disk *and* in `images` while
 its rows are dropped, and a rerun with a different `--input` into the same
-`--output` never cleans the directory, so the list describes this run only. What
+`--output` never cleans the directory, so the list describes this run only. On
+the full corpus the list holds 145,427 names and rows reference 145,399 of them:
+the 28-name gap is exactly that case, screenshots of steps whose rows were later
+dropped by isolation. What
 a rerun does clean is the temporary files of an interrupted run — `convert`
 unlinks `.<name>.<pid>.<n>.tmp` under `images/` before it starts, the only files
 a SIGKILL can strand there — so the directory-equals-manifest property holds
@@ -460,12 +468,13 @@ containers: an independent corpus-wide probe found 21,507 of 49,924 resolvable
 targets unlabeled (43.1%), a 150-episode sample put the per-split rate at 44–49%,
 and small samples vary widely (60% over the 21-episode run). Those three numbers
 were measured under the pre-soft-target definition — one target per row, the
-single hit the old smallest-area rule chose — and a row is now counted as an
-empty target only when **no** candidate the tap point touched carries a payload,
-so the post-change rate is expected to be equal or slightly lower;
-`element_stats.empty_target_payload_rate` is the authoritative per-run number and
-`soft_targets`/`multi_hit_rate`/`max_hits` say how much of that run's family was
-soft. The ground-truth element is inferred from the
+single hit the old smallest-area rule chose. A row is now counted as an empty
+target only when **no** candidate the tap point touched carries a payload, and
+the full run measured 0.403–0.426 per split, slightly below the pre-change rates
+as expected. `element_stats.empty_target_payload_rate` is the authoritative
+per-run number, and `soft_targets`/`multi_hit_rate`/`max_hits` say how much of
+that run's family was soft: 15,079 of the corpus's 49,652 element rows (30.4%)
+carry more than one hit, with `max_hits` up to 14. The ground-truth element is inferred from the
 recorded point rather than given, so a point that lands in several boxes is
 answered with a distribution over all of them, weighted by inverse area — a
 soft label the loss accepts, which is also the honest answer when two nested
