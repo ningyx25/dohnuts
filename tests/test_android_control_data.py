@@ -385,15 +385,18 @@ def test_hit_test_prefers_the_smallest_containing_element():
     assert hit_test(elements, 95, 95) == 0
 
 
-def test_hit_test_ties_go_to_the_smaller_index():
+def test_hit_test_ties_go_to_the_earlier_position():
     elements = [element(0, (0, 0, 50, 50)), element(1, (0, 0, 50, 50))]
     assert hit_test(elements, 5, 5) == 0
     assert hit_test(list(reversed(elements)), 5, 5) == 0
 
 
-def test_hit_test_reports_the_element_index_not_its_position():
+def test_hit_test_reports_the_position_not_the_index_field():
+    # Only the position is returned, so a caller can index the list it passed
+    # in even if the `index` fields disagree with the positions.
     elements = [element(7, (0, 0, 50, 50)), element(9, (0, 0, 200, 200))]
-    assert hit_test(elements, 5, 5) == 7
+    assert hit_test(elements, 5, 5) == 0
+    assert hit_test(elements, 150, 150) == 1
 
 
 def test_hit_test_uses_closed_bounds():
@@ -419,7 +422,14 @@ def test_hit_test_reports_misses_and_tolerates_malformed_input():
         "junk",
         element(4, (0, 0, 100, 100)),
     ]
-    assert hit_test(unusable, 5, 5) == 4
+    assert hit_test(unusable, 5, 5) == 5  # the position of the only usable element
+
+
+def test_hit_test_reports_nothing_for_a_non_list():
+    assert hit_test(None, 5, 5) is None
+    assert hit_test(7, 5, 5) is None
+    assert hit_test("elements", 5, 5) is None
+    assert hit_test({"0": element(0, (0, 0, 10, 10))}, 5, 5) is None
 
 
 def test_resolve_element_choice_enforces_the_candidate_count():
@@ -445,12 +455,58 @@ def test_resolve_element_choice_resolves_a_hit():
     assert resolve_element_choice(pair, 5, 5) == (0, None)
     assert resolve_element_choice(pair, 150, 150) == (1, None)
     assert resolve_element_choice(pair, 50, 50) == (None, "no_target_element")
-    assert resolve_element_choice(list(reversed(pair)), 150, 150) == (1, None)
+    # The result is a position in the list that was passed in, not a fixed id.
+    assert resolve_element_choice(list(reversed(pair)), 150, 150) == (0, None)
+    assert resolve_element_choice(list(reversed(pair)), 5, 5) == (1, None)
 
 
 def test_resolve_element_choice_accepts_the_full_candidate_list():
     elements = [element(index, (index * 10, 0, index * 10 + 8, 8)) for index in range(128)]
     assert resolve_element_choice(elements, 1005, 4) == (100, None)
+
+
+def test_resolve_element_choice_reports_a_non_list_as_too_few():
+    assert resolve_element_choice(None, 5, 5) == (None, "too_few_candidates")
+    assert resolve_element_choice(7, 5, 5) == (None, "too_few_candidates")
+    assert resolve_element_choice({}, 5, 5) == (None, "too_few_candidates")
+
+
+def test_extract_elements_numbers_every_element_with_its_position():
+    forests = [
+        forest(),
+        forest(node(text="kept"), node(isClickable=False), node(text="also kept")),
+        {
+            "windows": [
+                {"tree": {"nodes": [node(text="a"), node(isVisibleToUser=False)]}},
+                {"tree": {"nodes": [node(text="b")]}},
+            ]
+        },
+    ]
+    for a11y in forests:
+        elements = extract_elements(a11y, screen_size=SCREEN)
+        assert [entry["index"] for entry in elements] == list(range(len(elements))), a11y
+
+
+def test_extract_hit_test_and_description_agree_at_the_seam():
+    # The seam Tasks 2 and 3 rely on: the description label and the marked
+    # element must be the same element the hit test selected.
+    bounds = {"left": 100, "top": 200, "right": 300, "bottom": 260}
+    a11y = forest(
+        node(text="not clickable", isClickable=False, boundsInScreen=bounds),
+        node(text="TARGET", boundsInScreen=bounds),
+        node(text="elsewhere", boundsInScreen={"left": 0, "top": 0, "right": 10, "bottom": 10}),
+    )
+    elements = extract_elements(a11y, screen_size=SCREEN)
+    position, reason = resolve_element_choice(elements, 200, 230)
+    assert reason is None
+    assert position == 0
+    target = elements[position]
+    assert target["index"] == position
+    assert target["text"] == "TARGET"
+    assert target["bounds"][0] <= 200 <= target["bounds"][2]
+    description = element_description(position, target)
+    assert description == 'UI element 0: {"text": "TARGET"}'
+    assert json.loads(description.removeprefix("UI element 0: ")) == {"text": "TARGET"}
 
 
 def test_element_description_renders_text_then_content_description():

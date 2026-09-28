@@ -201,20 +201,19 @@ def element_bounds(element: dict) -> tuple[float, float, float, float] | None:
     return x_min, y_min, x_max, y_max
 
 
-def element_index(element: dict, position: int) -> int:
-    """Read an element's `index`, falling back to its position in the list."""
-    index = element.get("index") if isinstance(element, dict) else None
-    return index if is_integer(index) else position
-
-
 def hit_test(elements: list[dict], x: float, y: float) -> int | None:
-    """Index of the smallest element containing (x, y), or None when none does.
+    """Position of the smallest element containing (x, y), or None on a miss.
 
-    Bounds are closed on both ends. Equal areas go to the smaller index, so
-    nested and identical boxes resolve deterministically. Elements without a
-    usable box, and points that are not finite numbers, are ignored.
+    The result is a list position into the very `elements` list passed in, so
+    callers can index it directly; `extract_elements` numbers its elements so
+    that the position and the `index` field agree, but only the position is
+    returned here. An input that is not a list, an element without a usable
+    box, and a point that is not a finite number are all ignored.
+
+    Bounds are closed on both ends. Equal areas go to the earlier position, so
+    nested and identical boxes resolve deterministically.
     """
-    if coordinate(x) is None or coordinate(y) is None:
+    if not isinstance(elements, list) or coordinate(x) is None or coordinate(y) is None:
         return None
     best: tuple[float, int] | None = None
     for position, element in enumerate(elements):
@@ -224,39 +223,43 @@ def hit_test(elements: list[dict], x: float, y: float) -> int | None:
         x_min, y_min, x_max, y_max = bounds
         if not (x_min <= x <= x_max and y_min <= y <= y_max):
             continue
-        index = element_index(element, position)
         area = (x_max - x_min) * (y_max - y_min)
-        if best is None or (area, index) < best:
-            best = (area, index)
+        if best is None or (area, position) < best:
+            best = (area, position)
     return None if best is None else best[1]
 
 
 def resolve_element_choice(
     elements: list[dict], x: float, y: float
 ) -> tuple[int | None, str | None]:
-    """Resolve the ground-truth element index for a click at pixel (x, y).
+    """Resolve the ground-truth element for a click at pixel (x, y).
 
-    The count checks run first, so an unusable candidate list is reported even
-    when the point would hit nothing. Otherwise the point must land inside an
-    element and a miss excludes the step as `no_target_element`.
+    The returned position indexes the same `elements` list the caller passed in.
+    The count checks run first, so an unusable candidate list, including one
+    that is not a list at all, is reported even when the point would hit
+    nothing. Otherwise the point must land inside an element and a miss
+    excludes the step as `no_target_element`.
     """
-    if len(elements) < MIN_CANDIDATES:
+    if not isinstance(elements, list) or len(elements) < MIN_CANDIDATES:
         return None, "too_few_candidates"
     if len(elements) > MAX_CANDIDATES:
         return None, "too_many_candidates"
-    index = hit_test(elements, x, y)
-    if index is None:
+    position = hit_test(elements, x, y)
+    if position is None:
         return None, "no_target_element"
-    return index, None
+    return position, None
 
 
 def element_description(index: int, element: dict) -> str:
-    """Render one candidate line as `UI element {index}: {payload}`.
+    """Render the prompt option for one candidate: `UI element {index}: {payload}`.
 
-    The payload is JSON holding only a non-empty `text` and/or
+    `index` is the number to print; for `extract_elements` output it is also the
+    element's position in the list. The `UI element {index}:` prefix is the
+    prompt label. The payload that
+    follows it is JSON holding only a non-empty `text` and/or
     `content_description`, in that key order, and `{}` when the element has
-    neither. Node flags and the index itself never reach the prompt, and
-    non-ASCII text stays readable.
+    neither: node flags such as `is_clickable` never reach the payload, so they
+    cannot leak into a prompt, and non-ASCII text stays readable.
     """
     element = element if isinstance(element, dict) else {}
     text = read_text(element.get("text"))
