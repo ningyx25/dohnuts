@@ -1715,6 +1715,34 @@ def test_cli_records_exclusions_without_aborting_the_batch(tmp_path):
     assert entries[3]["detail"] == ""
     assert entries[4]["detail"].startswith("JSONDecodeError")
     assert sum(entry["n"] for entry in manifest["counts"]) == 2
+    # The failure paths store nothing they cannot reference.
+    assert sorted(path.name for path in (output / "images").iterdir()) == sorted(manifest["images"])
+
+
+def test_cli_writes_no_image_for_a_step_that_fails_late(tmp_path, monkeypatch):
+    source = tmp_path / "corpus"
+    directory = source / "0"
+    directory.mkdir(parents=True)
+    write_episode(
+        source,
+        0,
+        click_step(directory, 0, (27, 0, 0)),
+        cli_step(directory, 1, {"action_type": "wait"}, "Wait", color=(27, 0, 1)),
+    )
+    output = tmp_path / "out"
+
+    def explode(step, image_path, marked=None):
+        raise RuntimeError("boom")
+
+    # The failure lands after the screenshots would have been stored: the step is
+    # excluded and neither file may survive on disk, where no row could name it
+    # and a rerun could not tell it apart from a referenced one.
+    monkeypatch.setattr(prepare, "rows_for_ac_step", explode)
+    manifest = prepare.convert(source, output)
+    assert manifest["exclusions"] == {"parse:unexpected": 2}
+    assert manifest["images"] == []
+    assert list((output / "images").glob("*.png")) == []
+    assert (output / "train.jsonl").read_text() == ""
 
 
 def test_cli_excludes_an_episode_whose_two_ids_disagree(tmp_path):
@@ -1869,6 +1897,9 @@ def test_cli_excludes_over_budget_steps_whole(tmp_path):
         "android_control_0_step1:complete",
     ]
     assert len(manifest["images"]) == 1
+    # The manifest and the directory agree: an image nothing references must not
+    # survive on disk either, or every rerun leaves the corpus' slack behind.
+    assert sorted(path.name for path in (output / "images").iterdir()) == sorted(manifest["images"])
     assert manifest["element_stats"] == {}
     assert manifest["element_resolution"] == {
         "basis": "pre_isolation",
@@ -1962,7 +1993,7 @@ def test_token_length_counts_words_and_image_patches(tmp_path):
 
 
 def test_token_length_matches_the_training_collator(tmp_path):
-    model = Path("Qwen/Qwen3.5-0.8B")
+    model = ROOT / "Qwen" / "Qwen3.5-0.8B"
     if not model.is_dir():
         pytest.skip("local Qwen3.5-0.8B snapshot is not available")
     from dohnuts.training_data import DecisionCollator

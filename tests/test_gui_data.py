@@ -626,6 +626,17 @@ def test_validate_rows_decodes_each_distinct_image_once(monkeypatch, image_root)
     assert opened[-1] == "gone.png"
 
 
+def test_validate_rows_reports_an_unresolvable_image_path(image_root):
+    # A symlink loop resolves to a RuntimeError rather than an OSError; callers
+    # abort on ValueError alone, so the row must fail like any other unreadable
+    # image instead of escaping the self-check as a traceback.
+    (image_root / "loop.png").symlink_to(image_root / "loop.png")
+    rows = [row_stub("a:action", group="task:a", split="train")]
+    rows[0]["image"] = "loop.png"
+    with pytest.raises(ValueError, match="Image is not readable: a:action"):
+        validate_rows(rows, root=image_root)
+
+
 def test_validate_rows_rejects_group_across_splits(image_root):
     step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
     rows = rows_for_step(step, str(step.image))

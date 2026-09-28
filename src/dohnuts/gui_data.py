@@ -414,13 +414,16 @@ def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
         try:
             # `resolve()` runs inside the try so that a path it cannot resolve
             # fails as an unreadable image with the row that named it, exactly
-            # like one that cannot be opened.
+            # like one that cannot be opened. It reports a symlink loop as a
+            # RuntimeError rather than an OSError, and callers abort on ValueError
+            # alone, so both are caught here: an unresolvable path must not escape
+            # as a traceback.
             key = path.resolve()
             if key not in validated:
                 with Image.open(path) as image:
                     image.convert("RGB")
                 validated.add(key)
-        except OSError as error:
+        except (OSError, RuntimeError) as error:
             raise ValueError(
                 f"Image is not readable: {row['id']} ({row['image']}): {error}"
             ) from error

@@ -140,43 +140,50 @@ def token_length(processor, row: dict) -> int:
     return length + (height // factor) * (width // factor) - 1
 
 
-def store_raw(step, output: Path) -> Path:
-    """Copy the step screenshot to its content-addressed name; return that path.
+def image_path(output: Path, sha256: str) -> Path:
+    """The content-addressed path of one stored screenshot."""
+    return Path(output) / "images" / (sha256 + ".png")
+
+
+def store_raw(step, target: Path) -> None:
+    """Copy the step screenshot to its content-addressed `target`.
 
     The copy is byte-identical to the source: the row rules alias the file by the
     digest of the bytes `parse_step` hashed and `validate_rows` decodes the
     stored copy, so re-encoding here would break both.
     """
-    target = output / "images" / (step.image_sha256 + ".png")
     if not target.exists() or digest_file(target) != step.image_sha256:
         # Re-copy a target whose content does not match its name: a killed
         # previous run can leave a truncated file that later runs would trust.
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(step.image, target)
-    return target
 
 
-def store_marked(image: Path, elements: list[dict], output: Path) -> tuple[Path, str]:
-    """Render the set-of-mark screenshot of one step; return its path and digest.
+def render_marked(image: Path, elements: list[dict]) -> tuple[bytes, str]:
+    """Render the set-of-mark screenshot of one step; return its PNG bytes and digest.
 
-    The name comes from a sha256 of the exact bytes written, computed before the
-    write, so the file is content-addressed by construction and a rerun over an
-    existing file with a matching digest has nothing to do. The PNG is encoded
+    The digest comes from a sha256 of the exact bytes written, computed before
+    the write, so the file is content-addressed by construction and a rerun over
+    an existing file with a matching digest has nothing to do. The PNG is encoded
     from an in-memory buffer rather than saved to a path, which is what keeps the
     bytes -- and therefore every name derived from them -- a property of the
-    image and the candidate list alone.
+    image and the candidate list alone. Rendering before storing also means a
+    step that never reaches its rows writes nothing at all.
     """
     with Image.open(image) as handle:
         marked = mark_screenshot(handle, elements)
     buffer = io.BytesIO()
     marked.save(buffer, format="PNG")
     payload = buffer.getvalue()
-    sha256 = hashlib.sha256(payload).hexdigest()
-    target = output / "images" / (sha256 + ".png")
+    return payload, hashlib.sha256(payload).hexdigest()
+
+
+def store_marked(target: Path, payload: bytes) -> None:
+    """Write one rendered set-of-mark PNG to its content-addressed `target`."""
+    sha256 = target.name.removesuffix(".png")
     if not target.exists() or digest_file(target) != sha256:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
-    return target, sha256
 
 
 def convert(source: Path, output: Path, *, processor=None) -> dict:
@@ -240,8 +247,10 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
                         # The budget is checked before anything is written, and
                         # the probe rows are the rows this step would mint: only
                         # the element question carries the candidate texts, so
-                        # the answer is the same either way. Its dummy marked
-                        # copy duplicates the raw alias, which never leaves this
+                        # the answer is the same either way. The probe's raw path
+                        # stands in for the marked copy because marking never
+                        # changes the dimensions `token_length` reads (never the
+                        # pixels), and its duplicated alias never leaves this
                         # computation.
                         probe = (str(step.image), step.image_sha256)
                         lengths = [
@@ -263,23 +272,26 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
                                 }
                             )
                             continue
-                    raw_target = store_raw(step, output)
+                    raw_target = image_path(output, step.image_sha256)
                     marked = None
-                    marked_target = None
+                    marked_png = None
                     if step.target_element is not None:
-                        marked_target, marked_sha256 = store_marked(
-                            step.image, step.elements, output
-                        )
-                        marked = (os.path.relpath(marked_target, root), marked_sha256)
-                    rows.extend(
-                        rows_for_ac_step(step, os.path.relpath(raw_target, root), marked=marked)
+                        payload, marked_sha256 = render_marked(step.image, step.elements)
+                        marked_png = (image_path(output, marked_sha256), payload)
+                        marked = (os.path.relpath(marked_png[0], root), marked_sha256)
+                    # Rows are minted before anything is written, and an image is
+                    # written and listed only for a step whose rows exist: no
+                    # failure can leave a file on disk that the manifest omits.
+                    produced = rows_for_ac_step(
+                        step, os.path.relpath(raw_target, root), marked=marked
                     )
-                    # An image enters the manifest only once the rows naming it
-                    # exist, so a failure above cannot leave an unreferenced file
-                    # behind in it.
+                    store_raw(step, raw_target)
                     images_written.add(raw_target.name)
-                    if step.target_element is not None:  # hence marked_target is set too
-                        images_written.add(marked_target.name)
+                    if marked_png is not None:
+                        store_marked(*marked_png)
+                        images_written.add(marked_png[0].name)
+                    rows.extend(produced)
+                    if step.target_element is not None:
                         element_rows += 1
                         target = step.elements[step.target_element]
                         # The payload is `{}` exactly when the ground-truth
@@ -378,7 +390,9 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     ]
     # The hit rate is over the steps that asked an element question at all: the
     # audit counts the three ways `resolve_element_choice` can refuse one, and
-    # `element_rows` counts the steps it resolved (one choice row each).
+    # `element_rows` counts the steps that resolved and within budget (one choice
+    # row each). A step that resolved but was excluded by the budget is in
+    # neither count, so the rates here and in the manifest stay additive.
     asked = element_rows + sum(misses)
     element_resolution = {
         "basis": "pre_isolation",
