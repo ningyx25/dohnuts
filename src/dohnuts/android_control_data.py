@@ -35,9 +35,12 @@ from dohnuts.gui_data import (
 # across the two pipelines.
 AC_ACTIONS = {**ACTIONS, "open_app": "open an app by name"}
 
-# Android Control records where the finger goes, gui-v1 records where the
-# content goes: scrolling down reveals content below the fold, which means the
-# finger moves up. Flip the alignment here and nowhere else.
+# Android Control records where the content goes, gui-v1 where the finger goes:
+# `scroll: down` reveals content below the fold, so the finger moves up. The
+# inversion was checked against the corpus -- on 138 real vertical scroll steps
+# the content moved up in 28 coherent cases against 10 moving down, and the step
+# instructions agree ("Swipe up for Product details" on `scroll: down` steps).
+# Flip the alignment here and nowhere else.
 SCROLL_TO_SWIPE_DIRECTION = {"down": "up", "up": "down", "left": "right", "right": "left"}
 
 SYSTEM_BUTTONS = {"navigate_back": "Back", "navigate_home": "Home"}

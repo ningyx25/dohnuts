@@ -1,7 +1,7 @@
 # Android Control 元素决策数据的构建设计(episode 目录 → Dohnuts direct decisions)
 
 日期:2026-09-28
-状态:已实现(转换管线与文档);端到端冒烟与真实数据转换待执行
+状态:已实现(转换管线、文档与端到端冒烟);全语料转换运行中
 范围:一个确定性转换管线,把 Android Control 的 episode 目录
 (`metadata_{episode_id}.json` + 每步截图 + `step_NNN_a11y.json`)转成 Dohnuts
 决策行:5 个问题族、行级 split、排除审计、元素候选与标号截图,可直接喂给现有
@@ -72,9 +72,12 @@
 
 - `AC_ACTIONS = {**ACTIONS, "open_app": "open an app by name"}`,前 8 项与 gui-v1
   同序同义;`ACTIONS` 本身不改。
-- **scroll 取反**的理由:AC 记录的是内容移动方向(`scroll down` = 查看下方内容 =
+- **scroll 取反**的理由:AC 的 `direction` 是内容方向(`scroll down` = 查看下方内容 =
   手指上滑),gui-v1 的 `swipe_dir` 来自手指位移;取反后两数据集的 `up`/`down`
   都表示同一手指动作。常量只有一处(`SCROLL_TO_SWIPE_DIRECTION`)。
+  实测核对:对 138 个真实竖直 scroll 步做前后截图互相关,连贯位移中内容上移 28 例、
+  下移 10 例(`scroll: down`);数据集自身的 step instruction 也一致(`scroll: down` 步写
+  "Swipe up for Product details",`scroll: up` 步写 "Swipe down")。
 - 末步 terminate 假设 episode 均为成功演示(parsed 数据已丢 `goal_status`),计入文档与
   manifest(已知限制);结构损坏的 step 一律排除而不是当作末步(避免铸出假 terminate)。
 
@@ -167,8 +170,9 @@
 - `element_stats`(**post_isolation**,`basis` 键):每 split 的
   rows / candidates min·mean·max / `empty_target_payloads` / `empty_target_payload_rate`;
   没有 element 行的 split 不出现。
-- `element_resolution`(**pre_isolation**,`basis` 键):`element_rows`、
-  三种拒绝计数、`hit_rate`。
+- `element_resolution`(**pre_isolation**,`basis` 键,**整语料一条记录**,不分 split):
+  `element_rows`(预算内解析成功的步)、三种拒绝计数、`hit_rate`;被预算丢掉但已解析的步
+  不计入任何一项。
 - `exclusions`、`images`(本次运行写入的 PNG,写文件只发生在行已铸出之后,故磁盘与列表一致)。
 - `vocabularies`:`ac_actions`(9 类)、`buttons`、`swipe_directions`、
   `instructions`(含 element)、`complete_criteria`,以及白话规则
@@ -206,18 +210,23 @@
    标号图有字节级确定性测试与像素级存在性测试。
 4. token 一致性:stub 测试钉住算术形状,另有真实 `Qwen/Qwen3.5-0.8B` 处理器与
    `DecisionCollator` 的逐行一致性用例(本地快照存在时运行)。
-5. 真实数据探针:元素行 1.04% 超预算(见 §3);23 个真实 episode 的小样转换
+5. 真实数据探针:元素行 1.04% 超预算(见 §3);21 个真实 episode 的小样转换
    产出 384 行、206 张图、2 条排除(1 条超预算、1 条候选过少),GT 命中率 0.98。
-6. 待执行:端到端冒烟(train → calibrate → evaluate → predict)与全语料转换
-   `data/processed/ac-v1` 及其检查清单(见计划 Task 7–8)。
+6. 端到端冒烟已跑通:120 个合成 episode / 480 步 → 1,195 行(train 842 / dev 130 /
+   calibration 122 / test 101),无排除,`hit_rate` 1.0;train 2 步、evaluate、predict
+   均退出 0(`selected_step: 2`,各切片 `schema_pass_rate` 1.0,5/5 dataset 可推理)。
+7. 运行中:全语料转换 `data/processed/ac-v1`(15,283 个 episode)及其检查清单
+   (见计划 Task 8),数字在其完成后记录。
 
 ## 16. 已知限制
 
 - 末步 terminate 假设 episode 均为成功完成(parsed 数据已丢 `goal_status`)。
 - `task_progress` 是模板拼接,非自然语言叙述,与参照行措辞不同。
 - GT 元素由命中测试反推(面积最小规则),不是标注给出;命中不了即整步排除。
-- 大量 GT 元素的 payload 是 `{}`(真实小样上测得 44–49%):很多可点击容器没有文案,
-  信号由标号截图承担;`element_stats.empty_target_payload_rate` 记录比例。
+- 大量 GT 元素的 payload 是 `{}`:全语料探针测得 21,507/49,924(43.08%)可解析 GT 目标
+  无文案,150 episode 样本每 split 44–49%,小样本波动大(21 episode 小样整体 60.3%)。
+  很多可点击容器没有文案,信号由标号截图承担;`element_stats.empty_target_payload_rate`
+  是该次运行的权威数字。
 - 标号图字节依赖 Pillow 版本,跨版本重跑会改变文件名与四文件 sha256。
 - 标号图与 gui-v1 原图视觉上不同域,element 行的图像分布与 gui-v1 各族不同。
 - 标号编号与 `example-data/train.jsonl` 手工 smoke 行不同(该行用带空洞的数据集下标,

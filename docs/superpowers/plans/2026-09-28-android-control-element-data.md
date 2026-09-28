@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12、PIL、transformers(AutoProcessor/smart_resize)、pytest、ruff、ty、pdm。
 
-**状态(2026-09-28):** Task 1–6 已完成并提交;Task 7(端到端冒烟)与 Task 8(真实数据转换)尚未执行。
+**状态(2026-09-28):** Task 1–7 已完成;Task 8(全语料转换)运行中。
 
 **约定(每个任务都适用):**
 
@@ -86,7 +86,7 @@ Task 4 `5accff3` `778c39d`;Task 5 `c528e5f` `307f9e1`;Task 6 文档提交(见下
 
 **内容:** episode 目录按数值序发现;`metadata_{name}.json` 读取(读不出 → `parse:unparsable_metadata`,并记录目录名与 `episode_id` 不一致);原图与标号图按内容寻址写入(写文件只发生在行已铸出之后);`isolate` → `validate_rows` → 四 split + `excluded.jsonl` + `manifest.json`;`element_stats`(post_isolation)/`element_resolution`(pre_isolation)/`environment`/`vocabularies.element_rule`/`marked_images`;`metrics.py` 的 macro-F1 抑制集合加 `screenshot_choice`。
 
-**Verification:** manifest 全字段与行内容一致;同 `--output` 重跑 sha256 相同;磁盘镜像文件与 `manifest["images"]` 一致;输入目录下没有 episode 目录时 `SystemExit`;非仓库根运行 `SystemExit`;`validate_rows` 改按期去重后,150 episode 的真实小样自检耗时从 267 s 降到约一半(130 s 的重复解码被消除)。
+**Verification:** manifest 全字段与行内容一致;同 `--output` 重跑 sha256 相同;磁盘镜像文件与 `manifest["images"]` 一致;输入目录下没有 episode 目录时 `SystemExit`;非仓库根运行 `SystemExit`;`validate_rows` 按期去重解码:150 episode 的整轮运行 266.6 s 中自检占 130.3 s(48.9%),去重后解码从 2,638 次降到 1,491 个不同文件(约 −45%),20 episode 小样冒烟 39.8 s → 30.1 s。
 
 ---
 
@@ -116,21 +116,17 @@ Task 4 `5accff3` `778c39d`;Task 5 `c528e5f` `307f9e1`;Task 6 文档提交(见下
 
 ## Task 7: 端到端冒烟(需要 GPU 与本地 Qwen3.5-0.8B)
 
-- [ ] **Status:** 待执行
+- [x] **Status:** 完成
 
-**计划内容:** 合成 ~100 个 episode(每个 episode 一个目录,metadata + 每步截图 + a11y JSON,截图字节各不相同),转换后喂给 `train.ipynb` 的 CLI 流程跑通 train → calibrate → evaluate → predict;四个 split 均非空,`screenshot_choice` 在 calibration/dev/test 各有行。
+**内容:** 120 个合成 episode / 480 步 → **1,195 行**(train 842 / dev 130 / calibration 122 / test 101),无排除,`element_resolution.hit_rate` 1.0,`token_check: "enabled"`。train 2 步退出码 0(峰值 reserved 3.28 GiB);evaluate 退出码 0,`selected_step: 2`,`primitive_candidate_slices` 出现 `choice` k=9 与 k=4、可变宽度的 element 切片 k=3/k=4/k=5、以及 `noul` k=2,全部 `schema_pass_rate` 1.0;predict 5/5 个 dataset 均给出答案(`screenshot_choice` 从标号图答出 `r0`,输入 358–454 tokens)。
 
-**已完成的等价款:** 对 23 个**真实** episode 的实跑(仅转换,未训练):384 行、206 张图(143 原图 + 63 标号图)、`token_check: enabled`、排除 2 条(`parse:token_budget` 1、`parse:too_few_candidates` 1)、GT 命中率 0.984(63/64)。产物在 `/tmp`,未进仓库。
-
-**待做:** 训练/校准/评估/推理四步冒烟,以及把 `train.ipynb` 的 `DATA_DIR` 指向新数据后的端到端确认。
+**另一次等价款(仅转换):** 对 21 个**真实** episode 的实跑:384 行、206 张图(143 原图 + 63 标号图)、`token_check: enabled`、排除 2 条(`parse:token_budget` 1、`parse:too_few_candidates` 1)、GT 命中率 0.984(63/64)。产物在 `/tmp`,未进仓库。
 
 ---
 
 ## Task 8: 真实数据转换与交付检查
 
-- [ ] **Status:** 待执行
-
-**计划内容:**
+- [ ] **Status:** 待执行 —— **全量转换运行中**(15,283 个 episode 的转换正在跑,数字在其完成后记录)
 
 ```bash
 pdm run python scripts/prepare_android_control_data.py \
@@ -143,7 +139,7 @@ pdm run python scripts/prepare_android_control_data.py \
 1. 四 split 非空,`screenshot_choice` 在各 split 有行;calibration 的 choice 与 noul 各 ≥10(否则温度保持 1.0)。
 2. `no_target_element`/`too_few_candidates` 排除率若 >10% 需复查命中规则。
 3. `action_classes` 各 split 分布相近,`open_app` 出现在 9 类分布里。
-4. `element_stats` 候选数均值与探索一致(约 12 起,真实小样 21.8);`empty_target_payload_rate` 与探针的 44–49% 相符。
+4. `element_stats` 候选数均值与探索一致(约 12 起,21 episode 小样 21.8);`empty_target_payload_rate` 以该次运行自己的 `element_stats` 为准:全语料探针测得 21,507/49,924(43.08%)可解析 GT 目标无文案,150 episode 样本每 split 44–49%,小样本波动大(21 episode 小样整体 38/63 = 60.3%,train 0.607 / dev 0.40 / test 1.0)。
 5. `token_check: enabled`,`parse:token_budget` 逐条可解释(全语料预计约 520 条,与探针一致)。
 6. 磁盘:输出预计 ~40–50 GB(99k 原图 + 52k 标号图),先 `df -h` 确认。
 7. 转换后不要再改 `data/processed/ac-v1` 下的 jsonl(`train.py` 会比对 SHA-256)。
@@ -158,6 +154,6 @@ pdm run python scripts/prepare_android_control_data.py \
 | `pdm run check` | 通过(被跟踪文件) | `pdm run format-check`、`pdm run typecheck` 退出 0;`pdm run lint` 仅报未跟踪的 `train.ipynb` 自带 F541 |
 | 转换确定性 | 通过 | 同 `--input`/`--output` 重跑 manifest 与四文件 sha256 不变;标号图字节级确定性测试 |
 | token 估算与训练 collator 一致 | 通过 | 真实处理器逐行一致性用例(本地快照存在时运行) |
-| 真实小样转换 | 通过 | 23 episode → 384 行 / 206 图 / 2 排除 / 命中率 0.984 |
-| 端到端冒烟(Task 7) | 待执行 | 计划位于本文件 Task 7 |
-| 全语料转换与检查单(Task 8) | 待执行 | 计划位于本文件 Task 8 |
+| 真实小样转换 | 通过 | 21 episode → 384 行 / 206 图 / 2 排除 / 命中率 0.984 |
+| 端到端冒烟(Task 7) | 通过 | 120 合成 episode / 480 步 → 1,195 行,无排除,hit_rate 1.0;train/evaluate/predict 均退出 0 |
+| 全语料转换与检查单(Task 8) | 运行中 | 15,283 个 episode 的转换正在执行;检查单见本文件 Task 8 |

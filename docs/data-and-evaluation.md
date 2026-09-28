@@ -255,8 +255,10 @@ pdm run python scripts/prepare_gui_data.py \
 [Android Control](https://console.cloud.google.com/storage/browser/gresearch/android_control)
 episodes into decision rows; it is the sibling of the GUI converter above. An
 episode is one directory: `metadata_{episode_id}.json` lists its steps, and every
-step points at a screenshot plus a `step_NNN_a11y.json` accessibility forest. The
-converter reuses the gui-v1 split seed, vocabularies, isolation and self-check,
+step points at a screenshot plus a `step_NNN_a11y.json` accessibility forest.
+Episodes are discovered by an all-digit directory name in numeric order, so
+anything else under `--input` is ignored. The converter reuses the gui-v1 split
+seed, vocabularies, isolation and self-check,
 and adds one question family that needs the element tree: which element to act
 on. The parsed corpus holds 15,283 episodes and 99,131 steps, 83,848 of them with
 an action; output goes under the gitignored `data/processed/` (the `ac-v1`
@@ -267,7 +269,7 @@ question per row:
 
 | Question | Dataset | Type | Candidates | Target | Rows |
 | --- | --- | --- | --- | --- | --- |
-| `action` | `gui_action` | choice | the nine actions below | the step's action | every step |
+| `action` | `gui_action` | choice | the nine actions (gui-v1's eight plus `open_app` at index 8) | the step's action | every step |
 | `complete` | `gui_complete` | noul | false, true | whether the episode ends here | every step |
 | `element` | `screenshot_choice` | choice | the step's clickable elements | the element under the action's point | click, long_press |
 | `swipe_dir` | `gui_swipe` | choice | up, down, left, right | the finger's direction | scroll |
@@ -292,7 +294,7 @@ rows that repeat it.
 | scroll(direction) | swipe, direction inverted | swipe_dir |
 | input_text(text) | type; the text stays in `reference` | — |
 | wait | wait | — |
-| open_app(app_name) | open_app | — |
+| open_app(app_name) | open_app (index 8) | — |
 | navigate_back, navigate_home | system_button (Back, Home) | button |
 | null action (the last step) | terminate | complete target is `true` |
 
@@ -300,11 +302,18 @@ rows that repeat it.
   0–7 keep their gui-v1 meaning; its criterion is "open an app by name". The
   vocabulary keeps all nine classes, so `answer` stays a criterion even though no
   Android Control action maps to it.
-- Scroll directions are inverted deliberately. Android Control records where the
-  content moves — `scroll down` reveals content below the fold, so the finger
+- Scroll directions are inverted deliberately. Android Control's `direction` is
+  content-ward — `scroll down` reveals content below the fold, so the finger
   moves up — while gui-v1 derives `swipe_dir` from the finger's displacement.
   Inverting keeps `up`/`down` meaning the same finger motion in both datasets,
-  and lives in one constant.
+  and lives in one constant. Cross-correlating the screenshots before and after
+  138 real vertical scroll steps puts content moving up in 28 coherent cases
+  against 10 moving down for `scroll: down`, and the dataset's own step
+  instructions agree ("Swipe up for Product details" on `scroll: down` steps,
+  "Swipe down" on `scroll: up` steps).
+- `reference` also carries `ac_action` (the raw source action, or null on the
+  terminal step) and `element_position` (the hit-tested candidate position, or
+  null outside the element family); neither enters model input.
 - The last step of every episode carries a null action and becomes `terminate`
   with `complete = true`. Episodes are treated as successful demonstrations; the
   parsed corpus no longer carries the source `goal_status` field that would
@@ -324,7 +333,8 @@ Fewer than 2 or more than 128 candidates also exclude the step
 non-empty `text` and/or `content_description`, in that key order, and `{}` when
 the node has neither; node flags, class names and indices never reach the prompt.
 The instruction is "Which action should be taken next to complete the user's
-task?", the wording the dataset itself ships for this question.
+task?", taken verbatim from the hand-built element row in
+`example-data/train.jsonl`.
 
 **Marked screenshots.** The element row ships a set-of-mark rendering: every
 candidate is boxed in green and numbered with a white chip in the same order as
@@ -366,23 +376,31 @@ Parse-stage entries carry the step id or the episode directory name; isolate-sta
 entries carry the row id with its family suffix.
 
 **Manifest.** `element_stats` and `element_resolution` both describe the element
-family, both keyed by split and both carrying a `basis` field, but they answer
-different questions: `element_stats` (`basis: post_isolation`) counts the element
-rows that were actually written, with candidate min/mean/max and
-`empty_target_payload_rate`, while `element_resolution` (`basis: pre_isolation`)
-counts the steps that asked an element question before isolation, with
-`element_rows`, the three refusal counts and `hit_rate`; splits without element
-rows are absent from `element_stats`. `source.metadata_sha256` hashes only the
-readable metadata files, and `metadata_files_hashed` says how many those were.
-`images` lists exactly the PNG files this run wrote under `<output>/images/`
-(raw and marked, content-addressed): a step that fails is excluded before
-anything is stored, so the directory and the list agree. `vocabularies` carries
-the nine actions, buttons, swipe directions, instructions, complete criteria, and
-two plain-language entries — `element_rule` and `marked_images` — that state the
-candidate and marking rules without the source. `dataset_weighting` records that
-the five dataset names are drawn uniformly, so `gui_button` and `gui_swipe` rows,
-which exist only on the steps that press a button or scroll, are relatively
-upweighted.
+family and both carry a `basis` field, but they answer different questions and
+have different shapes. `element_stats` (`basis: post_isolation`) is a per-split
+map of the element rows that were actually written, with candidate min/mean/max
+and `empty_target_payload_rate`; splits without element rows are absent from it.
+`element_resolution` (`basis: pre_isolation`) is a single corpus-wide record of
+the steps whose element question resolved within budget before isolation, with
+`element_rows`, the three refusal counts and `hit_rate` — a step that resolved
+but was then dropped by the token budget counts in neither `element_rows` nor the
+refusals.
+
+`source.metadata_sha256` hashes only the readable metadata files, and
+`metadata_files_hashed` says how many those were. `images` lists the PNG files
+this run wrote under `<output>/images/` (raw and marked, content-addressed). Rows
+are minted before any file is written, so a step that fails before its stores
+writes nothing and the list never names an unreferenced file; a failure between
+the raw and the marked store leaves the raw PNG on disk *and* in `images` while
+its rows are dropped, and a rerun with a different `--input` into the same
+`--output` never cleans the directory, so the list describes this run only.
+`vocabularies` carries the nine actions, buttons, swipe directions,
+instructions, complete criteria, and two plain-language entries — `element_rule`
+and `marked_images` — that state the candidate and marking rules without the
+source. `dataset_weighting` records that the five dataset names are drawn
+uniformly, so `gui_button` and `gui_swipe` rows, which exist only on the steps
+that press a button or scroll, are relatively upweighted. The manifest goes to
+stdout; the empty-split warning and the periodic progress lines go to stderr.
 
 **Metrics.** `screenshot_choice` is in `metrics.py`'s macro-F1 suppression set,
 because its candidate labels are per-row (every row's `r0..r{N-1}` comes from its
@@ -398,12 +416,15 @@ vocabularies stay in separate trees. Indices 0–7 still mean the same action in
 both pipelines.
 
 **Known limits.** The terminal-step mapping assumes every episode is a successful
-demonstration. `task_progress` is mechanically templated. A large share of
-ground-truth element payloads are `{}` (measured at ~44–49% on real subsets)
-because many clickable nodes are unlabeled containers; the numbered screenshot
-carries the signal and `element_stats.empty_target_payload_rate` records it. The
-ground-truth element is inferred by hit test rather than given, so a point that
-lands in several boxes resolves by the smallest-area rule. Marked bytes depend on
+demonstration. `task_progress` is mechanically templated. Ground-truth element
+payloads are frequently `{}` because many clickable nodes are unlabeled
+containers: an independent corpus-wide probe found 21,507 of 49,924 resolvable
+targets unlabeled (43.1%), a 150-episode sample put the per-split rate at 44–49%,
+and small samples vary widely (60% over the 21-episode run). The numbered
+screenshot carries the signal, and `element_stats.empty_target_payload_rate` is
+the authoritative per-run number. The ground-truth element is inferred by hit
+test rather than given, so a point that lands in several boxes resolves by the
+smallest-area rule. Marked bytes depend on
 the Pillow version. The label numbering differs from the hand-built smoke row in
 `example-data/train.jsonl`, which numbers dataset indices with gaps instead of
 contiguous clickable-only candidates. As in the GUI converter, symbol links
