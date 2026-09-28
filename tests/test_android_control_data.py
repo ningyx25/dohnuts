@@ -1,9 +1,15 @@
-"""Android Control step parsing, action mapping, and element extraction rules."""
+"""Android Control step parsing, action mapping, element extraction, and row rules."""
 
 import json
+from pathlib import Path
+
+import pytest
+from PIL import Image
 
 from dohnuts.android_control_data import (
     AC_ACTIONS,
+    DATASETS,
+    ELEMENT_INSTRUCTION,
     MAX_CANDIDATES,
     MIN_CANDIDATES,
     SCROLL_TO_SWIPE_DIRECTION,
@@ -12,10 +18,21 @@ from dohnuts.android_control_data import (
     hit_test,
     map_action,
     parse_metadata,
+    parse_step,
     resolve_element_choice,
+    rows_for_ac_step,
     validate_element,
 )
-from dohnuts.gui_data import ACTIONS
+from dohnuts.gui_data import (
+    ACTIONS,
+    BUTTONS,
+    COMPLETE_CRITERIA,
+    INSTRUCTIONS,
+    SWIPE_DIRECTIONS,
+    image_digest,
+    split_for,
+    validate_rows,
+)
 
 SCREEN = (1080, 2400)
 
@@ -640,3 +657,641 @@ def test_parse_metadata_never_raises_on_malformed_records():
         parsed, reason = parse_metadata(record)
         assert parsed is None
         assert reason == "unparsable_metadata"
+
+
+# --- Task 2: per-step parsing and the five question families -------------------
+
+GOAL = "Open the Zoho Meet app , view the scheduled meetings ."
+SCREENSHOT = (100, 200)
+RAW_IMAGE = "episode/step_000_screenshot.png"
+MARKED_IMAGE = "episode/step_000_marked.png"
+
+
+def write_png(path: Path, *, size=SCREENSHOT, color="white") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, color).save(path)
+    return path
+
+
+def write_a11y(path: Path, *nodes) -> Path:
+    """Write the accessibility forest a click step points at."""
+    path.write_text(json.dumps(forest(*nodes)))
+    return path
+
+
+def ac_step(index, action, instruction, *, directory: Path, nodes=None):
+    """One metadata step entry, with the files it points at already on disk.
+
+    `nodes=None` writes no accessibility file at all, so a test can prove the
+    step never opened one.
+    """
+    stem = f"step_{index:03d}"
+    write_png(directory / f"{stem}_screenshot.png")
+    if nodes is not None:
+        write_a11y(directory / f"{stem}_a11y.json", *nodes)
+    return {
+        "step_id": index,
+        "screenshot": f"{stem}_screenshot.png",
+        "accessibility_tree": f"{stem}_a11y.json",
+        "action": action,
+        "step_instruction": instruction,
+    }
+
+
+def ac_episode(*steps, goal=GOAL, episode_id=7):
+    return {"episode_id": episode_id, "goal": goal, "steps": list(steps)}
+
+
+def parse_ac_step(record, index, *, directory):
+    step, reason = parse_step(record, index, episode_dir=directory)
+    assert reason is None
+    assert step is not None
+    return step
+
+
+def click_nodes():
+    """Two clickable nodes; a click at (75, 75) resolves to position 1."""
+    return [
+        node(text="Cancel", boundsInScreen={"left": 0, "top": 0, "right": 50, "bottom": 50}),
+        node(
+            text="JOIN A MEETING",
+            contentDescription="Join the next meeting",
+            boundsInScreen={"left": 50, "top": 50, "right": 100, "bottom": 100},
+        ),
+    ]
+
+
+def test_parse_step_reads_a_click_step_and_resolves_the_target(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(
+            0,
+            {"action_type": "click", "x": 75, "y": 75},
+            "Tap JOIN A MEETING",
+            directory=directory,
+            nodes=click_nodes(),
+        )
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    assert step.id == "android_control_7_step0"
+    assert step.group == "task:android_control_7"
+    assert step.action == "click"
+    assert step.arguments == {"action": "click", "coordinate": [75, 75]}
+    assert step.ac_action == {"action_type": "click", "x": 75, "y": 75}
+    assert step.instruction == "Tap JOIN A MEETING"
+    assert [entry["text"] for entry in step.elements] == ["Cancel", "JOIN A MEETING"]
+    assert step.target_element == 1
+    assert step.image == directory / "step_000_screenshot.png"
+    assert step.image_sha256 == image_digest(directory / "step_000_screenshot.png")
+    assert step.state == {
+        "user_query": GOAL,
+        "task_progress": "(You have done the following operation on the current device): .",
+    }
+    assert step.reference == {
+        "thought": "",
+        "action": "Tap JOIN A MEETING",
+        "tool_call": {
+            "name": "mobile_use",
+            "arguments": {"action": "click", "coordinate": [75, 75]},
+        },
+        "ac_action": {"action_type": "click", "x": 75, "y": 75},
+        "element_index": 1,
+    }
+
+
+def test_click_step_yields_action_complete_and_element_rows(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(
+            0,
+            {"action_type": "click", "x": 75, "y": 75},
+            "Tap JOIN A MEETING",
+            directory=directory,
+            nodes=click_nodes(),
+        )
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    marked = (MARKED_IMAGE, image_digest(write_png(directory / "step_000_marked.png")))
+    rows = rows_for_ac_step(step, RAW_IMAGE, marked)
+    assert [row["id"] for row in rows] == [
+        "android_control_7_step0:action",
+        "android_control_7_step0:complete",
+        "android_control_7_step0:element",
+    ]
+    assert [row["dataset"] for row in rows] == ["gui_action", "gui_complete", "screenshot_choice"]
+    assert {row["group"] for row in rows} == {"task:android_control_7"}
+    assert {row["split"] for row in rows} == {split_for("task:android_control_7")}
+    # state, aliases and reference are shared by every row of the step.
+    assert rows[0]["state"] is rows[2]["state"]
+    assert rows[0]["aliases"] is rows[2]["aliases"]
+    assert rows[0]["reference"] is rows[2]["reference"]
+    action, complete, choice = rows
+    assert action["question"]["type"] == "choice"
+    assert action["question"]["instructions"] == INSTRUCTIONS["action"]
+    assert list(action["question"]["criteria"]) == list(AC_ACTIONS)
+    assert action["target"][list(AC_ACTIONS).index("click")] == 1.0
+    assert sum(action["target"]) == 1.0
+    assert complete["question"] == {
+        "type": "noul",
+        "instructions": INSTRUCTIONS["complete"],
+        "criteria": dict(COMPLETE_CRITERIA),
+    }
+    assert complete["target"] == [1.0, 0.0]
+    assert choice["question"]["type"] == "choice"
+    assert choice["question"]["instructions"] == ELEMENT_INSTRUCTION
+    assert list(choice["question"]["criteria"]) == ["r0", "r1"]
+    assert choice["question"]["criteria"] == {
+        f"r{index}": element_description(index, element)
+        for index, element in enumerate(step.elements)
+    }
+    assert choice["target"] == [0.0, 1.0]
+    assert choice["image"] == MARKED_IMAGE
+    assert {row["image"] for row in rows[:2]} == {RAW_IMAGE}
+    assert rows[0]["aliases"] == [
+        "image-bytes:" + step.image_sha256,
+        "image-bytes:" + marked[1],
+    ]
+
+
+def test_click_step_element_criteria_carry_only_text_and_description(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(
+            0,
+            {"action_type": "click", "x": 75, "y": 75},
+            "Tap JOIN A MEETING",
+            directory=directory,
+            nodes=click_nodes(),
+        )
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    rows = rows_for_ac_step(step, RAW_IMAGE, (MARKED_IMAGE, "marked"))
+    criteria = rows[2]["question"]["criteria"]
+    assert criteria["r0"] == 'UI element 0: {"text": "Cancel"}'
+    assert criteria["r1"] == (
+        'UI element 1: {"text": "JOIN A MEETING", "content_description": "Join the next meeting"}'
+    )
+    for index, payload in enumerate(criteria.values()):
+        assert set(json.loads(payload.removeprefix(f"UI element {index}: "))) <= {
+            "text",
+            "content_description",
+        }
+
+
+def test_scroll_step_yields_action_complete_and_swipe_dir_rows(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(
+            0, {"action_type": "scroll", "direction": "down"}, "Scroll down", directory=directory
+        )
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    assert step.arguments == {"action": "swipe", "direction": "up"}
+    assert step.elements == []
+    assert step.target_element is None
+    rows = rows_for_ac_step(step, RAW_IMAGE)
+    assert [row["id"] for row in rows] == [
+        "android_control_7_step0:action",
+        "android_control_7_step0:complete",
+        "android_control_7_step0:swipe_dir",
+    ]
+    assert [row["dataset"] for row in rows] == ["gui_action", "gui_complete", "gui_swipe"]
+    assert rows[0]["target"][list(AC_ACTIONS).index("swipe")] == 1.0
+    # Android Control records the finger, gui-v1 the content: scrolling down is
+    # an upward swipe.
+    swipe = rows[2]
+    assert swipe["question"]["type"] == "choice"
+    assert swipe["question"]["instructions"] == INSTRUCTIONS["swipe_dir"]
+    assert list(swipe["question"]["criteria"]) == list(SWIPE_DIRECTIONS)
+    assert swipe["target"] == [float(name == "up") for name in SWIPE_DIRECTIONS]
+    assert swipe["image"] == RAW_IMAGE
+    assert swipe["aliases"] == ["image-bytes:" + step.image_sha256]
+
+
+def test_system_button_step_yields_action_complete_and_button_rows(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(0, {"action_type": "navigate_back"}, "Press back", directory=directory)
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    rows = rows_for_ac_step(step, RAW_IMAGE)
+    assert [row["id"] for row in rows] == [
+        "android_control_7_step0:action",
+        "android_control_7_step0:complete",
+        "android_control_7_step0:button",
+    ]
+    assert [row["dataset"] for row in rows] == ["gui_action", "gui_complete", "gui_button"]
+    button = rows[2]
+    assert button["target"] == [float(name == "Back") for name in BUTTONS]
+    assert button["question"]["instructions"] == INSTRUCTIONS["button"]
+    assert list(button["question"]["criteria"]) == list(BUTTONS)
+    assert button["reference"]["tool_call"]["arguments"] == {
+        "action": "system_button",
+        "button": "Back",
+    }
+
+
+def test_open_app_step_target_is_the_last_action(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(
+            0,
+            {"action_type": "open_app", "app_name": "Zoho Meeting"},
+            "Open the app",
+            directory=directory,
+        )
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    rows = rows_for_ac_step(step, RAW_IMAGE)
+    assert [row["id"] for row in rows] == [
+        "android_control_7_step0:action",
+        "android_control_7_step0:complete",
+    ]
+    assert list(AC_ACTIONS).index("open_app") == 8
+    assert rows[0]["target"][8] == 1.0
+    assert rows[0]["target"][-1] == 1.0
+
+
+def test_wait_and_type_steps_have_no_conditional_row(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(0, {"action_type": "wait"}, "Wait", directory=directory),
+        ac_step(
+            1, {"action_type": "input_text", "text": "hello"}, "Type hello", directory=directory
+        ),
+    )
+    for index, action in enumerate(("wait", "type")):
+        step = parse_ac_step(record, index, directory=directory)
+        assert step.action == action
+        assert step.elements == []
+        assert step.target_element is None
+        rows = rows_for_ac_step(step, RAW_IMAGE)
+        assert [row["id"] for row in rows] == [
+            f"android_control_7_step{index}:action",
+            f"android_control_7_step{index}:complete",
+        ]
+        assert rows[0]["target"][list(AC_ACTIONS).index(action)] == 1.0
+        assert rows[1]["target"] == [1.0, 0.0]
+
+
+def test_terminal_step_yields_terminate_rows_without_an_accessibility_tree(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(0, {"action_type": "wait"}, "Wait", directory=directory),
+        ac_step(1, None, None, directory=directory),  # no a11y file on disk
+    )
+    step = parse_ac_step(record, 1, directory=directory)
+    assert step.action == "terminate"
+    assert step.arguments == {"action": "terminate"}
+    assert step.ac_action is None
+    assert step.instruction is None
+    assert step.elements == []
+    assert step.target_element is None
+    assert step.reference == {
+        "thought": "",
+        "action": "",
+        "tool_call": {"name": "mobile_use", "arguments": {"action": "terminate"}},
+        "ac_action": None,
+        "element_index": None,
+    }
+    rows = rows_for_ac_step(step, "episode/step_001_screenshot.png")
+    assert [row["id"] for row in rows] == [
+        "android_control_7_step1:action",
+        "android_control_7_step1:complete",
+    ]
+    assert rows[0]["target"][list(AC_ACTIONS).index("terminate")] == 1.0
+    assert rows[1]["target"] == [0.0, 1.0]
+    assert rows[0]["aliases"] == ["image-bytes:" + step.image_sha256]
+
+
+def test_rows_for_ac_step_requires_the_marked_screenshot_for_element_rows(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(
+            0,
+            {"action_type": "click", "x": 75, "y": 75},
+            "Tap",
+            directory=directory,
+            nodes=click_nodes(),
+        )
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    with pytest.raises(ValueError, match="marked screenshot"):
+        rows_for_ac_step(step, RAW_IMAGE)
+    # A step without an element row never needs the marked copy: passing one is
+    # ignored rather than an error.
+    waited = parse_ac_step(
+        ac_episode(ac_step(0, {"action_type": "wait"}, "Wait", directory=directory)),
+        0,
+        directory=directory,
+    )
+    assert rows_for_ac_step(waited, RAW_IMAGE, (MARKED_IMAGE, "marked"))[0]["aliases"] == [
+        "image-bytes:" + waited.image_sha256
+    ]
+
+
+def test_state_template_is_empty_at_the_first_step(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(0, {"action_type": "wait"}, "Wait for the app to load", directory=directory),
+        ac_step(1, None, None, directory=directory),
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    assert step.state == {
+        "user_query": GOAL,
+        "task_progress": "(You have done the following operation on the current device): .",
+    }
+
+
+def test_state_template_numbers_only_the_completed_instructions(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(0, {"action_type": "wait"}, "A", directory=directory),
+        ac_step(1, {"action_type": "wait"}, "B", directory=directory),
+        ac_step(2, {"action_type": "wait"}, "C", directory=directory),
+    )
+    step = parse_ac_step(record, 2, directory=directory)
+    assert step.state["task_progress"] == (
+        "(You have done the following operation on the current device): Step 1: A; Step 2: B; ."
+    )
+    # The current step's instruction is the answer and never reaches the state.
+    assert step.instruction == "C"
+    assert "C" not in step.state["task_progress"]
+
+
+def test_state_template_skips_missing_instructions_without_renumbering(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(0, {"action_type": "wait"}, None, directory=directory),
+        ac_step(1, {"action_type": "wait"}, "A", directory=directory),
+        ac_step(2, {"action_type": "wait"}, "B", directory=directory),
+        ac_step(3, {"action_type": "wait"}, "C", directory=directory),
+    )
+    step = parse_ac_step(record, 3, directory=directory)
+    assert step.state["task_progress"] == (
+        "(You have done the following operation on the current device): Step 1: A; Step 2: B; ."
+    )
+    assert step.state["user_query"] == GOAL
+
+
+def test_state_carries_the_goal_verbatim(tmp_path):
+    directory = tmp_path / "episode"
+    goal = "Book  a  table , then   call the office ."
+    record = ac_episode(ac_step(0, {"action_type": "wait"}, "Wait", directory=directory), goal=goal)
+    step = parse_ac_step(record, 0, directory=directory)
+    assert step.state["user_query"] == goal
+
+
+def test_reference_keeps_the_raw_action_and_the_mapped_arguments(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(
+            0, {"action_type": "scroll", "direction": "left"}, "Scroll left", directory=directory
+        )
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    assert step.reference == {
+        "thought": "",
+        "action": "Scroll left",
+        "tool_call": {
+            "name": "mobile_use",
+            "arguments": {"action": "swipe", "direction": "right"},
+        },
+        "ac_action": {"action_type": "scroll", "direction": "left"},
+        "element_index": None,
+    }
+
+
+def test_parse_step_excludes_unknown_actions(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(ac_step(0, {"action_type": "teleport"}, "Teleport", directory=directory))
+    assert parse_step(record, 0, episode_dir=directory) == (None, "unknown_action")
+    record = ac_episode(
+        ac_step(0, {"action_type": "click", "x": "540", "y": 390}, "Tap", directory=directory)
+    )
+    assert parse_step(record, 0, episode_dir=directory) == (None, "unknown_action")
+
+
+def test_parse_step_excludes_missing_and_undecodable_screenshots(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(ac_step(0, {"action_type": "wait"}, "Wait", directory=directory))
+    record["steps"][0]["screenshot"] = "gone.png"
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
+    record["steps"][0]["screenshot"] = "../step_000_screenshot.png"
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
+    record["steps"][0]["screenshot"] = "/etc/hostname"
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
+    record["steps"][0]["screenshot"] = ""
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
+    (directory / "junk.png").write_bytes(b"not an image")
+    record["steps"][0]["screenshot"] = "junk.png"
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
+
+
+def test_parse_step_excludes_click_steps_without_a_usable_a11y(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(0, {"action_type": "click", "x": 75, "y": 75}, "Tap", directory=directory)
+    )
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_a11y")
+    tree = directory / "step_000_a11y.json"
+    tree.write_text("{not json")
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_a11y")
+    for document in ("[1, 2]", "7", '{"windows": null}', '{"windows": {}}', "{}", "null"):
+        tree.write_text(document)
+        assert parse_step(record, 0, episode_dir=directory) == (None, "missing_a11y"), document
+    record["steps"][0]["accessibility_tree"] = "../step_000_a11y.json"
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_a11y")
+
+
+def test_parse_step_excludes_click_steps_whose_target_does_not_resolve(tmp_path):
+    directory = tmp_path / "episode"
+    click = {"action_type": "click", "x": 75, "y": 75}
+    # No clickable element at all.
+    record = ac_episode(ac_step(0, click, "Tap", directory=directory, nodes=[]))
+    assert parse_step(record, 0, episode_dir=directory) == (None, "too_few_candidates")
+    # Exactly one candidate is below the two-candidate floor.
+    record = ac_episode(
+        ac_step(0, click, "Tap", directory=directory, nodes=[node(text="Only one")])
+    )
+    assert parse_step(record, 0, episode_dir=directory) == (None, "too_few_candidates")
+    # Two candidates, but the click lands outside both.
+    record = ac_episode(
+        ac_step(
+            0,
+            {"action_type": "click", "x": 5, "y": 190},
+            "Tap",
+            directory=directory,
+            nodes=click_nodes(),
+        )
+    )
+    assert parse_step(record, 0, episode_dir=directory) == (None, "no_target_element")
+
+
+def test_parse_step_excludes_click_steps_with_too_many_candidates(tmp_path):
+    directory = tmp_path / "episode"
+    boxes = [
+        node(
+            text=f"box {index}",
+            boundsInScreen={"left": 0, "top": index, "right": 10, "bottom": index + 1},
+        )
+        for index in range(MAX_CANDIDATES + 1)
+    ]
+    record = ac_episode(
+        ac_step(
+            0, {"action_type": "click", "x": 5, "y": 5}, "Tap", directory=directory, nodes=boxes
+        )
+    )
+    assert parse_step(record, 0, episode_dir=directory) == (None, "too_many_candidates")
+
+
+def test_parse_step_never_reads_the_a11y_tree_for_other_actions(tmp_path):
+    directory = tmp_path / "episode"
+    actions = [
+        {"action_type": "wait"},
+        {"action_type": "scroll", "direction": "up"},
+        {"action_type": "input_text", "text": "hello"},
+        {"action_type": "open_app", "app_name": "Maps"},
+        {"action_type": "navigate_back"},
+        {"action_type": "navigate_home"},
+        None,
+    ]
+    steps = [
+        ac_step(index, action, "Do it", directory=directory) for index, action in enumerate(actions)
+    ]
+    record = ac_episode(*steps)
+    for index in range(len(actions)):
+        step, reason = parse_step(record, index, episode_dir=directory)
+        assert reason is None, actions[index]
+        assert step.elements == []
+        assert step.target_element is None
+
+
+def test_parse_step_checks_the_screenshot_before_the_action(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(ac_step(0, {"action_type": "teleport"}, "Teleport", directory=directory))
+    record["steps"][0]["screenshot"] = "gone.png"
+    assert parse_step(record, 0, episode_dir=directory) == (None, "missing_image")
+
+
+def test_parse_step_never_raises_on_malformed_records(tmp_path):
+    malformed = [
+        None,
+        [],
+        "record",
+        7,
+        {},
+        {"episode_id": 7, "goal": "g"},
+        {"episode_id": 7, "goal": "g", "steps": None},
+        {"episode_id": 7, "goal": "g", "steps": {}},
+        {"episode_id": 7, "goal": "g", "steps": ["step"]},
+        {"episode_id": 7, "goal": "g", "steps": [None]},
+        {"episode_id": 7, "goal": "g", "steps": [{}]},
+        {"episode_id": "7", "goal": "g", "steps": []},
+        {"episode_id": True, "goal": "g", "steps": []},
+        {"episode_id": 7, "goal": None, "steps": []},
+        {"episode_id": 7, "goal": 7, "steps": []},
+    ]
+    for record in malformed:
+        step, reason = parse_step(record, 0, episode_dir=tmp_path)
+        assert step is None, record
+        assert isinstance(reason, str), record
+    directory = tmp_path / "episode"
+    record = ac_episode(ac_step(0, {"action_type": "wait"}, "Wait", directory=directory))
+    for index in (-1, 1, 99, "0", None, True, 1.5):
+        step, reason = parse_step(record, index, episode_dir=directory)
+        assert step is None, index
+        assert isinstance(reason, str), index
+
+
+def test_parse_step_never_raises_on_junk_inside_a_valid_step(tmp_path):
+    directory = tmp_path / "episode"
+    entry = ac_step(
+        0,
+        {"action_type": "click", "x": 75, "y": 75, "junk": object()},
+        42,  # a junk instruction reads as no instruction at all
+        directory=directory,
+        nodes=[
+            {"boundsInScreen": "box", "isClickable": True, "isVisibleToUser": True},
+            node(text="ok", boundsInScreen={"left": 50, "top": 50, "right": 100, "bottom": 100}),
+            "junk",
+            node(isClickable="true"),
+            node(text="also ok", boundsInScreen={"left": 0, "top": 0, "right": 50, "bottom": 50}),
+            node(text=5, contentDescription=None, boundsInScreen={"left": "x", "right": 10}),
+        ],
+    )
+    record = ac_episode(entry)
+    step, reason = parse_step(record, 0, episode_dir=directory)
+    assert reason is None
+    assert step.target_element == 0
+    assert [entry["text"] for entry in step.elements] == ["ok", "also ok"]
+    # A junk instruction is not a past instruction: the history stays empty.
+    assert step.state["task_progress"].endswith("): .")
+    assert step.instruction is None
+    assert step.reference == {
+        "thought": "",
+        "action": "",
+        "tool_call": {
+            "name": "mobile_use",
+            "arguments": {"action": "click", "coordinate": [75, 75]},
+        },
+        "ac_action": {"action_type": "click", "x": 75, "y": 75, "junk": entry["action"]["junk"]},
+        "element_index": 0,
+    }
+    rows = rows_for_ac_step(step, RAW_IMAGE, (MARKED_IMAGE, "marked"))
+    assert len(rows) == 3
+
+
+def test_rows_for_ac_step_is_deterministic(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(
+            0,
+            {"action_type": "click", "x": 75, "y": 75},
+            "Tap",
+            directory=directory,
+            nodes=click_nodes(),
+        )
+    )
+    marked = (MARKED_IMAGE, image_digest(write_png(directory / "step_000_marked.png")))
+    first = parse_ac_step(record, 0, directory=directory)
+    second = parse_ac_step(record, 0, directory=directory)
+    assert first == second
+    assert json.dumps(rows_for_ac_step(first, RAW_IMAGE, marked), sort_keys=True) == json.dumps(
+        rows_for_ac_step(second, RAW_IMAGE, marked), sort_keys=True
+    )
+
+
+def test_ac_rows_pass_validate_rows(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(
+        ac_step(
+            0,
+            {"action_type": "click", "x": 75, "y": 75},
+            "Tap",
+            directory=directory,
+            nodes=click_nodes(),
+        ),
+        ac_step(1, {"action_type": "scroll", "direction": "up"}, "Scroll up", directory=directory),
+        ac_step(2, {"action_type": "navigate_home"}, "Go home", directory=directory),
+        ac_step(3, None, None, directory=directory),
+    )
+    marked = (MARKED_IMAGE, image_digest(write_png(directory / "step_000_marked.png")))
+    rows = rows_for_ac_step(parse_ac_step(record, 0, directory=directory), RAW_IMAGE, marked)
+    for index, action in ((1, "swipe"), (2, "system_button"), (3, "terminate")):
+        step = parse_ac_step(record, index, directory=directory)
+        assert step.action == action
+        rows += rows_for_ac_step(step, f"episode/step_{index:03d}_screenshot.png")
+    assert len(rows) == 11
+    validate_rows(rows, root=tmp_path)
+
+
+def test_datasets_cover_the_five_families():
+    assert DATASETS == {
+        "action": "gui_action",
+        "complete": "gui_complete",
+        "element": "screenshot_choice",
+        "swipe_dir": "gui_swipe",
+        "button": "gui_button",
+    }
+    assert ELEMENT_INSTRUCTION == "Which action should be taken next to complete the user's task?"

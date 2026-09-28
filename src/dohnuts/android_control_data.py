@@ -5,17 +5,30 @@ the steps of the episode and every step points at a screenshot plus a
 `step_NNN_a11y.json` accessibility forest. This module holds the pure rules that
 turn that raw format into the vocabulary the gui-v1 pipeline already uses: the
 metadata structure check, the action mapping, the clickable element list, the
-ground-truth hit test, and the candidate choice constraints. The element rules
-are a port of the dataset's own `utils/representation_utils.py` onto plain JSON,
-with no protobuf and no cv2. Row building, screenshot marking, and the
-conversion CLI live in the callers, not here.
+ground-truth hit test, the candidate choice constraints, and the two or three
+decision rows every step produces. The element rules are a port of the dataset's
+own `utils/representation_utils.py` onto plain JSON, with no protobuf and no
+cv2. Screenshot marking and the conversion CLI live in the callers, not here.
 """
 
 import json
 import math
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TypeGuard
 
-from dohnuts.gui_data import ACTIONS
+from PIL import Image
+
+from dohnuts.gui_data import (
+    ACTIONS,
+    BUTTONS,
+    COMPLETE_CRITERIA,
+    INSTRUCTIONS,
+    SWIPE_DIRECTIONS,
+    image_digest,
+    one_hot,
+    split_for,
+)
 
 # Android Control adds `open_app` to the gui-v1 vocabulary. It is appended last
 # so indices 0..7 keep their gui-v1 meaning and one-hot targets stay comparable
@@ -33,6 +46,22 @@ SYSTEM_BUTTONS = {"navigate_back": "Back", "navigate_home": "Home"}
 # limits `dohnuts.gui_data.validate_rows` enforces on every written row.
 MIN_CANDIDATES = 2
 MAX_CANDIDATES = 128
+
+DATASETS = {
+    "action": "gui_action",
+    "complete": "gui_complete",
+    "element": "screenshot_choice",
+    "swipe_dir": "gui_swipe",
+    "button": "gui_button",
+}
+
+# The element family asks which candidate to act on, so it reuses the prompt of
+# the row the dataset itself ships for that question.
+ELEMENT_INSTRUCTION = "Which action should be taken next to complete the user's task?"
+
+# Every task_progress starts with this phrase; the gui-v1 state template uses
+# the same wording for the operations the agent has already performed.
+TASK_PROGRESS_PREFIX = "(You have done the following operation on the current device): "
 
 
 def is_integer(value: object) -> TypeGuard[int]:
@@ -314,3 +343,316 @@ def parse_metadata(record: object) -> tuple[dict | None, str | None]:
     if not isinstance(steps, list) or not all(validate_step(step) for step in steps):
         return None, "unparsable_metadata"
     return record, None
+
+
+def read_screenshot(episode_dir: Path, name: object) -> tuple[Path, str, tuple[int, int]] | None:
+    """Open one step screenshot; None when it is unusable, never raises.
+
+    `name` is the file name the metadata step points at. Absolute paths and
+    paths that escape `episode_dir` are rejected before any IO, so a record can
+    never read outside its own episode. The returned size is the pixel size
+    (width, height) the element rules measure bounds against, and the digest is
+    of the file bytes on disk, which is what the row aliases carry.
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    image = Path(episode_dir) / relative
+    try:
+        if not image.is_file():
+            return None
+        with Image.open(image) as handle:
+            handle.convert("RGB")
+            size = handle.size
+        return image, image_digest(image), size
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return None
+
+
+def read_a11y(episode_dir: Path, name: object) -> dict | None:
+    """Read one `step_NNN_a11y.json`; None when it is unusable, never raises.
+
+    The same path safety as `read_screenshot` applies. A file that is absent, is
+    not JSON, or is not a `{"windows": [...]}` forest reads as unusable rather
+    than as an empty forest, so a click step whose candidates cannot be known is
+    excluded instead of asked about with no candidates at all.
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    path = Path(episode_dir) / relative
+    try:
+        if not path.is_file():
+            return None
+        with path.open(encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(document, dict) or not isinstance(document.get("windows"), list):
+        return None
+    return document
+
+
+def task_progress(instructions: list[str | None]) -> str:
+    """Render the history prefix of one step from its completed instructions.
+
+    Callers pass the `step_instruction` of every step before the current one, in
+    episode order. None entries, and values that are not strings, are skipped
+    and the kept ones are renumbered 1..n, so the numbering never has holes. An
+    empty history renders as the bare prefix plus `.`.
+    """
+    parts = [
+        f"Step {number}: {instruction};"
+        for number, instruction in enumerate(
+            (value for value in instructions if isinstance(value, str)), 1
+        )
+    ]
+    return TASK_PROGRESS_PREFIX + " ".join([*parts, "."])
+
+
+@dataclass(frozen=True)
+class ACStep:
+    """One parsed Android Control step; `rows_for_ac_step` turns it into rows.
+
+    `elements` and `target_element` only carry values when the mapped action is
+    `click` or `long_press`; every other step, including the terminal one, has
+    `elements == []` and `target_element is None`. `target_element` is a
+    position into `elements`, never the `index` field of an element, and
+    `arguments` are the mapped mobile_use-shaped arguments, not the raw ones.
+    """
+
+    id: str
+    group: str
+    state: dict
+    image: Path
+    image_sha256: str
+    action: str
+    arguments: dict
+    ac_action: dict | None
+    instruction: str | None
+    elements: list[dict]
+    target_element: int | None
+    reference: dict
+
+
+def parse_step(
+    metadata: dict, index: int, *, episode_dir: Path
+) -> tuple[ACStep | None, str | None]:
+    """Parse one step of an episode; never raises, returns an exclusion reason.
+
+    `metadata` is a record already accepted by `parse_metadata` and `index` is
+    the step to parse. The envelope is checked again here, so a caller that
+    skips `parse_metadata` gets a reason string instead of a traceback.
+
+    Reasons: `unparsable_metadata` (the envelope or the index is unusable),
+    `missing_image` (the screenshot is missing, undecodable, or outside the
+    episode directory), `unknown_action` (`map_action` does not know the
+    action), `missing_a11y` (a click or long_press step without a readable
+    accessibility forest), and `resolve_element_choice`'s `too_few_candidates`,
+    `too_many_candidates` and `no_target_element`. Any element reason excludes
+    the whole step: a step is never partially converted. The forest is opened
+    only for `click` and `long_press` steps.
+
+    The last step of an episode has a null action; it becomes a `terminate` step
+    with an empty candidate list and no instruction.
+    """
+    if not isinstance(metadata, dict):
+        return None, "unparsable_metadata"
+    steps = metadata.get("steps")
+    episode_id = metadata.get("episode_id")
+    goal = metadata.get("goal")
+    if not is_integer(episode_id) or not isinstance(goal, str):
+        return None, "unparsable_metadata"
+    if not isinstance(steps, list) or not is_integer(index) or not 0 <= index < len(steps):
+        return None, "unparsable_metadata"
+    step = steps[index]
+    if not isinstance(step, dict):
+        return None, "unparsable_metadata"
+    screenshot = read_screenshot(episode_dir, step.get("screenshot"))
+    if screenshot is None:
+        return None, "missing_image"
+    image, image_sha256, size = screenshot
+
+    raw = step.get("action")
+    instruction = step.get("step_instruction")
+    instruction = instruction if isinstance(instruction, str) else None
+    elements: list[dict] = []
+    target_element = None
+    ac_action: dict | None = None
+    if raw is None:
+        # The last step of an episode: no action to take, and the instruction
+        # that would describe the next one does not exist either.
+        action, arguments = "terminate", {"action": "terminate"}
+        ac_action = None
+        instruction = None
+    else:
+        if not isinstance(raw, dict):
+            return None, "unknown_action"
+        mapped = map_action(raw)
+        if mapped is None:
+            return None, "unknown_action"
+        action, arguments = mapped
+        ac_action = raw
+        if action in ("click", "long_press"):
+            a11y = read_a11y(episode_dir, step.get("accessibility_tree"))
+            if a11y is None:
+                return None, "missing_a11y"
+            elements = extract_elements(a11y, screen_size=size)
+            # map_action passes the raw x/y through unchanged, and this branch
+            # only runs when it accepted both as finite coordinates.
+            x, y = arguments["coordinate"]
+            position, reason = resolve_element_choice(elements, x, y)
+            if reason is not None:
+                return None, reason
+            target_element = position
+
+    past = [
+        entry.get("step_instruction") if isinstance(entry, dict) else None
+        for entry in steps[:index]
+    ]
+    return (
+        ACStep(
+            id=f"android_control_{episode_id}_step{index}",
+            group=f"task:android_control_{episode_id}",
+            state={"user_query": goal, "task_progress": task_progress(past)},
+            image=image,
+            image_sha256=image_sha256,
+            action=action,
+            arguments=arguments,
+            ac_action=ac_action,
+            instruction=instruction,
+            elements=elements,
+            target_element=target_element,
+            reference={
+                "thought": "",
+                "action": instruction or "",
+                "tool_call": {"name": "mobile_use", "arguments": arguments},
+                "ac_action": ac_action,
+                "element_index": target_element,
+            },
+        ),
+        None,
+    )
+
+
+def rows_for_ac_step(
+    step: ACStep, image_path: str, marked: tuple[str, str] | None = None
+) -> list[dict]:
+    """Every decision row of one parsed step: action, complete, then its family.
+
+    `step` must come from `parse_step` (it guarantees the action vocabulary and
+    the candidate list this function relies on). `image_path` is the repository
+    root relative path of the stored copy of the raw screenshot, not
+    `step.image`. `marked` is the relative path and sha256 of the marked copy and
+    is only read by the element family; it is ignored by the other families.
+
+    Rows come back in the order action, complete, element or button or
+    swipe_dir. Every row of a step shares `state`, `group`, `aliases` and
+    `reference` **by reference**: treat row values as read-only.
+
+    Two programming errors raise a `ValueError`, with the same posture as
+    `gui_data.rows_for_step`'s swipe guard: an element step without `marked`,
+    and an element step whose `target_element` was never resolved (which
+    `parse_step` cannot produce).
+    """
+    element_row = step.action in ("click", "long_press")
+    if element_row and marked is None:
+        raise ValueError(
+            "rows_for_ac_step requires the marked screenshot of a click or long_press step"
+        )
+    marked_path = image_path
+    aliases = ["image-bytes:" + step.image_sha256]
+    if element_row and marked is not None:  # the guard above rules out marked=None
+        marked_path = marked[0]
+        aliases.append("image-bytes:" + marked[1])
+    split = split_for(step.group)
+
+    def row(name: str, question: dict, target: list[float], image: str) -> dict:
+        return {
+            "id": f"{step.id}:{name}",
+            "dataset": DATASETS[name],
+            "group": step.group,
+            "aliases": aliases,
+            "split": split,
+            "state": step.state,
+            "image": image,
+            "question": question,
+            "target": target,
+            "reference": step.reference,
+        }
+
+    rows = [
+        row(
+            "action",
+            {
+                "type": "choice",
+                "instructions": INSTRUCTIONS["action"],
+                "criteria": dict(AC_ACTIONS),
+            },
+            one_hot(len(AC_ACTIONS), list(AC_ACTIONS).index(step.action)),
+            image_path,
+        ),
+        row(
+            "complete",
+            {
+                "type": "noul",
+                "instructions": INSTRUCTIONS["complete"],
+                "criteria": dict(COMPLETE_CRITERIA),
+            },
+            [0.0, 1.0] if step.action == "terminate" else [1.0, 0.0],
+            image_path,
+        ),
+    ]
+    if element_row:
+        if step.target_element is None:
+            raise ValueError(
+                "rows_for_ac_step requires a resolved element target; parse_step rejects the rest"
+            )
+        rows.append(
+            row(
+                "element",
+                {
+                    "type": "choice",
+                    "instructions": ELEMENT_INSTRUCTION,
+                    "criteria": {
+                        f"r{position}": element_description(position, element)
+                        for position, element in enumerate(step.elements)
+                    },
+                },
+                one_hot(len(step.elements), step.target_element),
+                marked_path,
+            )
+        )
+    elif step.action == "system_button":
+        buttons = list(BUTTONS)
+        rows.append(
+            row(
+                "button",
+                {
+                    "type": "choice",
+                    "instructions": INSTRUCTIONS["button"],
+                    "criteria": dict(BUTTONS),
+                },
+                one_hot(len(buttons), buttons.index(step.arguments["button"])),
+                image_path,
+            )
+        )
+    elif step.action == "swipe":
+        directions = list(SWIPE_DIRECTIONS)
+        rows.append(
+            row(
+                "swipe_dir",
+                {
+                    "type": "choice",
+                    "instructions": INSTRUCTIONS["swipe_dir"],
+                    "criteria": dict(SWIPE_DIRECTIONS),
+                },
+                one_hot(len(directions), directions.index(step.arguments["direction"])),
+                image_path,
+            )
+        )
+    return rows
