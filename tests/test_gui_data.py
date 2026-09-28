@@ -596,6 +596,36 @@ def test_validate_rows_reports_unreadable_images(image_root):
         validate_rows(rows)
 
 
+def test_validate_rows_decodes_each_distinct_image_once(monkeypatch, image_root):
+    rows = [
+        row_stub("a:action", group="task:a", split="train", alias="image-bytes:1"),
+        row_stub("b:action", group="task:b", split="train", alias="image-bytes:2"),
+        row_stub("c:action", group="task:c", split="train", alias="image-bytes:3"),
+    ]
+    # Three rows over one file, spelled two ways, plus one over a second file:
+    # the self-check re-reading a screenshot per row costs a full decode each
+    # time, so a path that already opened must not open again.
+    rows[0]["image"] = "shot.png"
+    rows[1]["image"] = "./shot.png"
+    rows[2]["image"] = "other.png"
+    opened = []
+    real_open = Image.open
+
+    def counting_open(path, *arguments, **keywords):
+        opened.append(Path(path).name)
+        return real_open(path, *arguments, **keywords)
+
+    monkeypatch.setattr("dohnuts.gui_data.Image.open", counting_open)
+    validate_rows(rows, root=image_root)
+    assert opened == ["shot.png", "other.png"]
+    # A path that does not open still fails with the row that pointed at it.
+    rows.append(row_stub("d:action", group="task:d", split="train", alias="image-bytes:4"))
+    rows[-1]["image"] = "gone.png"
+    with pytest.raises(ValueError, match="Image is not readable: d:action"):
+        validate_rows(rows, root=image_root)
+    assert opened[-1] == "gone.png"
+
+
 def test_validate_rows_rejects_group_across_splits(image_root):
     step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
     rows = rows_for_step(step, str(step.image))

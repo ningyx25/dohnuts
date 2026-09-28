@@ -164,6 +164,7 @@ def convert(source: Path, output: Path) -> dict:
     if Path.cwd().resolve() != root:
         raise SystemExit(f"Run from the repository root: {root}")
     source = Path(source)
+    output = Path(output)
     episodes = episode_dirs(source)
     if not episodes:
         raise SystemExit(f"No episode directories found under {source}")
@@ -175,12 +176,15 @@ def convert(source: Path, output: Path) -> dict:
     excluded: list[dict] = []
     rows: list[dict] = []
     images_written: set[str] = set()
+    empty_targets: dict[str, bool] = {}
     element_rows = 0
+    metadata_files_hashed = 0
     metadata_sha256 = hashlib.sha256()
     for number, episode_dir in enumerate(episodes, 1):
         name = episode_dir.name
         record, raw, detail = read_metadata(episode_dir, name)
         if raw is not None:
+            metadata_files_hashed += 1
             metadata_sha256.update(raw)
         if record is not None:
             # A valid JSON document of the wrong shape is as unusable as a torn
@@ -188,6 +192,12 @@ def convert(source: Path, output: Path) -> dict:
             # text to report, so the entry carries no detail.
             record, _ = parse_metadata(record)
             detail = ""
+        if record is not None and int(name) != record["episode_id"]:
+            # The metadata file is named after its directory while the rows are
+            # keyed by the record's id: a corpus whose two ids disagree would be
+            # keyed unpredictably, so the episode is excluded instead.
+            detail = f"episode_id mismatch: dir {name} vs record {record['episode_id']}"
+            record = None
         if record is None:
             # One unreadable episode out of 15,283 is not a reason to stop the
             # batch, and the directory name is the only id the episode has left.
@@ -207,19 +217,30 @@ def convert(source: Path, output: Path) -> dict:
                         )
                         continue
                     raw_target = store_raw(step, output)
-                    images_written.add(raw_target.name)
                     marked = None
+                    marked_target = None
                     if step.target_element is not None:
                         marked_target, marked_sha256 = store_marked(
                             step.image, step.elements, output
                         )
-                        images_written.add(marked_target.name)
                         marked = (os.path.relpath(marked_target, root), marked_sha256)
                     rows.extend(
                         rows_for_ac_step(step, os.path.relpath(raw_target, root), marked=marked)
                     )
-                    if step.target_element is not None:
+                    # An image enters the manifest only once the rows naming it
+                    # exist, so a failure above cannot leave an unreferenced file
+                    # behind in it.
+                    images_written.add(raw_target.name)
+                    if step.target_element is not None:  # hence marked_target is set too
+                        images_written.add(marked_target.name)
                         element_rows += 1
+                        target = step.elements[step.target_element]
+                        # The payload is `{}` exactly when the ground-truth
+                        # candidate carries neither a text nor a description,
+                        # which makes the question unanswerable from the prompt.
+                        empty_targets[f"{step.id}:element"] = not (
+                            target["text"] or target["content_description"]
+                        )
                 except Exception as error:
                     # A filesystem or decode failure outside the rule parsers must
                     # not abort the batch, and the half-made rows are dropped:
@@ -236,7 +257,15 @@ def convert(source: Path, output: Path) -> dict:
                     continue
         if number % PROGRESS_EVERY == 0:
             print(
-                json.dumps({"progress": {"episodes": number, "rows": len(rows)}}),
+                json.dumps(
+                    {
+                        "progress": {
+                            "episodes": number,
+                            "rows": len(rows),
+                            "exclusions": len(excluded),
+                        }
+                    }
+                ),
                 file=sys.stderr,
                 flush=True,
             )
@@ -260,21 +289,20 @@ def convert(source: Path, output: Path) -> dict:
                     label = list(AC_ACTIONS)[row["target"].index(1.0)]
                     classes.setdefault(row["split"], Counter())[label] += 1
                 elif row["dataset"] == "screenshot_choice":
-                    criteria = list(row["question"]["criteria"].values())
-                    candidates.setdefault(row["split"], []).append(len(criteria))
-                    if criteria[row["target"].index(1.0)].endswith(": {}"):
-                        # `element_description` renders a candidate without text
-                        # and without a description as the empty object, which is
-                        # the one payload that asks nothing of the model.
+                    candidates.setdefault(row["split"], []).append(len(row["question"]["criteria"]))
+                    if empty_targets.get(row["id"]):
                         empty_payloads[row["split"]] += 1
         finally:
             for handle in handles.values():
                 handle.close()
     except OSError as error:
         raise SystemExit(f"Cannot write the split files under {output}: {error}") from error
-    with (output / "excluded.jsonl").open("w") as stream:
-        for entry in [*excluded, *dropped]:
-            stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    try:
+        with (output / "excluded.jsonl").open("w") as stream:
+            for entry in [*excluded, *dropped]:
+                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as error:
+        raise SystemExit(f"Cannot write the exclusions under {output}: {error}") from error
     empty = [split for split in SPLITS if not any(key[1] == split for key in counts)]
     if empty:
         print(
@@ -289,6 +317,7 @@ def convert(source: Path, output: Path) -> dict:
             continue
         empties = empty_payloads[split]
         element_stats[split] = {
+            "basis": "post_isolation",
             "rows": len(widths),
             "candidates_min": min(widths),
             "candidates_mean": sum(widths) / len(widths),
@@ -305,6 +334,7 @@ def convert(source: Path, output: Path) -> dict:
     # `element_rows` counts the steps it resolved (one choice row each).
     asked = element_rows + sum(misses)
     element_resolution = {
+        "basis": "pre_isolation",
         "element_rows": element_rows,
         "no_target_element": misses[0],
         "too_few_candidates": misses[1],
@@ -319,6 +349,7 @@ def convert(source: Path, output: Path) -> dict:
             "input": str(source),
             "episodes": len(episodes),
             "metadata_sha256": metadata_sha256.hexdigest(),
+            "metadata_files_hashed": metadata_files_hashed,
         },
         "path_convention": f"repository-root relative ({root})",
         "counts": [
@@ -351,7 +382,10 @@ def convert(source: Path, output: Path) -> dict:
         "environment": {"python": platform.python_version(), "pillow": PIL.__version__},
         "sha256": {split: digest_file(output / f"{split}.jsonl") for split in SPLITS},
     }
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    try:
+        (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    except OSError as error:
+        raise SystemExit(f"Cannot write the manifest under {output}: {error}") from error
     print(json.dumps(manifest), flush=True)
     return manifest
 

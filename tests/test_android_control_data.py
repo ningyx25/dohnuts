@@ -1537,6 +1537,7 @@ def test_cli_writes_the_splits_and_a_manifest(tmp_path):
     assert manifest["split_limits"] == [["calibration", 10], ["dev", 20], ["test", 30]]
     assert manifest["source"]["episodes"] == 3
     assert len(manifest["source"]["metadata_sha256"]) == 64
+    assert manifest["source"]["metadata_files_hashed"] == 3
     assert manifest["path_convention"].startswith("repository-root relative")
     assert manifest["token_check"] == "skipped"
     assert manifest["exclusions"] == {}
@@ -1570,6 +1571,7 @@ def test_cli_writes_the_splits_and_a_manifest(tmp_path):
         "train": {"click": 1, "system_button": 1, "swipe": 1, "terminate": 1},
     }
     assert manifest["element_stats"]["train"] == {
+        "basis": "post_isolation",
         "rows": 1,
         "candidates_min": 2,
         "candidates_mean": 2.0,
@@ -1578,6 +1580,7 @@ def test_cli_writes_the_splits_and_a_manifest(tmp_path):
         "empty_target_payload_rate": 0.0,
     }
     assert manifest["element_stats"]["test"] == {
+        "basis": "post_isolation",
         "rows": 1,
         "candidates_min": 2,
         "candidates_mean": 2.0,
@@ -1586,6 +1589,7 @@ def test_cli_writes_the_splits_and_a_manifest(tmp_path):
         "empty_target_payload_rate": 1.0,
     }
     assert manifest["element_resolution"] == {
+        "basis": "pre_isolation",
         "element_rows": 2,
         "no_target_element": 0,
         "too_few_candidates": 0,
@@ -1679,16 +1683,20 @@ def test_cli_records_exclusions_without_aborting_the_batch(tmp_path):
     entry = cli_step(third, 0, {"action_type": "wait"}, "Wait", color=(3, 0, 0))
     (third / "step_000_screenshot.png").unlink()
     write_episode(source, 2, entry)
-    # Episode 3 has a metadata file that parses as JSON but not as an episode.
+    # Episode 3 has a metadata file that parses as JSON but not as an episode,
+    # and episode 4 has one that was cut off mid-write.
     fourth = source / "3"
     fourth.mkdir(parents=True)
     (fourth / "metadata_3.json").write_text(json.dumps({"episode_id": 3}))
+    fifth = source / "4"
+    fifth.mkdir(parents=True)
+    (fifth / "metadata_4.json").write_text("{torn")
     output = tmp_path / "out"
     manifest = prepare.convert(source, output)
     assert manifest["exclusions"] == {
         "parse:missing_image": 1,
         "parse:no_target_element": 1,
-        "parse:unparsable_metadata": 2,
+        "parse:unparsable_metadata": 3,
     }
     entries = [json.loads(line) for line in (output / "excluded.jsonl").read_text().splitlines()]
     assert [(entry["id"], entry["reason"], entry["stage"]) for entry in entries] == [
@@ -1696,6 +1704,7 @@ def test_cli_records_exclusions_without_aborting_the_batch(tmp_path):
         ("android_control_1_step0", "no_target_element", "parse"),
         ("android_control_2_step0", "missing_image", "parse"),
         ("3", "unparsable_metadata", "parse"),
+        ("4", "unparsable_metadata", "parse"),
     ]
     # An unreadable metadata file names the error it hit; a step exclusion and a
     # structurally wrong document carry no detail of their own.
@@ -1703,7 +1712,36 @@ def test_cli_records_exclusions_without_aborting_the_batch(tmp_path):
     assert entries[1]["detail"] == ""
     assert entries[2]["detail"] == ""
     assert entries[3]["detail"] == ""
+    assert entries[4]["detail"].startswith("JSONDecodeError")
     assert sum(entry["n"] for entry in manifest["counts"]) == 2
+
+
+def test_cli_excludes_an_episode_whose_two_ids_disagree(tmp_path):
+    source = tmp_path / "corpus"
+    directory = source / "5"
+    directory.mkdir(parents=True)
+    entry = cli_step(directory, 0, {"action_type": "wait"}, "Wait", color=(13, 13, 13))
+    # The rows would be keyed `android_control_6_*` while the metadata file is
+    # named after directory 5, so the episode is excluded rather than keyed by
+    # an id nobody can predict.
+    (directory / "metadata_5.json").write_text(json.dumps(ac_episode(entry, episode_id=6)))
+    output = tmp_path / "out"
+    manifest = prepare.convert(source, output)
+    assert manifest["exclusions"] == {"parse:unparsable_metadata": 1}
+    assert manifest["source"] == {
+        "input": str(source),
+        "episodes": 1,
+        "metadata_sha256": hashlib.sha256((directory / "metadata_5.json").read_bytes()).hexdigest(),
+        "metadata_files_hashed": 1,
+    }
+    entry = json.loads((output / "excluded.jsonl").read_text().splitlines()[0])
+    assert entry == {
+        "id": "5",
+        "reason": "unparsable_metadata",
+        "detail": "episode_id mismatch: dir 5 vs record 6",
+        "stage": "parse",
+    }
+    assert sum(item["n"] for item in manifest["counts"]) == 0
 
 
 def test_cli_refuses_to_run_outside_the_repository_root(tmp_path, monkeypatch):
@@ -1749,12 +1787,17 @@ def test_cli_reports_progress_on_a_long_run(tmp_path, capsys, monkeypatch):
     source = tmp_path / "corpus"
     directory = source / "0"
     directory.mkdir(parents=True)
+    broken = cli_step(directory, 2, {"action_type": "wait"}, "Wait", color=(6, 6, 8))
+    (directory / "step_002_screenshot.png").unlink()
     write_episode(
         source,
         0,
         cli_step(directory, 0, {"action_type": "wait"}, "Wait", color=(6, 6, 6)),
         cli_step(directory, 1, None, None, color=(6, 6, 7)),
+        broken,
     )
     prepare.convert(source, tmp_path / "out")
     captured = capsys.readouterr()
-    assert captured.err.splitlines()[0] == json.dumps({"progress": {"episodes": 1, "rows": 4}})
+    assert captured.err.splitlines()[0] == json.dumps(
+        {"progress": {"episodes": 1, "rows": 4, "exclusions": 1}}
+    )

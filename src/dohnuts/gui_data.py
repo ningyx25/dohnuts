@@ -383,9 +383,17 @@ def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
     Every failure is a `ValueError` naming the offending row, so callers can
     abort with one actionable line. `root` resolves the stored image paths
     (they are repository-root relative) and defaults to the working directory.
+
+    A screenshot is decoded once per distinct file, not once per row: rows of
+    one step share an image, and a corpus-scale run would otherwise spend most of
+    its self-check time re-decoding the same bytes. The cache is keyed by the
+    resolved path, and only a successful open is remembered, so two spellings of
+    one file validate once and an unreadable file still fails on every row that
+    names it.
     """
     root = Path.cwd() if root is None else root
     seen_ids = set()
+    validated: set[Path] = set()
     splits_by_group: dict[str, set] = {}
     splits_by_alias: dict[str, set] = {}
     for row in rows:
@@ -402,9 +410,16 @@ def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
             raise ValueError(f"Target width does not match candidates: {row['id']}")
         if min(row["target"]) < 0 or abs(sum(row["target"]) - 1) > 1e-4:
             raise ValueError(f"Target is not a distribution: {row['id']}")
+        path = root / row["image"]
         try:
-            with Image.open(root / row["image"]) as image:
-                image.convert("RGB")
+            # `resolve()` runs inside the try so that a path it cannot resolve
+            # fails as an unreadable image with the row that named it, exactly
+            # like one that cannot be opened.
+            key = path.resolve()
+            if key not in validated:
+                with Image.open(path) as image:
+                    image.convert("RGB")
+                validated.add(key)
         except OSError as error:
             raise ValueError(
                 f"Image is not readable: {row['id']} ({row['image']}): {error}"
