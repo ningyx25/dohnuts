@@ -19,6 +19,8 @@ from pathlib import Path
 
 import PIL
 from PIL import Image
+from transformers import AutoProcessor
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 from dohnuts.android_control_data import (
     AC_ACTIONS,
@@ -38,6 +40,8 @@ from dohnuts.gui_data import (
     isolate,
     validate_rows,
 )
+from dohnuts.predictor import render, render_question
+from dohnuts.recipe import IMAGE_PIXELS, MAX_LENGTH
 
 SPLITS = ["train", "dev", "calibration", "test"]
 
@@ -120,6 +124,22 @@ def read_metadata(episode_dir: Path, name: str) -> tuple[object | None, bytes | 
         return None, raw, f"{type(error).__name__}: {error}"
 
 
+def token_length(processor, row: dict) -> int:
+    """Rendered tokens plus expanded image placeholders, as prepare_data.filter_data counts."""
+    prompt, _ = render_question(render(row["state"]), row["question"], has_image=True)
+    length = len(processor.tokenizer(prompt, truncation=False)["input_ids"])
+    factor = processor.image_processor.patch_size * processor.image_processor.merge_size
+    with Image.open(row["image"]) as image:
+        width, height = smart_resize(
+            image.height,
+            image.width,
+            factor=factor,
+            min_pixels=IMAGE_PIXELS,
+            max_pixels=IMAGE_PIXELS,
+        )[::-1]
+    return length + (height // factor) * (width // factor) - 1
+
+
 def store_raw(step, output: Path) -> Path:
     """Copy the step screenshot to its content-addressed name; return that path.
 
@@ -159,7 +179,7 @@ def store_marked(image: Path, elements: list[dict], output: Path) -> tuple[Path,
     return target, sha256
 
 
-def convert(source: Path, output: Path) -> dict:
+def convert(source: Path, output: Path, *, processor=None) -> dict:
     root = repository_root()
     if Path.cwd().resolve() != root:
         raise SystemExit(f"Run from the repository root: {root}")
@@ -216,6 +236,33 @@ def convert(source: Path, output: Path) -> dict:
                             {"id": step_id, "reason": reason, "detail": "", "stage": "parse"}
                         )
                         continue
+                    if processor is not None:
+                        # The budget is checked before anything is written, and
+                        # the probe rows are the rows this step would mint: only
+                        # the element question carries the candidate texts, so
+                        # the answer is the same either way. Its dummy marked
+                        # copy duplicates the raw alias, which never leaves this
+                        # computation.
+                        probe = (str(step.image), step.image_sha256)
+                        lengths = [
+                            token_length(processor, row)
+                            for row in rows_for_ac_step(
+                                step,
+                                str(step.image),
+                                marked=probe if step.target_element is not None else None,
+                            )
+                        ]
+                        if any(length > MAX_LENGTH for length in lengths):
+                            audit["parse:token_budget"] += 1
+                            excluded.append(
+                                {
+                                    "id": step.id,
+                                    "reason": "token_budget",
+                                    "detail": str(max(lengths)),
+                                    "stage": "parse",
+                                }
+                            )
+                            continue
                     raw_target = store_raw(step, output)
                     marked = None
                     marked_target = None
@@ -369,7 +416,7 @@ def convert(source: Path, output: Path) -> dict:
             "rows each has; because gui_button and gui_swipe rows only exist on the steps "
             "that press a button or scroll, those rows are relatively upweighted"
         ),
-        "token_check": "skipped",
+        "token_check": "skipped" if processor is None else "enabled",
         "vocabularies": {
             "ac_actions": AC_ACTIONS,
             "buttons": BUTTONS,
@@ -399,8 +446,18 @@ def main(argv=None):
         help="Directory of `{episode_id}` episode directories (not an output directory)",
     )
     parser.add_argument("--output", type=Path, required=True, help="Split directory to create")
+    parser.add_argument(
+        "--model", type=Path, default=None, help="Local model used for the token budget check"
+    )
+    parser.add_argument("--no-token-check", dest="token_check", action="store_false")
     args = parser.parse_args(argv)
-    convert(args.input, args.output)
+    processor = None
+    if args.model is not None and args.token_check:
+        try:
+            processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"Cannot load the token-check model {args.model}: {error}") from error
+    convert(args.input, args.output, processor=processor)
 
 
 if __name__ == "__main__":

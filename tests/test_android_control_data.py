@@ -38,6 +38,7 @@ from dohnuts.gui_data import (
     split_for,
     validate_rows,
 )
+from dohnuts.recipe import MAX_LENGTH
 
 SCREEN = (1080, 2400)
 
@@ -1801,3 +1802,175 @@ def test_cli_reports_progress_on_a_long_run(tmp_path, capsys, monkeypatch):
     assert captured.err.splitlines()[0] == json.dumps(
         {"progress": {"episodes": 1, "rows": 4, "exclusions": 1}}
     )
+
+
+# --- Task 5: the token budget check ------------------------------------------
+
+
+class StubImageProcessor:
+    patch_size = 14
+    merge_size = 2
+
+
+class StubTokenizer:
+    def __call__(self, text, truncation=False):
+        return {"input_ids": list(range(len(text.split())))}
+
+
+class StubProcessor:
+    image_processor = StubImageProcessor()
+    tokenizer = StubTokenizer()
+
+
+def token_heavy_step(directory, index, *, color):
+    """A click step whose first candidate carries a whole document as its text.
+
+    The a11y `text` of a real Android Control node can hold an entire PDF, which
+    is what pushes a step past the budget the training collator enforces.
+    """
+    nodes = [
+        node(
+            text=" ".join(["filler"] * 4000),
+            boundsInScreen={"left": 0, "top": 0, "right": 50, "bottom": 50},
+        ),
+        node(
+            text="JOIN A MEETING",
+            boundsInScreen={"left": 50, "top": 50, "right": 100, "bottom": 100},
+        ),
+    ]
+    return click_step(directory, index, color, nodes=nodes)
+
+
+def test_cli_excludes_over_budget_steps_whole(tmp_path):
+    source = tmp_path / "corpus"
+    directory = source / "0"
+    directory.mkdir(parents=True)
+    write_episode(
+        source,
+        0,
+        token_heavy_step(directory, 0, color=(21, 0, 0)),
+        cli_step(directory, 1, {"action_type": "wait"}, "Wait", color=(21, 0, 1)),
+    )
+    output = tmp_path / "out"
+    manifest = prepare.convert(source, output, processor=StubProcessor())
+    assert manifest["token_check"] == "enabled"
+    assert manifest["exclusions"] == {"parse:token_budget": 1}
+    entry = json.loads((output / "excluded.jsonl").read_text().splitlines()[0])
+    assert {key: entry[key] for key in entry if key != "detail"} == {
+        "id": "android_control_0_step0",
+        "reason": "token_budget",
+        "stage": "parse",
+    }
+    assert int(entry["detail"]) > MAX_LENGTH
+    # The excluded step mints no rows and stores no images: the budget is checked
+    # before anything is written, and a step is never partially converted.
+    assert [row["id"] for row in stored_rows(output)] == [
+        "android_control_0_step1:action",
+        "android_control_0_step1:complete",
+    ]
+    assert len(manifest["images"]) == 1
+    assert manifest["element_stats"] == {}
+    assert manifest["element_resolution"] == {
+        "basis": "pre_isolation",
+        "element_rows": 0,
+        "no_target_element": 0,
+        "too_few_candidates": 0,
+        "too_many_candidates": 0,
+        "hit_rate": None,
+    }
+
+
+def test_cli_checks_the_budget_against_the_final_rows(tmp_path):
+    # The probe rows are the very rows the step would mint (the duplicate alias
+    # of the dummy marked copy never leaves the probe), so the reported length is
+    # the element row's own.
+    source = tmp_path / "corpus"
+    directory = source / "0"
+    directory.mkdir(parents=True)
+    entry = token_heavy_step(directory, 0, color=(26, 0, 0))
+    write_episode(source, 0, entry)
+    step = parse_ac_step(ac_episode(entry, episode_id=0), 0, directory=directory)
+    rows = rows_for_ac_step(step, str(step.image), (str(step.image), step.image_sha256))
+    lengths = [prepare.token_length(StubProcessor(), row) for row in rows]
+    assert max(lengths) > MAX_LENGTH
+    output = tmp_path / "out"
+    manifest = prepare.convert(source, output, processor=StubProcessor())
+    assert manifest["exclusions"] == {"parse:token_budget": 1}
+    entry = json.loads((output / "excluded.jsonl").read_text())
+    assert entry["detail"] == str(max(lengths))
+
+
+def test_cli_skips_the_model_when_token_checks_are_disabled(tmp_path, monkeypatch):
+    source = tmp_path / "corpus"
+    directory = source / "0"
+    directory.mkdir(parents=True)
+    write_episode(
+        source, 0, cli_step(directory, 0, {"action_type": "wait"}, "Wait", color=(22, 0, 0))
+    )
+    output = tmp_path / "out"
+
+    def explode(*args, **kwargs):
+        raise AssertionError("the token-check model must not be loaded")
+
+    monkeypatch.setattr(prepare.AutoProcessor, "from_pretrained", explode)
+    prepare.main(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--model",
+            "/nonexistent",
+            "--no-token-check",
+        ]
+    )
+    assert json.loads((output / "manifest.json").read_text())["token_check"] == "skipped"
+
+
+def test_cli_reports_an_unloadable_token_check_model(tmp_path):
+    source = tmp_path / "corpus"
+    directory = source / "0"
+    directory.mkdir(parents=True)
+    write_episode(
+        source, 0, cli_step(directory, 0, {"action_type": "wait"}, "Wait", color=(23, 0, 0))
+    )
+    with pytest.raises(SystemExit, match="Cannot load the token-check model"):
+        prepare.main(
+            [
+                "--input",
+                str(source),
+                "--output",
+                str(tmp_path / "out"),
+                "--model",
+                "/nonexistent",
+            ]
+        )
+
+
+def test_token_length_counts_words_and_image_patches(tmp_path):
+    directory = tmp_path / "episode"
+    record = ac_episode(cli_step(directory, 0, {"action_type": "wait"}, "Wait", color=(24, 0, 0)))
+    step = parse_ac_step(record, 0, directory=directory)
+    row = rows_for_ac_step(step, str(step.image))[0]
+    prompt, _ = prepare.render_question(
+        prepare.render(row["state"]), row["question"], has_image=True
+    )
+    # The 100x200 screenshot resizes to 728x364: 26x13 = 338 patches at the stub
+    # factor of 14*2, minus the placeholder token already in the prompt. The real
+    # processor's factor is 16*2 = 32, which resizes it to 736x384 instead.
+    assert prepare.token_length(StubProcessor(), row) == len(prompt.split()) + 338 - 1
+
+
+def test_token_length_matches_the_training_collator(tmp_path):
+    model = Path("Qwen/Qwen3.5-0.8B")
+    if not model.is_dir():
+        pytest.skip("local Qwen3.5-0.8B snapshot is not available")
+    from dohnuts.training_data import DecisionCollator
+
+    directory = tmp_path / "episode"
+    record = ac_episode(click_step(directory, 0, (25, 0, 0)))
+    step = parse_ac_step(record, 0, directory=directory)
+    rows = rows_for_ac_step(step, str(step.image), (str(step.image), step.image_sha256))
+    processor = prepare.AutoProcessor.from_pretrained(model, local_files_only=True)
+    collated, *_ = DecisionCollator(model)([rows[-1]])
+    assert prepare.token_length(processor, rows[-1]) == int(collated["input_ids"].shape[1])
