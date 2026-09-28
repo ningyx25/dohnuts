@@ -235,7 +235,10 @@ def element_bounds(element: dict) -> tuple[float, float, float, float] | None:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
     x_min, y_min, x_max, y_max = bounds
-    if not all(math.isfinite(value) for value in bounds):
+    try:
+        if not all(math.isfinite(value) for value in bounds):
+            return None
+    except OverflowError:  # an int too large to convert to a float
         return None
     if x_min >= x_max or y_min >= y_max:
         return None

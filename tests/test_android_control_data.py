@@ -405,6 +405,11 @@ def test_element_bounds_rejects_unusable_boxes():
     for bad in (float("inf"), float("-inf"), float("nan")):
         assert element_bounds(element(0, (bad, 0, 10, 10))) is None
         assert element_bounds(element(0, (0, 0, 10, bad))) is None
+    # An int too large for a float is out too, rather than raising from
+    # `math.isfinite`.
+    for huge in (10**400, -(10**400)):
+        assert element_bounds(element(0, (huge, 0, 10, 10))) is None
+        assert element_bounds(element(0, (0, 0, 10, huge))) is None
 
 
 def test_hit_test_ignores_inverted_and_non_finite_element_bounds():
@@ -415,6 +420,12 @@ def test_hit_test_ignores_inverted_and_non_finite_element_bounds():
         element(3, (0, 0, 100, 100)),
     ]
     assert hit_test(elements, 5, 5) == 3
+    # An unbounded box would otherwise swallow every point and win the hit.
+    assert (
+        hit_test([{"bounds": [float("-inf"), float("-inf"), float("inf"), float("inf")]}], 5, 5)
+        is None
+    )
+    assert hit_test([{"bounds": [-(10**400), 0, 10**400, 10]}], 5, 5) is None
 
 
 def test_hit_test_prefers_the_smallest_containing_element():
