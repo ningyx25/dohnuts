@@ -342,6 +342,19 @@ The instruction is "Which action should be taken next to complete the user's
 task?", taken verbatim from the hand-built element row in
 `example-data/train.jsonl`.
 
+**Reading element metrics.** A soft target changes what the per-row numbers
+mean, so the element family is reported with two accuracies. `metrics.summarize`
+takes `label = target.argmax()` and `pred = p.argmax()`, so `accuracy` is
+"the model picked the **dominant** hit" — the largest-weight candidate, and on
+equal weights the earliest one, exactly as `np.argmax` breaks the tie — while
+`soft_accuracy` is `target[pred]`, the mass the model's pick carries, so it
+credits **any** positive-weight hit and a uniform multi-hit row gives 1/`n` to
+even a wrong pick. `macro_f1` is over label indices as before. `nll` and both
+`brier` values read the whole distribution rather than the argmax, so they need
+no reinterpretation. `reference.element_positions` lists every hit, which is
+what a per-row error analysis needs to tell "picked the wrong box" from "picked
+the other box the tap point was in".
+
 **Marked screenshots.** The element row ships a set-of-mark rendering: every
 candidate is boxed in green and numbered with a white chip in the same order as
 the criteria, nothing else is drawn, and the ground truth is not highlighted. The
@@ -382,15 +395,25 @@ the schema (`step 1: missing key 'action'`). The isolate stage drops rows
 Parse-stage entries carry the step id or the episode directory name; isolate-stage
 entries carry the row id with its family suffix. `missing_image` is decided by a
 full decode of the screenshot, not by its container: a PNG whose CRCs are
-consistent over a stream the decoder rejects fails on its own step rather than
-surfacing at the end-of-run self-check, which used to abort the whole batch and
-write no splits at all.
+consistent over a stream the decoder rejects fails on its own step, where it
+costs one step, instead of surfacing at the end-of-run self-check, where it used
+to abort the whole batch and write no splits at all. The self-check that closes
+a run walks containers rather than pixels (`gui_data.validate_rows` calls
+`Image.open` and `verify`, a real chunk-and-CRC walk for the PNGs stored here),
+which is sound only because of that parse-time decode: what the self-check sees
+is either a byte-for-byte copy of a source that already decoded, re-copied
+whenever its digest stops matching its name, or bytes this process encoded from
+an image it had just decoded.
 
 **Manifest.** `element_stats` and `element_resolution` both describe the element
 family and both carry a `basis` field, but they answer different questions and
 have different shapes. `element_stats` (`basis: post_isolation`) is a per-split
-map of the element rows that were actually written, with candidate min/mean/max
-and `empty_target_payload_rate`; splits without element rows are absent from it.
+map of the element rows that were actually written, with candidate min/mean/max,
+`soft_targets` (element rows whose target has more than one positive weight),
+`multi_hit_rate` (`soft_targets / rows`), `max_hits` (the largest hit count any
+one row of the split carries), and `empty_target_payload_rate` (rows where **no**
+hit candidate carries a payload, so the prompt names no correct answer at all);
+splits without element rows are absent from it.
 `element_resolution` (`basis: pre_isolation`) is a single corpus-wide record of
 the steps whose element question resolved within budget before isolation, with
 `element_rows`, the three refusal counts and `hit_rate` — a step that resolved
@@ -404,7 +427,11 @@ are minted before any file is written, so a step that fails before its stores
 writes nothing and the list never names an unreferenced file; a failure between
 the raw and the marked store leaves the raw PNG on disk *and* in `images` while
 its rows are dropped, and a rerun with a different `--input` into the same
-`--output` never cleans the directory, so the list describes this run only.
+`--output` never cleans the directory, so the list describes this run only. What
+a rerun does clean is the temporary files of an interrupted run — `convert`
+unlinks `.<name>.<pid>.<n>.tmp` under `images/` before it starts, the only files
+a SIGKILL can strand there — so the directory-equals-manifest property holds
+again for an operator re-running into the same `--output`.
 `vocabularies` carries the nine actions, buttons, swipe directions,
 instructions, complete criteria, and two plain-language entries — `element_rule`
 and `marked_images` — that state the candidate and marking rules without the
@@ -431,9 +458,14 @@ demonstration. `task_progress` is mechanically templated. Ground-truth element
 payloads are frequently `{}` because many clickable nodes are unlabeled
 containers: an independent corpus-wide probe found 21,507 of 49,924 resolvable
 targets unlabeled (43.1%), a 150-episode sample put the per-split rate at 44–49%,
-and small samples vary widely (60% over the 21-episode run). The numbered
-screenshot carries the signal, and `element_stats.empty_target_payload_rate` is
-the authoritative per-run number. The ground-truth element is inferred from the
+and small samples vary widely (60% over the 21-episode run). Those three numbers
+were measured under the pre-soft-target definition — one target per row, the
+single hit the old smallest-area rule chose — and a row is now counted as an
+empty target only when **no** candidate the tap point touched carries a payload,
+so the post-change rate is expected to be equal or slightly lower;
+`element_stats.empty_target_payload_rate` is the authoritative per-run number and
+`soft_targets`/`multi_hit_rate`/`max_hits` say how much of that run's family was
+soft. The ground-truth element is inferred from the
 recorded point rather than given, so a point that lands in several boxes is
 answered with a distribution over all of them, weighted by inverse area — a
 soft label the loss accepts, which is also the honest answer when two nested

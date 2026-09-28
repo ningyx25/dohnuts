@@ -230,8 +230,9 @@ def element_bounds(element: dict) -> tuple[float, float, float, float] | None:
     because nothing downstream can act on them. This is the one place that
     decides, so the hit rules never have to reason about a box they cannot
     compare against and the marking code never hands a reversed rectangle to
-    PIL. It is also what makes every area downstream strictly positive, so
-    `element_target_weights` can invert one without guarding.
+    PIL. Every extent that gets through is positive and finite, but their
+    product is not bounded by that -- `element_target_weights` owns the range
+    checks on the area itself.
     """
     bounds = element.get("bounds") if isinstance(element, dict) else None
     if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
@@ -279,23 +280,39 @@ def element_target_weights(elements: list[dict], x: float, y: float) -> list[flo
 
     Every element whose bounds contain the point is ground truth, weighted by
     inverse box area and normalized over the hits, so a smaller box -- the more
-    specific target -- carries the larger share; `element_bounds` guarantees
-    every area is positive, so the inversion cannot divide by zero. The returned
-    list has one weight per element of the very list passed in, `0.0` off the
-    hits, and sums to 1. A single hit degenerates to the one-hot of that
-    position, and a point inside nothing is a miss rather than a zero vector.
+    specific target -- carries the larger share. The returned list has one
+    weight per element of the very list passed in, `0.0` off the hits, and sums
+    to 1. A single hit degenerates to the one-hot of that position, and a point
+    inside nothing is a miss rather than a zero vector.
+
+    Areas are computed in float on purpose: `element_bounds` bounds each
+    coordinate, not the product, so an area can leave the float range. One that
+    overflows to `inf` inverts to `0.0`, which is its true share against any box
+    that fits; if every hit overflows the total would be `0.0 / 0.0`, and if an
+    area underflows to `0.0` the ratio would be a division by zero. Both cases
+    mean the areas cannot be ranked at all, so the fallback is a uniform
+    distribution over the hits -- never a zero vector with a hit in it, and a
+    lone overflowing hit still comes back as its own one-hot.
     """
     hits = element_hits(elements, x, y)
     if not hits:
         return None
-    inverse: dict[int, float] = {}
+    areas: dict[int, float] = {}
     for position in hits:
         bounds = element_bounds(elements[position])
         if bounds is None:  # not reachable: element_hits only reports usable boxes
             continue
         x_min, y_min, x_max, y_max = bounds
-        inverse[position] = 1.0 / ((x_max - x_min) * (y_max - y_min))
+        areas[position] = (float(x_max) - float(x_min)) * (float(y_max) - float(y_min))
+    uniform = [1.0 / len(areas) if position in areas else 0.0 for position in range(len(elements))]
+    if any(area == 0.0 for area in areas.values()):
+        return uniform
+    inverse = {
+        position: (1.0 / area if math.isfinite(area) else 0.0) for position, area in areas.items()
+    }
     total = sum(inverse.values())
+    if total == 0.0 or not math.isfinite(total):
+        return uniform
     return [inverse.get(position, 0.0) / total for position in range(len(elements))]
 
 
@@ -604,10 +621,13 @@ def parse_step(
             # only runs when it accepted both as finite coordinates.
             x, y = arguments["coordinate"]
             weights, reason = resolve_element_target(elements, x, y)
-            if reason is not None:
+            if weights is None:  # `reason` is set whenever there is no answer
                 return None, reason
             element_weights = weights
-            element_positions = element_hits(elements, x, y)
+            # Provenance is the target's support, not the raw hit list: a box
+            # whose area escaped the float range carries no weight and is not
+            # one of the answers the row teaches.
+            element_positions = [position for position, weight in enumerate(weights) if weight > 0]
 
     past = [
         entry.get("step_instruction") if isinstance(entry, dict) else None

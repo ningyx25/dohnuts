@@ -134,9 +134,12 @@ def read_metadata(episode_dir: Path, name: str) -> tuple[object | None, bytes | 
         return None, None, f"{type(error).__name__}: {error}"
     try:
         return json.loads(raw), raw, ""
-    except ValueError as error:
+    except (ValueError, RecursionError) as error:
         # JSONDecodeError and UnicodeDecodeError are both ValueError, and a torn
-        # or non-UTF-8 file must not abort the batch with a traceback.
+        # or non-UTF-8 file must not abort the batch with a traceback. A document
+        # nested past the interpreter's recursion limit is as unusable, and a
+        # RecursionError escaping here would kill a pool worker rather than
+        # exclude the episode.
         return None, raw, f"{type(error).__name__}: {error}"
 
 
@@ -186,8 +189,8 @@ def store_raw(step, target: Path) -> None:
     """Copy the step screenshot to its content-addressed `target`.
 
     The copy is byte-identical to the source: the row rules alias the file by the
-    digest of the bytes `parse_step` hashed and `validate_rows` decodes the
-    stored copy, so re-encoding here would break both.
+    digest of the bytes `parse_step` hashed and the model reads back exactly the
+    bytes that were decoded at parse time, so re-encoding here would break both.
     """
     if not target.exists() or digest_file(target) != step.image_sha256:
         # Re-copy a target whose content does not match its name: a killed
@@ -232,16 +235,25 @@ def process_episode(episode_dir: Path, *, output: Path, root: Path, token_check:
     the parent folds into its digest in episode order -- a digest cannot be
     merged after the fact, so the bytes have to travel).
 
-    Never raises. Each step of the episode is already guarded, and an episode
-    that fails outside those guards comes back as a single `unexpected`
-    exclusion with none of its half-made rows, so one bad directory can neither
-    abort the batch nor kill a pool worker.
+    Never raises. Each step of the episode is already guarded, the metadata read
+    reports its own failures, and an episode that fails outside those guards
+    comes back as a single `unexpected` exclusion with none of its half-made
+    rows -- but with the metadata bytes it did read, so the parent's digest
+    count stays what the serial loop would have counted.
     """
     name = Path(episode_dir).name
     try:
-        return convert_episode(episode_dir, name, output=output, root=root, token_check=token_check)
+        # Deliberately outside the guarded body: `read_metadata` never raises,
+        # and its bytes have to be in hand even if the conversion then fails.
+        document, raw, detail = read_metadata(episode_dir, name)
+    except Exception:  # a backstop for the never-raises contract, not a path
+        document, raw, detail = None, None, ""
+    try:
+        result = convert_episode(
+            episode_dir, name, document, detail, output=output, root=root, token_check=token_check
+        )
     except Exception as error:
-        return {
+        result = {
             "rows": [],
             "excluded": [
                 {
@@ -255,18 +267,27 @@ def process_episode(episode_dir: Path, *, output: Path, root: Path, token_check:
             "audit": {"parse:unexpected": 1},
             "element_rows": 0,
             "empty_targets": {},
-            "metadata_bytes": None,
         }
+    result["metadata_bytes"] = raw
+    return result
 
 
 def convert_episode(
-    episode_dir: Path, name: str, *, output: Path, root: Path, token_check: bool
+    episode_dir: Path,
+    name: str,
+    document: object,
+    detail: str,
+    *,
+    output: Path,
+    root: Path,
+    token_check: bool,
 ) -> dict:
     """Parse, probe, store and derive the rows of one episode.
 
     The body of the conversion loop, keyed by the directory `name` the episode
-    is addressed by; `process_episode` turns whatever escapes here into an
-    exclusion.
+    is addressed by; `document` is the metadata as read (or None when it could
+    not be read, with `detail` naming why) and `process_episode` turns whatever
+    escapes here into an exclusion.
     """
     audit: Counter = Counter()
     excluded: list[dict] = []
@@ -274,14 +295,20 @@ def convert_episode(
     images_written: list[str] = []
     empty_targets: dict[str, bool] = {}
     element_rows = 0
-    record, raw, detail = read_metadata(episode_dir, name)
-    if record is not None:
+    record = document
+    if isinstance(record, dict):
         # A valid JSON document of the wrong shape is as unusable as a torn
         # file, and comes back with the same reason; the detail names the first
         # step or field that does not satisfy the schema.
         violation = metadata_detail(record)
         if violation:
             record, detail = None, violation
+    elif record is not None:
+        # A JSON document that is not an object cannot carry the keys the steps
+        # are read from; `metadata_detail` refuses it in the same words as any
+        # other structural failure. This branch is also the type check that
+        # lets the rest of the function treat `record` as a mapping.
+        record, detail = None, metadata_detail(record)
     if record is not None and int(name) != record["episode_id"]:
         # The metadata file is named after its directory while the rows are
         # keyed by the record's id: a corpus whose two ids disagree would be
@@ -385,7 +412,6 @@ def convert_episode(
         "audit": dict(audit),
         "element_rows": element_rows,
         "empty_targets": empty_targets,
-        "metadata_bytes": raw,
     }
 
 
@@ -398,7 +424,10 @@ def episode_results(episodes: list[Path], *, output: Path, root: Path, workers: 
     results in submission order -- which is what keeps the merged rows,
     exclusions, image list and metadata digest identical to the serial run, no
     matter how the workers interleave. The jobs carry no processor: the token
-    check reads the module global the fork inherited.
+    check reads the module global the fork inherited. That is fork-only by
+    design -- under `spawn` or `forkserver` a worker would re-import this module
+    with `_TOKEN_PROCESSOR` at None and silently skip the token check, so the
+    start method is pinned rather than left to the platform default.
     """
     job = partial(
         process_episode, output=output, root=root, token_check=_TOKEN_PROCESSOR is not None
@@ -412,6 +441,24 @@ def episode_results(episodes: list[Path], *, output: Path, root: Path, workers: 
         yield from pool.imap(job, episodes, chunksize=1)
 
 
+def sweep_staged(output: Path) -> None:
+    """Delete the temporary files a killed run left in the image directory.
+
+    `staged_write` removes its own temporary file whenever it sees a failure,
+    but a SIGKILL or a lost machine leaves one behind, and nothing else ever
+    deletes it: the operator's next run into the same `--output` would then find
+    a file under `images/` that its manifest does not list. Only the
+    `.<name>.<pid>.<n>.tmp` names this module writes are touched; stored PNGs,
+    referenced or orphaned, are left alone.
+    """
+    images = Path(output) / "images"
+    if not images.is_dir():
+        return
+    for stale in images.glob(".*.tmp"):
+        with contextlib.suppress(OSError):
+            stale.unlink()
+
+
 def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> dict:
     """Convert every episode under `source` into the splits under `output`.
 
@@ -421,6 +468,12 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
     as the serial one: every episode's results are merged in episode order,
     which fixes the row order, the counters, the image list, and the metadata
     digest. Returns the manifest it published.
+
+    A rerun into an existing `--output` reuses the screenshots whose bytes still
+    match their names, sweeps the temporaries a killed run may have left, and
+    writes everything else in place; stale PNGs from an older input are left
+    where they are, so `manifest["images"]` describes this run rather than the
+    directory.
     """
     global _TOKEN_PROCESSOR
     root = repository_root()
@@ -435,6 +488,7 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
         output.mkdir(parents=True, exist_ok=True)
     except OSError as error:
         raise SystemExit(f"Cannot create the output directory {output}: {error}") from error
+    sweep_staged(output)
     _TOKEN_PROCESSOR = processor
     audit: Counter = Counter()
     excluded: list[dict] = []
@@ -444,32 +498,40 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
     element_rows = 0
     metadata_files_hashed = 0
     metadata_sha256 = hashlib.sha256()
-    for number, result in enumerate(
-        episode_results(episodes, output=output, root=root, workers=workers), 1
-    ):
-        if result["metadata_bytes"] is not None:
-            metadata_files_hashed += 1
-            metadata_sha256.update(result["metadata_bytes"])
-        audit.update(result["audit"])
-        excluded.extend(result["excluded"])
-        rows.extend(result["rows"])
-        images_written.update(result["images"])
-        empty_targets.update(result["empty_targets"])
-        element_rows += result["element_rows"]
-        if number % PROGRESS_EVERY == 0:
-            print(
-                json.dumps(
-                    {
-                        "progress": {
-                            "episodes": number,
-                            "rows": len(rows),
-                            "exclusions": len(excluded),
+    merged = 0
+    try:
+        for number, result in enumerate(
+            episode_results(episodes, output=output, root=root, workers=workers), 1
+        ):
+            if result["metadata_bytes"] is not None:
+                metadata_files_hashed += 1
+                metadata_sha256.update(result["metadata_bytes"])
+            audit.update(result["audit"])
+            excluded.extend(result["excluded"])
+            rows.extend(result["rows"])
+            images_written.update(result["images"])
+            empty_targets.update(result["empty_targets"])
+            element_rows += result["element_rows"]
+            merged = number
+            if number % PROGRESS_EVERY == 0:
+                print(
+                    json.dumps(
+                        {
+                            "progress": {
+                                "episodes": number,
+                                "rows": len(rows),
+                                "exclusions": len(excluded),
+                            }
                         }
-                    }
-                ),
-                file=sys.stderr,
-                flush=True,
-            )
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+    except KeyboardInterrupt as interrupt:
+        # Ctrl-C is a decision, not a crash: leave the pool to clean up after
+        # itself and report how far the run got, the way the rest of the CLI
+        # reports a stop instead of printing a traceback.
+        raise SystemExit(f"Interrupted after {merged} of {len(episodes)} episodes") from interrupt
     dropped: list = []
     kept = isolate(rows, audit, dropped)
     try:
@@ -479,6 +541,7 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
     counts: Counter = Counter()
     classes: dict[str, Counter] = {}
     candidates: dict[str, list[int]] = {}
+    hits: dict[str, list[int]] = {}
     empty_payloads: Counter = Counter()
     try:
         handles = {split: (output / f"{split}.jsonl").open("w") for split in SPLITS}
@@ -491,6 +554,11 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
                     classes.setdefault(row["split"], Counter())[label] += 1
                 elif row["dataset"] == "screenshot_choice":
                     candidates.setdefault(row["split"], []).append(len(row["question"]["criteria"]))
+                    # The positive weights are the hits the row actually teaches;
+                    # more than one makes it a soft target rather than a one-hot.
+                    hits.setdefault(row["split"], []).append(
+                        sum(1 for weight in row["target"] if weight > 0)
+                    )
                     if empty_targets.get(row["id"]):
                         empty_payloads[row["split"]] += 1
         finally:
@@ -517,12 +585,20 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
         if not widths:
             continue
         empties = empty_payloads[split]
+        hit_counts = hits[split]
+        soft = sum(1 for count in hit_counts if count > 1)
         element_stats[split] = {
             "basis": "post_isolation",
             "rows": len(widths),
             "candidates_min": min(widths),
             "candidates_mean": sum(widths) / len(widths),
             "candidates_max": max(widths),
+            # How much of the family is a distribution rather than a one-hot:
+            # a soft target names every hit, so the model is only graded on
+            # picking one of them, not on picking the smallest.
+            "soft_targets": soft,
+            "multi_hit_rate": soft / len(widths),
+            "max_hits": max(hit_counts),
             "empty_target_payloads": empties,
             "empty_target_payload_rate": empties / len(widths),
         }

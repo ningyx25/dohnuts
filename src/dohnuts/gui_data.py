@@ -384,12 +384,24 @@ def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
     abort with one actionable line. `root` resolves the stored image paths
     (they are repository-root relative) and defaults to the working directory.
 
-    A screenshot is decoded once per distinct file, not once per row: rows of
-    one step share an image, and a corpus-scale run would otherwise spend most of
-    its self-check time re-decoding the same bytes. The cache is keyed by the
-    resolved path, and only a successful open is remembered, so two spellings of
-    one file validate once and an unreadable file still fails on every row that
-    names it.
+    A screenshot is opened once per distinct file, not once per row: rows of one
+    step share an image, and a corpus-scale run would otherwise pay the same
+    cost again for every row. The cache is keyed by the resolved path, and only
+    a successful open is remembered, so two spellings of one file validate once
+    and an unreadable file still fails on every row that names it.
+
+    What is checked is the container -- `Image.open` reads and sanity-checks the
+    header, and `verify` walks whatever the format plugin implements, which for
+    PNG is a real walk over every chunk and CRC and for the formats whose plugin
+    does not override it is a no-op. Every stored image here is a PNG, so the
+    walk is real; the pixels are deliberately not decoded. The bytes behind a
+    stored name are either a byte-for-byte copy of a source both converters
+    fully decoded at parse time -- re-copied only when its digest stops matching
+    its name -- or bytes this process encoded from an image it had just decoded,
+    so a stored image that cannot be decoded is not a state a healthy run can
+    reach. Re-decoding here would buy nothing and cost a full pass over the
+    corpus: about 2.4 hours for AC at 15k episodes, against the roughly 1.2
+    minutes a container walk takes over the same files.
     """
     root = Path.cwd() if root is None else root
     seen_ids = set()
@@ -421,7 +433,12 @@ def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
             key = path.resolve()
             if key not in validated:
                 with Image.open(path) as image:
-                    image.convert("RGB")
+                    width, height = image.size
+                    image.verify()
+                if width <= 0 or height <= 0:
+                    # `verify` walks the container, not the header it came from,
+                    # so a zero-sized canvas has to be refused explicitly.
+                    raise OSError(f"image dimensions are not positive: {width}x{height}")
                 validated.add(key)
         except (OSError, RuntimeError) as error:
             raise ValueError(

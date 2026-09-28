@@ -596,34 +596,95 @@ def test_validate_rows_reports_unreadable_images(image_root):
         validate_rows(rows)
 
 
-def test_validate_rows_decodes_each_distinct_image_once(monkeypatch, image_root):
+def corrupted_png(size=(8, 8)) -> bytes:
+    """A PNG whose container is valid and whose pixels cannot be decoded.
+
+    The chunk CRCs are correct and the IDAT is a valid zlib stream, so the
+    container walk the self-check performs passes; every scanline starts with a
+    filter type PNG does not define, so decoding the pixels fails.
+    """
+    import struct
+    import zlib
+
+    def chunk(kind, body):
+        return (
+            struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+        )
+
+    width, height = size
+    stride = 1 + width * 3
+    raw = bytearray(stride * height)
+    for row in range(height):
+        raw[row * stride] = 99
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(bytes(raw)))
+        + chunk(b"IEND", b"")
+    )
+
+
+def test_validate_rows_verifies_each_distinct_image_once(monkeypatch, image_root):
     rows = [
         row_stub("a:action", group="task:a", split="train", alias="image-bytes:1"),
         row_stub("b:action", group="task:b", split="train", alias="image-bytes:2"),
         row_stub("c:action", group="task:c", split="train", alias="image-bytes:3"),
     ]
     # Three rows over one file, spelled two ways, plus one over a second file:
-    # the self-check re-reading a screenshot per row costs a full decode each
-    # time, so a path that already opened must not open again.
+    # the self-check re-opening a screenshot per row pays the same cost again
+    # each time, so a path that already passed must not be checked again.
     rows[0]["image"] = "shot.png"
     rows[1]["image"] = "./shot.png"
     rows[2]["image"] = "other.png"
     opened = []
+    verified = []
     real_open = Image.open
+    real_verify = Image.Image.verify
 
     def counting_open(path, *arguments, **keywords):
         opened.append(Path(path).name)
         return real_open(path, *arguments, **keywords)
 
+    def counting_verify(self):
+        verified.append(Path(self.filename).name)
+        return real_verify(self)
+
     monkeypatch.setattr("dohnuts.gui_data.Image.open", counting_open)
+    # PNG overrides the base no-op `verify` with the chunk and CRC walk, and
+    # every stored screenshot is a PNG, so this is the class that runs.
+    monkeypatch.setattr("PIL.PngImagePlugin.PngImageFile.verify", counting_verify)
     validate_rows(rows, root=image_root)
     assert opened == ["shot.png", "other.png"]
+    assert verified == ["shot.png", "other.png"]
     # A path that does not open still fails with the row that pointed at it.
     rows.append(row_stub("d:action", group="task:d", split="train", alias="image-bytes:4"))
     rows[-1]["image"] = "gone.png"
     with pytest.raises(ValueError, match="Image is not readable: d:action"):
         validate_rows(rows, root=image_root)
     assert opened[-1] == "gone.png"
+
+
+def test_validate_rows_accepts_images_whose_pixels_do_not_decode(image_root):
+    # Deliberate weakening, pinned here so nobody "fixes" it back: the
+    # self-check walks the container -- chunks and CRCs for PNG -- and does not
+    # decode, so a PNG that is structurally intact over an undecodable pixel
+    # stream passes it. The real guard is the full decode both converters
+    # perform on the source when they parse a step; the stored copy is then
+    # either a byte-for-byte copy whose digest is re-checked whenever it is
+    # reused, or bytes this process encoded from an image it just decoded.
+    # Decoding here instead would cost about 2.4 h over the AC corpus, against
+    # the roughly 1.2 min a container walk takes over the same files.
+    screenshot = image_root / "shot.png"
+    screenshot.write_bytes(corrupted_png())
+    with Image.open(screenshot) as image:
+        with pytest.raises(OSError, match="data stream"):
+            image.convert("RGB")  # the pixels do not decode ...
+    with Image.open(screenshot) as image:
+        image.verify()  # ... while the container checks pass
+    rows = [row_stub("a:action", group="task:a", split="train")]
+    rows[0]["image"] = "shot.png"
+    validate_rows(rows, root=image_root)
 
 
 def test_validate_rows_reports_an_unresolvable_image_path(image_root):

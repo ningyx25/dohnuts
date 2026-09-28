@@ -157,3 +157,24 @@ pdm run python scripts/prepare_android_control_data.py \
 | 真实小样转换 | 通过 | 21 episode → 384 行 / 206 图 / 2 排除 / 命中率 0.984 |
 | 端到端冒烟(Task 7) | 通过 | 120 合成 episode / 480 步 → 1,195 行,无排除,hit_rate 1.0;train/evaluate/predict 均退出 0 |
 | 全语料转换与检查单(Task 8) | 运行中 | 15,283 个 episode 的转换正在执行;检查单见本文件 Task 8 |
+
+---
+
+## 修订记录(2026-09-28,首轮实现之后)
+
+本计划是首轮实现的执行记录,以下规则在后续评审中被修订;上文的任务分解、数字与
+验收表按当时的规则保留为历史记录:
+
+- 元素 GT 规则由"最小面积单点"改为**逆面积归一化的软分布**(单命中仍是 one-hot;
+  面积不可排序时回落为命中集合上的均匀分布),`ACStep.target_element` 改为
+  `element_weights`,element 行 `target` 直接使用该分布。
+- `reference.element_position` 改为 `element_positions`(该点接触到的全部候选,
+  按 row `target` 的正权重升序;升序位置,非 dataset 下标)。
+- 新增 `--workers N` 并行转换(fork 池 + 顺序合并),输出与 `--workers 1` 逐字节一致;
+  `convert(source, output, *, processor=None, workers=1)`。
+- 其余同轮修订:`read_screenshot` 恢复整图解码(`missing_image` 覆盖像素不可解码)、
+  `unparsable_metadata` 的 `detail` 指明 step 序号与字段、`element_stats` 增加
+  `soft_targets`/`multi_hit_rate`/`max_hits`、`validate_rows` 只做容器校验并在启动时
+  清理残留 `.tmp`、Ctrl-C 以一行 `SystemExit` 退出。
+- 因此 §16「GT 元素由命中测试反推(面积最小规则)」与验收表中"105 个用例"等数字
+  已过时,以修订后的 `docs/data-and-evaluation.md` 与当轮测试为准。

@@ -232,3 +232,24 @@
 - 标号编号与 `example-data/train.jsonl` 手工 smoke 行不同(该行用带空洞的数据集下标,
   本管线用连续的可点击元素编号)。
 - 输入根内的符号链接仍可解析到根外(拒绝绝对路径与 `..`,未做 `resolve()` 校验)。
+
+## 17. 修订记录(2026-09-28,首轮实现之后)
+
+本文档是首轮实现的设计记录,以下三处在后续评审中被修订,正文其余部分仍按当时
+的规则描述,保留为历史记录:
+
+- **元素目标改为软分布**:多命中不再取"面积最小、平局取靠前"的单点答案。命中点落入
+  的每个候选框都是 GT,权重为 `1 / 面积` 并在命中集合上归一化;单命中退化为 one-hot,
+  面积溢出/下溢到无法排序时回落为命中集合上的均匀分布。`hit_test`/`resolve_element_choice`
+  被 `element_hits`/`element_target_weights`/`resolve_element_target` 取代(row 的
+  `target` 直接就是该分布)。理由:嵌套框同时命中时,最小面积只是一个约定,分布才是
+  诚实答案;`rlcd.py` 的损失本就接受分布。实测 20 episode 小样 60 条元素行里 24 条
+  (40%)是多命中。
+- **`reference.element_position` → `element_positions`**:记录该点接触到的所有候选
+  (按 row `target` 的正权重支撑集,升序),不再只记单点位置。
+- **`--workers N` 并行转换**:按 episode 顺序合并的 fork 池,输出与串行逐字节一致
+  (20 episode 实测 30.7 s → 13.2 s);`--workers` 不进入 manifest。
+- 其他同轮修订:parse 期整图解码(容器合法但像素不可解码的 PNG 不再拖垮整批)、
+  `unparsable_metadata` 的 `detail` 指明首个失败的 step/字段、`element_stats` 新增
+  `soft_targets`/`multi_hit_rate`/`max_hits`、`validate_rows` 改为容器校验
+  (`Image.open` + `verify`,不再逐图解码)。

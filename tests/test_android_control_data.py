@@ -540,6 +540,43 @@ def test_element_target_weights_report_a_miss_as_none():
     assert element_target_weights([element(0, (0, 0, 10, 10))], 5, "5") is None
 
 
+def test_element_target_weights_survive_an_area_that_leaves_the_float_range():
+    # Two bounds either side of 1e154 multiply past the float maximum: an exact
+    # int product would raise from `math.isfinite`, and every inverse would be
+    # 0.0, so the shares have to fall back to uniform instead of 0.0 / 0.0.
+    elements = [
+        element(0, (0, 0, 2e154, 2e154)),
+        element(1, (0, 0, 3e154, 3e154)),
+    ]
+    weights = element_target_weights(elements, 1, 1)
+    assert weights == [0.5, 0.5]
+    assert abs(sum(weights) - 1) <= 1e-9
+    # A lone overflowing hit still degenerates to its own one-hot.
+    assert element_target_weights([element(0, (0, 0, 2e154, 2e154))], 1, 1) == [1.0]
+    assert element_target_weights([element(0, (10**400, 0, 2 * 10**400, 10))], 0, 0) is None
+
+
+def test_element_target_weights_give_an_overflowing_hit_no_mass():
+    elements = [
+        element(0, (0, 0, 2e154, 2e154)),  # area inf: the share is 0.0
+        element(1, (0, 0, 10, 10)),  # area 100
+    ]
+    assert element_hits(elements, 5, 5) == [0, 1]
+    weights = element_target_weights(elements, 5, 5)
+    assert weights == [0.0, 1.0]
+
+
+def test_element_target_weights_fall_back_to_uniform_when_an_area_underflows():
+    # Extents small enough to underflow the product leave no ratio to invert,
+    # so every hit counts the same rather than the division blowing up.
+    elements = [
+        element(0, (0, 0, 5e-200, 5e-200)),
+        element(1, (0, 0, 10, 10)),
+    ]
+    weights = element_target_weights(elements, 1e-201, 1e-201)
+    assert weights == [0.5, 0.5]
+
+
 def test_element_target_weights_ignore_unusable_boxes():
     elements = [{"index": 0, "bounds": None}, element(1, (0, 0, 10, 10))]
     assert element_target_weights(elements, 5, 5) == [0.0, 1.0]
@@ -1216,6 +1253,28 @@ def test_multi_hit_element_rows_are_soft_and_pass_validate_rows(tmp_path):
     validate_rows(rows, root=tmp_path)
 
 
+def test_element_positions_report_the_support_of_the_weights(tmp_path):
+    directory = tmp_path / "episode"
+    # The huge box contains the tap point as well, but its area is past the
+    # float maximum, so it carries no weight and is not one of the answers the
+    # row teaches: provenance follows the distribution, not the raw hit list.
+    huge = node(boundsInScreen={"left": 0, "top": 0, "right": 2e154, "bottom": 2e154})
+    small = node(text="TARGET", boundsInScreen={"left": 0, "top": 0, "right": 100, "bottom": 100})
+    record = ac_episode(
+        ac_step(
+            0,
+            {"action_type": "click", "x": 75, "y": 75},
+            "Tap",
+            directory=directory,
+            nodes=[huge, small],
+        )
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    assert element_hits(step.elements, 75, 75) == [0, 1]
+    assert step.element_weights == [0.0, 1.0]
+    assert step.reference["element_positions"] == [1]
+
+
 def test_state_template_is_empty_at_the_first_step(tmp_path):
     directory = tmp_path / "episode"
     record = ac_episode(
@@ -1597,6 +1656,9 @@ ORIGINAL_PROCESS_EPISODE = prepare.process_episode
 # Set by the parallel test below: a file every worker appends its pid to.
 WORKER_PIDS: Path | None = None
 
+# Set by the interrupt test below: the episode whose worker refuses to run.
+INTERRUPT_EPISODE: str | None = None
+
 
 def recording_process_episode(episode_dir, **kwargs):
     """`prepare.process_episode` with a pid record and a pause.
@@ -1608,6 +1670,13 @@ def recording_process_episode(episode_dir, **kwargs):
         with WORKER_PIDS.open("a") as stream:
             stream.write(f"{os.getpid()}\n")
     time.sleep(0.2)
+    return ORIGINAL_PROCESS_EPISODE(episode_dir, **kwargs)
+
+
+def interrupting_process_episode(episode_dir, **kwargs):
+    """`prepare.process_episode` that a Ctrl-C hits on one named episode."""
+    if INTERRUPT_EPISODE is not None and Path(episode_dir).name == INTERRUPT_EPISODE:
+        raise KeyboardInterrupt
     return ORIGINAL_PROCESS_EPISODE(episode_dir, **kwargs)
 
 
@@ -1751,6 +1820,9 @@ def test_cli_writes_the_splits_and_a_manifest(tmp_path):
         "candidates_min": 2,
         "candidates_mean": 2.0,
         "candidates_max": 2,
+        "soft_targets": 0,
+        "multi_hit_rate": 0.0,
+        "max_hits": 1,
         "empty_target_payloads": 0,
         "empty_target_payload_rate": 0.0,
     }
@@ -1760,6 +1832,9 @@ def test_cli_writes_the_splits_and_a_manifest(tmp_path):
         "candidates_min": 2,
         "candidates_mean": 2.0,
         "candidates_max": 2,
+        "soft_targets": 0,
+        "multi_hit_rate": 0.0,
+        "max_hits": 1,
         "empty_target_payloads": 1,
         "empty_target_payload_rate": 1.0,
     }
@@ -1912,6 +1987,34 @@ def test_cli_parallel_workers_share_the_episodes(tmp_path, monkeypatch):
     # More than one process really did the work: the pool is not a serial loop
     # wearing a worker count.
     assert len(set((tmp_path / "worker-pids.txt").read_text().split())) > 1
+
+
+def test_cli_reports_an_interrupt_instead_of_a_traceback(tmp_path, monkeypatch):
+    global INTERRUPT_EPISODE
+    source = parallel_corpus(tmp_path)
+    INTERRUPT_EPISODE = "1"
+    monkeypatch.setattr(prepare, "process_episode", interrupting_process_episode)
+    try:
+        # The pool path funnels through the same handler: the interrupt surfaces
+        # while the parent waits for a result, and one line explains the stop.
+        with pytest.raises(SystemExit, match="Interrupted after 1 of 8 episodes"):
+            prepare.convert(source, tmp_path / "out", workers=1)
+    finally:
+        INTERRUPT_EPISODE = None
+
+
+def test_cli_sweeps_temporaries_left_by_a_killed_run(tmp_path):
+    source = sample_corpus(tmp_path)
+    output = tmp_path / "out"
+    images = output / "images"
+    images.mkdir(parents=True)
+    stale = images / ".deadbeef.png.1234.0.tmp"
+    stale.write_bytes(b"half a png")
+    manifest = prepare.convert(source, output)
+    # Nothing else would ever delete it, and a leftover under images/ breaks the
+    # directory-equals-manifest property for an operator re-running into it.
+    assert not stale.exists()
+    assert sorted(path.name for path in images.iterdir()) == sorted(manifest["images"])
 
 
 def test_cli_records_exclusions_without_aborting_the_batch(tmp_path):
@@ -2083,6 +2186,80 @@ def test_cli_names_the_step_and_field_that_breaks_the_metadata(tmp_path):
         "android_control_0_step0:action",
         "android_control_0_step0:complete",
     ]
+
+
+def test_cli_manifest_counts_the_soft_element_targets(tmp_path):
+    source = tmp_path / "corpus"
+    directory = source / "0"
+    directory.mkdir(parents=True)
+    nested = [
+        node(text="Card", boundsInScreen={"left": 0, "top": 0, "right": 100, "bottom": 100}),
+        node(text="Button", boundsInScreen={"left": 50, "top": 50, "right": 100, "bottom": 100}),
+    ]
+    write_episode(
+        source,
+        0,
+        click_step(directory, 0, (40, 0, 0), nodes=nested),  # (75, 75) is in both boxes
+        click_step(directory, 1, (40, 0, 1)),  # click_nodes: only one box holds it
+        cli_step(directory, 2, None, None, color=(40, 0, 2)),
+    )
+    output = tmp_path / "out"
+    manifest = prepare.convert(source, output)
+    stats = manifest["element_stats"][split_for("task:android_control_0")]
+    assert stats["rows"] == 2
+    assert stats["soft_targets"] == 1
+    assert stats["multi_hit_rate"] == 0.5
+    assert stats["max_hits"] == 2
+    # The rows say the same thing the summary does.
+    hits = sorted(
+        sum(1 for weight in row["target"] if weight > 0)
+        for row in stored_rows(output)
+        if row["dataset"] == "screenshot_choice"
+    )
+    assert hits == [1, 2]
+
+
+def test_cli_keeps_the_metadata_digest_of_an_episode_that_fails_late(tmp_path, monkeypatch):
+    source = tmp_path / "corpus"
+    for episode_id in (0, 1):
+        directory = source / str(episode_id)
+        directory.mkdir(parents=True)
+        write_episode(
+            source,
+            episode_id,
+            cli_step(directory, 0, {"action_type": "wait"}, "Wait", color=(42, 0, episode_id)),
+        )
+    output = tmp_path / "out"
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    # The metadata is read before the episode body runs, so a failure inside the
+    # body leaves the digest of the metadata this run read exactly as the serial
+    # loop counted it.
+    monkeypatch.setattr(prepare, "convert_episode", explode)
+    manifest = prepare.convert(source, output)
+    assert manifest["exclusions"] == {"parse:unexpected": 2}
+    assert manifest["source"]["metadata_files_hashed"] == 2
+    digest = hashlib.sha256()
+    for episode_id in (0, 1):
+        digest.update((source / str(episode_id) / f"metadata_{episode_id}.json").read_bytes())
+    assert manifest["source"]["metadata_sha256"] == digest.hexdigest()
+
+
+def test_cli_excludes_metadata_nested_past_the_recursion_limit(tmp_path):
+    source = tmp_path / "corpus"
+    directory = source / "0"
+    directory.mkdir(parents=True)
+    (directory / "metadata_0.json").write_text("[" * 200_000)
+    output = tmp_path / "out"
+    manifest = prepare.convert(source, output)
+    # A RecursionError escaping the reader would kill a pool worker and hang the
+    # parent; the episode is excluded with the reason instead.
+    assert manifest["exclusions"] == {"parse:unparsable_metadata": 1}
+    entry = json.loads((output / "excluded.jsonl").read_text())
+    assert entry["reason"] == "unparsable_metadata"
+    assert entry["detail"].startswith("RecursionError")
 
 
 def test_cli_excludes_an_episode_whose_two_ids_disagree(tmp_path):
