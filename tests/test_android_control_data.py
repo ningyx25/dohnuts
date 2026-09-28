@@ -1317,6 +1317,14 @@ def test_parse_step_rejects_a_step_that_dropped_the_action_key(tmp_path):
     ]
 
 
+def test_parse_step_rejects_a_step_with_a_junk_instruction(tmp_path):
+    directory = tmp_path / "episode"
+    # The key is there but is not a string: the step does not match the schema,
+    # so it is excluded instead of parsing with no instruction.
+    record = ac_episode(ac_step(0, {"action_type": "wait"}, 42, directory=directory))
+    assert parse_step(record, 0, episode_dir=directory) == (None, "unparsable_metadata")
+
+
 def test_rows_for_ac_step_is_deterministic(tmp_path):
     directory = tmp_path / "episode"
     record = ac_episode(

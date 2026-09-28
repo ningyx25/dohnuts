@@ -354,15 +354,19 @@ def read_screenshot(episode_dir: Path, name: object) -> tuple[Path, str, tuple[i
     (width, height) the element rules measure bounds against, and the digest is
     of the file bytes on disk, which is what the row aliases carry.
 
-    Only the container is validated here: `Image.open` reads the header and
-    rejects decompression bombs, and `verify` walks the rest of the file, which
-    is everything the element bounds need and a fraction of the cost of a full
-    decode. Decoding every pixel here would be thrown away, because the stored
-    copy is what gets decoded again. Pixel decodability is proven later on
-    purpose: the marking step decodes every element screenshot, and
-    `validate_rows` re-opens every stored image at the end of a run, so a file
-    that only fails at decode time surfaces as a per-step `unexpected`
-    exclusion or a self-check failure instead of a silently wrong row.
+    Only the header is validated here: `Image.open` reads the size and rejects
+    decompression bombs, and `verify` adds whatever container check the format
+    plugin provides -- a real chunk and CRC walk for PNG, whose plugin overrides
+    it, and nothing at all for the formats whose plugin does not. A JPEG with a
+    cut scan, or a PNG whose compressed data is corrupt while its CRCs stay
+    consistent, is therefore accepted here, which is deliberate: decoding every
+    pixel would cost a full decode whose result is thrown away, because the
+    stored copy is what gets decoded again. Residual decode failures surface
+    later instead -- as a per-step `unexpected` exclusion when the marking step
+    decodes the screenshot, or as a `validate_rows` self-check failure at the
+    end of a run -- never as a silently wrong row. That backstop is only sound
+    because the stored copy is byte-identical to the source: the conversion CLI
+    copies the screenshot bytes with `shutil.copyfile` instead of re-encoding.
     """
     if not isinstance(name, str) or not name:
         return None
@@ -459,14 +463,17 @@ def parse_step(
     skips `parse_metadata` gets a reason string instead of a traceback.
 
     Reasons: `unparsable_metadata` (the envelope, the index, or the step entry
-    is structurally unusable, checked with `validate_step`), `missing_image`
-    (the screenshot is missing, unreadable, or outside the episode directory),
-    `unknown_action` (`map_action` does not know the action), `missing_a11y` (a
-    click or long_press step without a readable accessibility forest), and
-    `resolve_element_choice`'s `too_few_candidates`, `too_many_candidates` and
-    `no_target_element`. Any element reason excludes the whole step: a step is
-    never partially converted. The forest is opened only for `click` and
-    `long_press` steps.
+    is structurally unusable). The step entry must satisfy the whole
+    `validate_step` schema, including the fields this function never reads
+    (`step_id`, and `accessibility_tree` on the actions that need no forest), so
+    that the exclusion stays interpretable whenever it fires. Then
+    `missing_image` (the screenshot is missing, unreadable, or outside the
+    episode directory), `unknown_action` (`map_action` does not know the
+    action), `missing_a11y` (a click or long_press step without a readable
+    accessibility forest), and `resolve_element_choice`'s `too_few_candidates`,
+    `too_many_candidates` and `no_target_element`. Any element reason excludes
+    the whole step: a step is never partially converted. The forest is opened
+    only for `click` and `long_press` steps.
 
     The last step of an episode has a null action; it becomes a `terminate` step
     with an empty candidate list and no instruction.
