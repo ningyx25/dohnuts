@@ -5,8 +5,8 @@ the steps of the episode and every step points at a screenshot plus a
 `step_NNN_a11y.json` accessibility forest. This module holds the pure rules that
 turn that raw format into the vocabulary the gui-v1 pipeline already uses: the
 metadata structure check, the action mapping, the clickable element list, the
-ground-truth hit test, the candidate choice constraints, and the two or three
-decision rows every step produces. The element rules are a port of the dataset's
+ground-truth target weights, the candidate choice constraints, and the two or
+three decision rows every step produces. The element rules are a port of the dataset's
 own `utils/representation_utils.py` onto plain JSON, with no protobuf and no
 cv2. Screenshot marking and the conversion CLI live in the callers, not here.
 """
@@ -194,7 +194,7 @@ def extract_elements(a11y: dict, *, screen_size: tuple[int, int]) -> list[dict]:
     (as `[x_min, y_min, x_max, y_max]`); node flags are deliberately dropped so
     they cannot leak into a prompt later. Malformed containers are skipped
     instead of raising, and a forest that cannot be walked yields an empty list,
-    which `resolve_element_choice` reports as `too_few_candidates`.
+    which `resolve_element_target` reports as `too_few_candidates`.
     """
     elements = []
     windows = a11y.get("windows") if isinstance(a11y, dict) else None
@@ -228,8 +228,10 @@ def element_bounds(element: dict) -> tuple[float, float, float, float] | None:
     coordinate (`inf`, `nan`) and an inverted box (`x_min >= x_max` or
     `y_min >= y_max`, including the degenerate zero-area one) are refused too,
     because nothing downstream can act on them. This is the one place that
-    decides, so `hit_test` never has to reason about a box it cannot compare
-    against and the marking code never hands a reversed rectangle to PIL.
+    decides, so the hit rules never have to reason about a box they cannot
+    compare against and the marking code never hands a reversed rectangle to
+    PIL. It is also what makes every area downstream strictly positive, so
+    `element_target_weights` can invert one without guarding.
     """
     bounds = element.get("bounds") if isinstance(element, dict) else None
     if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
@@ -248,53 +250,74 @@ def element_bounds(element: dict) -> tuple[float, float, float, float] | None:
     return x_min, y_min, x_max, y_max
 
 
-def hit_test(elements: list[dict], x: float, y: float) -> int | None:
-    """Position of the smallest element containing (x, y), or None on a miss.
+def element_hits(elements: list[dict], x: float, y: float) -> list[int]:
+    """Ascending positions of every element whose bounds contain (x, y).
 
-    The result is a list position into the very `elements` list passed in, so
-    callers can index it directly; `extract_elements` numbers its elements so
-    that the position and the `index` field agree, but only the position is
-    returned here. An input that is not a list, an element without a usable
-    box, and a point that is not a finite number are all ignored.
-
-    Bounds are closed on both ends. Equal areas go to the earlier position, so
-    nested and identical boxes resolve deterministically.
+    The positions index the very `elements` list passed in, so callers can look
+    the elements up directly; `extract_elements` numbers its elements so that a
+    position and its `index` field agree, but only positions are returned here.
+    An input that is not a list, an element without a usable box, and a point
+    that is not a finite number are all ignored, and an empty list means the
+    point hit nothing. Bounds are closed on both ends, so a point on an edge or
+    a corner counts as inside every box that shares it.
     """
     if not isinstance(elements, list) or coordinate(x) is None or coordinate(y) is None:
-        return None
-    best: tuple[float, int] | None = None
+        return []
+    hits = []
     for position, element in enumerate(elements):
         bounds = element_bounds(element)
         if bounds is None:
             continue
         x_min, y_min, x_max, y_max = bounds
-        if not (x_min <= x <= x_max and y_min <= y <= y_max):
+        if x_min <= x <= x_max and y_min <= y <= y_max:
+            hits.append(position)
+    return hits
+
+
+def element_target_weights(elements: list[dict], x: float, y: float) -> list[float] | None:
+    """The ground-truth distribution of a click at pixel (x, y), or None on a miss.
+
+    Every element whose bounds contain the point is ground truth, weighted by
+    inverse box area and normalized over the hits, so a smaller box -- the more
+    specific target -- carries the larger share; `element_bounds` guarantees
+    every area is positive, so the inversion cannot divide by zero. The returned
+    list has one weight per element of the very list passed in, `0.0` off the
+    hits, and sums to 1. A single hit degenerates to the one-hot of that
+    position, and a point inside nothing is a miss rather than a zero vector.
+    """
+    hits = element_hits(elements, x, y)
+    if not hits:
+        return None
+    inverse: dict[int, float] = {}
+    for position in hits:
+        bounds = element_bounds(elements[position])
+        if bounds is None:  # not reachable: element_hits only reports usable boxes
             continue
-        area = (x_max - x_min) * (y_max - y_min)
-        if best is None or (area, position) < best:
-            best = (area, position)
-    return None if best is None else best[1]
+        x_min, y_min, x_max, y_max = bounds
+        inverse[position] = 1.0 / ((x_max - x_min) * (y_max - y_min))
+    total = sum(inverse.values())
+    return [inverse.get(position, 0.0) / total for position in range(len(elements))]
 
 
-def resolve_element_choice(
+def resolve_element_target(
     elements: list[dict], x: float, y: float
-) -> tuple[int | None, str | None]:
-    """Resolve the ground-truth element for a click at pixel (x, y).
+) -> tuple[list[float] | None, str | None]:
+    """Resolve the ground-truth element answer for a click at pixel (x, y).
 
-    The returned position indexes the same `elements` list the caller passed in.
-    The count checks run first, so an unusable candidate list, including one
+    The returned distribution is over the same `elements` list the caller passed
+    in. The count checks run first, so an unusable candidate list, including one
     that is not a list at all, is reported even when the point would hit
-    nothing. Otherwise the point must land inside an element and a miss
-    excludes the step as `no_target_element`.
+    nothing. Otherwise the point must land inside an element and a miss excludes
+    the step as `no_target_element`.
     """
     if not isinstance(elements, list) or len(elements) < MIN_CANDIDATES:
         return None, "too_few_candidates"
     if len(elements) > MAX_CANDIDATES:
         return None, "too_many_candidates"
-    position = hit_test(elements, x, y)
-    if position is None:
+    weights = element_target_weights(elements, x, y)
+    if weights is None:
         return None, "no_target_element"
-    return position, None
+    return weights, None
 
 
 def element_description(index: int, element: dict) -> str:
@@ -319,46 +342,83 @@ def element_description(index: int, element: dict) -> str:
     return f"UI element {index}: {json.dumps(payload, ensure_ascii=False)}"
 
 
-def validate_step(step: object) -> bool:
-    """True when a metadata step entry carries every field the callers read.
+def step_problem(step: object) -> str | None:
+    """Name the first field a metadata step entry gets wrong, or None when it is valid.
 
-    All five keys must be present: `step_id` is an int, `screenshot` and
-    `accessibility_tree` are non-empty file names, `action` is a dict or null,
-    and `step_instruction` is a string or null. The last step of every episode
-    has a null action and stays valid; an `action_type` that `map_action` does
-    not know is not a structure problem either.
+    The fields are checked in the order the callers read them: `step_id` is an
+    int, `screenshot` and `accessibility_tree` are non-empty file names, `action`
+    is a dict or null, and `step_instruction` is a string or null. The last step
+    of every episode has a null action and stays valid; an `action_type` that
+    `map_action` does not know is not a structure problem either. The returned
+    string is phrased to follow `step {index}:` and never quotes a value, so a
+    malformed record cannot smuggle its content into a log line.
     """
     if not isinstance(step, dict):
-        return False
+        return "step entry is not an object"
     if not is_integer(step.get("step_id")):
-        return False
+        return "key 'step_id' is not an integer"
     for key in ("screenshot", "accessibility_tree"):
         value = step.get(key)
         if not isinstance(value, str) or not value:
-            return False
-    if "action" not in step or "step_instruction" not in step:
-        return False
+            return f"key '{key}' is not a non-empty file name"
+    if "action" not in step:
+        return "missing key 'action'"
+    if "step_instruction" not in step:
+        return "missing key 'step_instruction'"
     action = step["action"]
     if action is not None and not isinstance(action, dict):
-        return False
+        return "key 'action' is neither an object nor null"
     instruction = step["step_instruction"]
-    return instruction is None or isinstance(instruction, str)
+    if instruction is not None and not isinstance(instruction, str):
+        return "key 'step_instruction' is neither a string nor null"
+    return None
+
+
+def validate_step(step: object) -> bool:
+    """True when a metadata step entry carries every field the callers read.
+
+    The rules live in `step_problem`, which names the field that failed; this is
+    the same walk with the name thrown away.
+    """
+    return step_problem(step) is None
+
+
+def metadata_detail(record: object) -> str:
+    """Explain the first structural failure of a metadata document, or "" when valid.
+
+    The envelope is checked before the steps, and the steps in list order, so
+    the detail names the first thing a reader would have to fix: `key 'goal' is
+    not a string`, then `step 1: missing key 'action'` and the like. It is the
+    single source of truth behind `parse_metadata`, so the reason and the detail
+    can never disagree about whether a document is usable.
+    """
+    if not isinstance(record, dict):
+        return "document is not an object"
+    if not is_integer(record.get("episode_id")):
+        return "key 'episode_id' is not an integer"
+    if not isinstance(record.get("goal"), str):
+        return "key 'goal' is not a string"
+    steps = record.get("steps")
+    if not isinstance(steps, list):
+        return "key 'steps' is not a list"
+    for index, step in enumerate(steps):
+        problem = step_problem(step)
+        if problem is not None:
+            return f"step {index}: {problem}"
+    return ""
 
 
 def parse_metadata(record: object) -> tuple[dict | None, str | None]:
     """Validate one `metadata_{episode_id}.json` document; never raises.
 
     Returns the record itself, or `(None, "unparsable_metadata")` when the
-    episode envelope or any step entry has the wrong shape.
+    episode envelope or any step entry has the wrong shape; `metadata_detail`
+    names the field that failed.
+
+    The type check repeats what `metadata_detail` already refuses, so that the
+    caller gets a `dict` rather than an `object` back.
     """
-    if not isinstance(record, dict):
-        return None, "unparsable_metadata"
-    if not is_integer(record.get("episode_id")):
-        return None, "unparsable_metadata"
-    if not isinstance(record.get("goal"), str):
-        return None, "unparsable_metadata"
-    steps = record.get("steps")
-    if not isinstance(steps, list) or not all(validate_step(step) for step in steps):
+    if not isinstance(record, dict) or metadata_detail(record):
         return None, "unparsable_metadata"
     return record, None
 
@@ -372,19 +432,15 @@ def read_screenshot(episode_dir: Path, name: object) -> tuple[Path, str, tuple[i
     (width, height) the element rules measure bounds against, and the digest is
     of the file bytes on disk, which is what the row aliases carry.
 
-    Only the header is validated here: `Image.open` reads the size and rejects
-    decompression bombs, and `verify` adds whatever container check the format
-    plugin provides -- a real chunk and CRC walk for PNG, whose plugin overrides
-    it, and nothing at all for the formats whose plugin does not. A JPEG with a
-    cut scan, or a PNG whose compressed data is corrupt while its CRCs stay
-    consistent, is therefore accepted here, which is deliberate: decoding every
-    pixel would cost a full decode whose result is thrown away, because the
-    stored copy is what gets decoded again. Residual decode failures surface
-    later instead -- as a per-step `unexpected` exclusion when the marking step
-    decodes the screenshot, or as a `validate_rows` self-check failure at the
-    end of a run -- never as a silently wrong row. That backstop is only sound
-    because the stored copy is byte-identical to the source: the conversion CLI
-    copies the screenshot bytes with `shutil.copyfile` instead of re-encoding.
+    The whole image is decoded here, not just its header. A container check is
+    not enough: a PNG whose chunk CRCs are consistent over a compressed stream
+    that does not decompress, or that decompresses to scanlines the decoder
+    rejects, passes `Image.verify` and then fails at the first real decode --
+    which, for the steps nothing else decodes, used to be the `validate_rows`
+    self-check at the very end of a batch, aborting a whole run over one bad
+    file. Decoding per step instead turns that into this step's own
+    `missing_image`, and the copy stored alongside the rows is byte-identical to
+    what was decoded here, so the failure cannot come back later.
     """
     if not isinstance(name, str) or not name:
         return None
@@ -397,7 +453,7 @@ def read_screenshot(episode_dir: Path, name: object) -> tuple[Path, str, tuple[i
             return None
         with Image.open(image) as handle:
             size = handle.size
-            handle.verify()
+            handle.convert("RGB")
         return image, image_digest(image), size
     except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
         return None
@@ -450,11 +506,12 @@ def task_progress(instructions: list[str | None]) -> str:
 class ACStep:
     """One parsed Android Control step; `rows_for_ac_step` turns it into rows.
 
-    `elements` and `target_element` only carry values when the mapped action is
+    `elements` and `element_weights` only carry values when the mapped action is
     `click` or `long_press`; every other step, including the terminal one, has
-    `elements == []` and `target_element is None`. `target_element` is a
-    position into `elements`, never the `index` field of an element, and
-    `arguments` are the mapped mobile_use-shaped arguments, not the raw ones.
+    `elements == []` and `element_weights is None`. `element_weights` is a
+    distribution over the positions of `elements`, never over their `index`
+    fields, and `arguments` are the mapped mobile_use-shaped arguments, not the
+    raw ones.
     """
 
     id: str
@@ -467,7 +524,7 @@ class ACStep:
     ac_action: dict | None
     instruction: str | None
     elements: list[dict]
-    target_element: int | None
+    element_weights: list[float] | None
     reference: dict
 
 
@@ -485,10 +542,10 @@ def parse_step(
     `validate_step` schema, including the fields this function never reads
     (`step_id`, and `accessibility_tree` on the actions that need no forest), so
     that the exclusion stays interpretable whenever it fires. Then
-    `missing_image` (the screenshot is missing, unreadable, or outside the
-    episode directory), `unknown_action` (`map_action` does not know the
-    action), `missing_a11y` (a click or long_press step without a readable
-    accessibility forest), and `resolve_element_choice`'s `too_few_candidates`,
+    `missing_image` (the screenshot is missing, unreadable, undecodable, or
+    outside the episode directory), `unknown_action` (`map_action` does not know
+    the action), `missing_a11y` (a click or long_press step without a readable
+    accessibility forest), and `resolve_element_target`'s `too_few_candidates`,
     `too_many_candidates` and `no_target_element`. Any element reason excludes
     the whole step: a step is never partially converted. The forest is opened
     only for `click` and `long_press` steps.
@@ -521,7 +578,8 @@ def parse_step(
     instruction = step.get("step_instruction")
     instruction = instruction if isinstance(instruction, str) else None
     elements: list[dict] = []
-    target_element = None
+    element_weights: list[float] | None = None
+    element_positions: list[int] = []
     ac_action: dict | None = None
     if raw is None:
         # The last step of an episode: no action to take, and the instruction
@@ -545,10 +603,11 @@ def parse_step(
             # map_action passes the raw x/y through unchanged, and this branch
             # only runs when it accepted both as finite coordinates.
             x, y = arguments["coordinate"]
-            position, reason = resolve_element_choice(elements, x, y)
+            weights, reason = resolve_element_target(elements, x, y)
             if reason is not None:
                 return None, reason
-            target_element = position
+            element_weights = weights
+            element_positions = element_hits(elements, x, y)
 
     past = [
         entry.get("step_instruction") if isinstance(entry, dict) else None
@@ -566,13 +625,13 @@ def parse_step(
             ac_action=ac_action,
             instruction=instruction,
             elements=elements,
-            target_element=target_element,
+            element_weights=element_weights,
             reference={
                 "thought": "",
                 "action": instruction or "",
                 "tool_call": {"name": "mobile_use", "arguments": arguments},
                 "ac_action": ac_action,
-                "element_position": target_element,
+                "element_positions": element_positions,
             },
         ),
         None,
@@ -595,10 +654,16 @@ def rows_for_ac_step(
     **by reference** (treat those values as read-only) and carries its own copy
     of the step's alias list.
 
+    The element row's `target` is the step's `element_weights` verbatim -- the
+    inverse-area distribution over the candidates the action point touched, or
+    the one-hot of a single hit -- so the row says how sure the ground truth is
+    of each candidate, and a soft one is a legal training target because the
+    loss accepts a distribution.
+
     Three programming errors raise a `ValueError`, with the same posture as
     `gui_data.rows_for_step`'s swipe guard: an element step without `marked`,
-    and an element step whose `target_element` is missing or does not name one
-    of its candidates (neither of which `parse_step` can produce).
+    and an element step whose `element_weights` are missing, do not cover its
+    candidates, or are all zeros (none of which `parse_step` can produce).
     """
     element_row = step.action in ("click", "long_press")
     if element_row and marked is None:
@@ -649,9 +714,10 @@ def rows_for_ac_step(
         ),
     ]
     if element_row:
-        if step.target_element is None or not 0 <= step.target_element < len(step.elements):
+        weights = step.element_weights
+        if weights is None or len(weights) != len(step.elements) or not any(weights):
             raise ValueError(
-                "rows_for_ac_step requires an element target that names a candidate;"
+                "rows_for_ac_step requires element weights over the candidate list;"
                 " parse_step rejects the rest"
             )
         rows.append(
@@ -665,7 +731,7 @@ def rows_for_ac_step(
                         for position, element in enumerate(step.elements)
                     },
                 },
-                one_hot(len(step.elements), step.target_element),
+                list(weights),
                 marked_path,
             )
         )

@@ -3,6 +3,11 @@
 import hashlib
 import importlib.util
 import json
+import os
+import struct
+import sys
+import time
+import zlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,12 +23,14 @@ from dohnuts.android_control_data import (
     SCROLL_TO_SWIPE_DIRECTION,
     element_bounds,
     element_description,
+    element_hits,
+    element_target_weights,
     extract_elements,
-    hit_test,
     map_action,
+    metadata_detail,
     parse_metadata,
     parse_step,
-    resolve_element_choice,
+    resolve_element_target,
     rows_for_ac_step,
     validate_element,
 )
@@ -416,62 +423,60 @@ def test_element_bounds_rejects_unusable_boxes():
         assert element_bounds(element(0, (0, 0, 10, huge))) is None
 
 
-def test_hit_test_ignores_inverted_and_non_finite_element_bounds():
+def test_element_hits_lists_every_containing_element_in_ascending_order():
+    elements = [
+        element(0, (0, 0, 100, 100)),
+        element(1, (10, 10, 40, 40)),
+        element(2, (0, 0, 200, 200)),
+    ]
+    # Nested boxes are all ground truth: the point touched every one of them.
+    assert element_hits(elements, 20, 20) == [0, 1, 2]
+    assert element_hits(elements, 150, 150) == [2]
+    assert element_hits(elements, 95, 95) == [0, 2]
+    assert element_hits(elements, 300, 300) == []
+
+
+def test_element_hits_reports_positions_not_the_index_field():
+    # Only positions are returned, so a caller can index the list it passed in
+    # even if the `index` fields disagree with the positions.
+    elements = [element(7, (0, 0, 50, 50)), element(9, (100, 100, 200, 200))]
+    assert element_hits(elements, 5, 5) == [0]
+    assert element_hits(elements, 150, 150) == [1]
+    assert element_hits(list(reversed(elements)), 5, 5) == [1]
+    assert element_hits(list(reversed(elements)), 150, 150) == [0]
+
+
+def test_element_hits_uses_closed_bounds():
+    elements = [element(0, (10, 10, 20, 20))]
+    assert element_hits(elements, 10, 10) == [0]
+    assert element_hits(elements, 20, 20) == [0]
+    assert element_hits(elements, 15, 15) == [0]
+    assert element_hits(elements, 9.9, 15) == []
+    assert element_hits(elements, 15, 20.1) == []
+
+
+def test_element_hits_ignores_inverted_and_non_finite_element_bounds():
     elements = [
         {"bounds": [10, 10, 5, 5]},
         {"bounds": [float("nan"), 0, 10, 10]},
         {"bounds": [float("inf"), 0, 10, 10]},
         element(3, (0, 0, 100, 100)),
     ]
-    assert hit_test(elements, 5, 5) == 3
-    # An unbounded box would otherwise swallow every point and win the hit.
+    assert element_hits(elements, 5, 5) == [3]
+    # An unbounded box would otherwise swallow every point in the image.
     assert (
-        hit_test([{"bounds": [float("-inf"), float("-inf"), float("inf"), float("inf")]}], 5, 5)
-        is None
+        element_hits([{"bounds": [float("-inf"), float("-inf"), float("inf"), float("inf")]}], 5, 5)
+        == []
     )
-    assert hit_test([{"bounds": [-(10**400), 0, 10**400, 10]}], 5, 5) is None
+    assert element_hits([{"bounds": [-(10**400), 0, 10**400, 10]}], 5, 5) == []
 
 
-def test_hit_test_prefers_the_smallest_containing_element():
-    elements = [
-        element(0, (0, 0, 100, 100)),
-        element(1, (10, 10, 40, 40)),
-        element(2, (0, 0, 200, 200)),
-    ]
-    assert hit_test(elements, 20, 20) == 1
-    assert hit_test(elements, 150, 150) == 2
-    assert hit_test(elements, 95, 95) == 0
-
-
-def test_hit_test_ties_go_to_the_earlier_position():
-    elements = [element(0, (0, 0, 50, 50)), element(1, (0, 0, 50, 50))]
-    assert hit_test(elements, 5, 5) == 0
-    assert hit_test(list(reversed(elements)), 5, 5) == 0
-
-
-def test_hit_test_reports_the_position_not_the_index_field():
-    # Only the position is returned, so a caller can index the list it passed
-    # in even if the `index` fields disagree with the positions.
-    elements = [element(7, (0, 0, 50, 50)), element(9, (0, 0, 200, 200))]
-    assert hit_test(elements, 5, 5) == 0
-    assert hit_test(elements, 150, 150) == 1
-
-
-def test_hit_test_uses_closed_bounds():
-    elements = [element(0, (10, 10, 20, 20))]
-    assert hit_test(elements, 10, 10) == 0
-    assert hit_test(elements, 20, 20) == 0
-    assert hit_test(elements, 15, 15) == 0
-    assert hit_test(elements, 9.9, 15) is None
-    assert hit_test(elements, 15, 20.1) is None
-
-
-def test_hit_test_reports_misses_and_tolerates_malformed_input():
-    assert hit_test([], 0, 0) is None
-    assert hit_test([element(0, (0, 0, 10, 10))], 50, 50) is None
-    assert hit_test([element(0, (0, 0, 10, 10))], float("nan"), 5) is None
-    assert hit_test([element(0, (0, 0, 10, 10))], "5", 5) is None
-    assert hit_test([element(0, (0, 0, 10, 10))], 5, None) is None
+def test_element_hits_reports_misses_and_tolerates_malformed_input():
+    assert element_hits([], 0, 0) == []
+    assert element_hits([element(0, (0, 0, 10, 10))], 50, 50) == []
+    assert element_hits([element(0, (0, 0, 10, 10))], float("nan"), 5) == []
+    assert element_hits([element(0, (0, 0, 10, 10))], "5", 5) == []
+    assert element_hits([element(0, (0, 0, 10, 10))], 5, None) == []
     unusable = [
         {"index": 0, "bounds": None},
         {"index": 1},
@@ -480,53 +485,105 @@ def test_hit_test_reports_misses_and_tolerates_malformed_input():
         "junk",
         element(4, (0, 0, 100, 100)),
     ]
-    assert hit_test(unusable, 5, 5) == 5  # the position of the only usable element
+    assert element_hits(unusable, 5, 5) == [5]  # the position of the only usable element
 
 
-def test_hit_test_reports_nothing_for_a_non_list():
-    assert hit_test(None, 5, 5) is None
-    assert hit_test(7, 5, 5) is None
-    assert hit_test("elements", 5, 5) is None
-    assert hit_test({"0": element(0, (0, 0, 10, 10))}, 5, 5) is None
+def test_element_hits_reports_nothing_for_a_non_list():
+    assert element_hits(None, 5, 5) == []
+    assert element_hits(7, 5, 5) == []
+    assert element_hits("elements", 5, 5) == []
+    assert element_hits({"0": element(0, (0, 0, 10, 10))}, 5, 5) == []
 
 
-def test_resolve_element_choice_enforces_the_candidate_count():
+def test_element_target_weights_degenerate_to_a_one_hot():
+    pair = [element(0, (0, 0, 10, 10)), element(1, (100, 100, 200, 200))]
+    assert element_target_weights(pair, 5, 5) == [1.0, 0.0]
+    assert element_target_weights(pair, 150, 150) == [0.0, 1.0]
+    # The distribution is over the list that was passed in, not a fixed id.
+    assert element_target_weights(list(reversed(pair)), 5, 5) == [0.0, 1.0]
+
+
+def test_element_target_weights_split_multi_hits_by_inverse_area():
+    elements = [
+        element(0, (0, 0, 100, 100)),  # area 10000
+        element(1, (10, 10, 40, 40)),  # area 900, nested inside the first
+    ]
+    weights = element_target_weights(elements, 20, 20)
+    assert weights is not None
+    assert abs(sum(weights) - 1) <= 1e-9
+    # The smaller box carries the larger share.
+    assert 0 < weights[0] < weights[1] < 1
+    assert weights[0] == pytest.approx(900 / 10900)
+    assert weights[1] == pytest.approx(10000 / 10900)
+
+
+def test_element_target_weights_are_zero_off_the_hits():
+    elements = [
+        element(0, (0, 0, 10, 10)),
+        element(1, (0, 0, 100, 100)),
+        element(2, (500, 500, 600, 600)),
+    ]
+    weights = element_target_weights(elements, 5, 5)
+    assert weights is not None
+    assert weights[2] == 0.0
+    # The smaller box inside the larger one carries the larger share.
+    assert 0 < weights[1] < weights[0]
+    assert abs(sum(weights) - 1) <= 1e-9
+
+
+def test_element_target_weights_report_a_miss_as_none():
+    assert element_target_weights([element(0, (0, 0, 10, 10))], 50, 50) is None
+    assert element_target_weights([], 0, 0) is None
+    assert element_target_weights(None, 0, 0) is None
+    assert element_target_weights(7, 0, 0) is None
+    assert element_target_weights([element(0, (0, 0, 10, 10))], float("nan"), 5) is None
+    assert element_target_weights([element(0, (0, 0, 10, 10))], 5, "5") is None
+
+
+def test_element_target_weights_ignore_unusable_boxes():
+    elements = [{"index": 0, "bounds": None}, element(1, (0, 0, 10, 10))]
+    assert element_target_weights(elements, 5, 5) == [0.0, 1.0]
+
+
+def test_resolve_element_target_enforces_the_candidate_count():
     assert (MIN_CANDIDATES, MAX_CANDIDATES) == (2, 128)
-    assert resolve_element_choice([], 0, 0) == (None, "too_few_candidates")
-    assert resolve_element_choice([element(0, (0, 0, 10, 10))], 5, 5) == (
+    assert resolve_element_target([], 0, 0) == (None, "too_few_candidates")
+    assert resolve_element_target([element(0, (0, 0, 10, 10))], 5, 5) == (
         None,
         "too_few_candidates",
     )
     too_many = [element(index, (0, 0, 10, 10)) for index in range(MAX_CANDIDATES + 1)]
-    assert resolve_element_choice(too_many, 5, 5) == (None, "too_many_candidates")
+    assert resolve_element_target(too_many, 5, 5) == (None, "too_many_candidates")
 
 
-def test_resolve_element_choice_checks_the_count_before_the_hit_test():
+def test_resolve_element_target_checks_the_count_before_the_hit_test():
     too_many = [element(index, (0, 0, 10, 10)) for index in range(MAX_CANDIDATES + 1)]
-    assert resolve_element_choice(too_many, 5000, 5000) == (None, "too_many_candidates")
+    assert resolve_element_target(too_many, 5000, 5000) == (None, "too_many_candidates")
     full = [element(index, (0, 0, 10, 10)) for index in range(MAX_CANDIDATES)]
-    assert resolve_element_choice(full, 5000, 5000) == (None, "no_target_element")
+    assert resolve_element_target(full, 5000, 5000) == (None, "no_target_element")
 
 
-def test_resolve_element_choice_resolves_a_hit():
+def test_resolve_element_target_returns_the_weights_of_a_hit():
     pair = [element(0, (0, 0, 10, 10)), element(1, (100, 100, 200, 200))]
-    assert resolve_element_choice(pair, 5, 5) == (0, None)
-    assert resolve_element_choice(pair, 150, 150) == (1, None)
-    assert resolve_element_choice(pair, 50, 50) == (None, "no_target_element")
-    # The result is a position in the list that was passed in, not a fixed id.
-    assert resolve_element_choice(list(reversed(pair)), 150, 150) == (0, None)
-    assert resolve_element_choice(list(reversed(pair)), 5, 5) == (1, None)
+    assert resolve_element_target(pair, 5, 5) == ([1.0, 0.0], None)
+    assert resolve_element_target(pair, 150, 150) == ([0.0, 1.0], None)
+    assert resolve_element_target(pair, 50, 50) == (None, "no_target_element")
+    # The result indexes the list that was passed in, not a fixed id.
+    assert resolve_element_target(list(reversed(pair)), 150, 150) == ([1.0, 0.0], None)
+    assert resolve_element_target(list(reversed(pair)), 5, 5) == ([0.0, 1.0], None)
 
 
-def test_resolve_element_choice_accepts_the_full_candidate_list():
+def test_resolve_element_target_accepts_the_full_candidate_list():
     elements = [element(index, (index * 10, 0, index * 10 + 8, 8)) for index in range(128)]
-    assert resolve_element_choice(elements, 1005, 4) == (100, None)
+    weights, reason = resolve_element_target(elements, 1005, 4)
+    assert reason is None
+    assert weights == [float(index == 100) for index in range(128)]
 
 
-def test_resolve_element_choice_reports_a_non_list_as_too_few():
-    assert resolve_element_choice(None, 5, 5) == (None, "too_few_candidates")
-    assert resolve_element_choice(7, 5, 5) == (None, "too_few_candidates")
-    assert resolve_element_choice({}, 5, 5) == (None, "too_few_candidates")
+def test_resolve_element_target_reports_a_non_list_as_too_few():
+    assert resolve_element_target(None, 5, 5) == (None, "too_few_candidates")
+    assert resolve_element_target(7, 5, 5) == (None, "too_few_candidates")
+    assert resolve_element_target({}, 5, 5) == (None, "too_few_candidates")
 
 
 def test_extract_elements_numbers_every_element_with_its_position():
@@ -545,9 +602,9 @@ def test_extract_elements_numbers_every_element_with_its_position():
         assert [entry["index"] for entry in elements] == list(range(len(elements))), a11y
 
 
-def test_extract_hit_test_and_description_agree_at_the_seam():
-    # The seam Tasks 2 and 3 rely on: the description label and the marked
-    # element must be the same element the hit test selected.
+def test_extract_hits_and_description_agree_at_the_seam():
+    # The seam Tasks 2 and 3 rely on: the weights, the description label and the
+    # marked element all name positions in the very candidate list handed in.
     bounds = {"left": 100, "top": 200, "right": 300, "bottom": 260}
     a11y = forest(
         node(text="not clickable", isClickable=False, boundsInScreen=bounds),
@@ -555,9 +612,11 @@ def test_extract_hit_test_and_description_agree_at_the_seam():
         node(text="elsewhere", boundsInScreen={"left": 0, "top": 0, "right": 10, "bottom": 10}),
     )
     elements = extract_elements(a11y, screen_size=SCREEN)
-    position, reason = resolve_element_choice(elements, 200, 230)
+    weights, reason = resolve_element_target(elements, 200, 230)
     assert reason is None
-    assert position == 0
+    assert weights == [1.0, 0.0]
+    assert element_hits(elements, 200, 230) == [0]
+    position = element_hits(elements, 200, 230)[0]
     target = elements[position]
     assert target["index"] == position
     assert target["text"] == "TARGET"
@@ -700,6 +759,74 @@ def test_parse_metadata_never_raises_on_malformed_records():
         assert reason == "unparsable_metadata"
 
 
+def test_metadata_detail_names_the_first_broken_field():
+    assert metadata_detail(metadata()) == ""
+    assert metadata_detail(metadata(steps=[])) == ""
+    assert metadata_detail(None) == "document is not an object"
+    assert metadata_detail([]) == "document is not an object"
+    assert metadata_detail("episode") == "document is not an object"
+    assert metadata_detail({}) == "key 'episode_id' is not an integer"
+    assert metadata_detail({"episode_id": 0, "goal": 5, "steps": []}) == (
+        "key 'goal' is not a string"
+    )
+    assert metadata_detail({"episode_id": 0, "goal": "g"}) == "key 'steps' is not a list"
+    assert metadata_detail({"episode_id": 0, "goal": "g", "steps": {}}) == (
+        "key 'steps' is not a list"
+    )
+
+
+def test_metadata_detail_names_the_first_broken_step():
+    assert metadata_detail(metadata(steps=[None])) == "step 0: step entry is not an object"
+    assert metadata_detail(metadata(steps=[step(step_id="0")])) == (
+        "step 0: key 'step_id' is not an integer"
+    )
+    assert metadata_detail(metadata(steps=[step(screenshot="")])) == (
+        "step 0: key 'screenshot' is not a non-empty file name"
+    )
+    assert metadata_detail(metadata(steps=[step(accessibility_tree=7)])) == (
+        "step 0: key 'accessibility_tree' is not a non-empty file name"
+    )
+    assert metadata_detail(metadata(steps=[step(action="click")])) == (
+        "step 0: key 'action' is neither an object nor null"
+    )
+    assert metadata_detail(metadata(steps=[step(step_instruction=5)])) == (
+        "step 0: key 'step_instruction' is neither a string nor null"
+    )
+    dropped = step()
+    del dropped["action"]
+    assert metadata_detail(metadata(steps=[dropped])) == "step 0: missing key 'action'"
+    dropped = step()
+    del dropped["step_instruction"]
+    assert metadata_detail(metadata(steps=[dropped])) == "step 0: missing key 'step_instruction'"
+    # Only the first failure is reported, with the index of the step it is in.
+    assert metadata_detail(metadata(steps=[step(), None, step(step_id=None)])) == (
+        "step 1: step entry is not an object"
+    )
+    assert metadata_detail(metadata(steps=[step(step_id=0.5)])) == (
+        "step 0: key 'step_id' is not an integer"
+    )
+
+
+def test_metadata_detail_agrees_with_parse_metadata():
+    # The detail and the reason come from the same walk, so one can never accept
+    # a document the other refuses.
+    records = [
+        metadata(),
+        metadata(steps=[]),
+        metadata(steps=[step(step_id="0")]),
+        metadata(steps=[None]),
+        {"episode_id": 0, "goal": "g"},
+        {"episode_id": 0, "goal": "g", "steps": [{"step_id": 0}]},
+        {},
+        [],
+        None,
+    ]
+    for record in records:
+        parsed, reason = parse_metadata(record)
+        assert (reason is None) == (metadata_detail(record) == ""), record
+        assert (parsed is None) == (reason is not None)
+
+
 # --- Task 2: per-step parsing and the five question families -------------------
 
 GOAL = "Open the Zoho Meet app , view the scheduled meetings ."
@@ -781,7 +908,7 @@ def test_parse_step_reads_a_click_step_and_resolves_the_target(tmp_path):
     assert step.ac_action == {"action_type": "click", "x": 75, "y": 75}
     assert step.instruction == "Tap JOIN A MEETING"
     assert [entry["text"] for entry in step.elements] == ["Cancel", "JOIN A MEETING"]
-    assert step.target_element == 1
+    assert step.element_weights == [0.0, 1.0]
     assert step.image == directory / "step_000_screenshot.png"
     assert step.image_sha256 == image_digest(directory / "step_000_screenshot.png")
     assert step.state == {
@@ -796,7 +923,7 @@ def test_parse_step_reads_a_click_step_and_resolves_the_target(tmp_path):
             "arguments": {"action": "click", "coordinate": [75, 75]},
         },
         "ac_action": {"action_type": "click", "x": 75, "y": 75},
-        "element_position": 1,
+        "element_positions": [1],
     }
 
 
@@ -895,7 +1022,7 @@ def test_scroll_step_yields_action_complete_and_swipe_dir_rows(tmp_path):
     step = parse_ac_step(record, 0, directory=directory)
     assert step.arguments == {"action": "swipe", "direction": "up"}
     assert step.elements == []
-    assert step.target_element is None
+    assert step.element_weights is None
     rows = rows_for_ac_step(step, RAW_IMAGE)
     assert [row["id"] for row in rows] == [
         "android_control_7_step0:action",
@@ -971,7 +1098,7 @@ def test_wait_and_type_steps_have_no_conditional_row(tmp_path):
         step = parse_ac_step(record, index, directory=directory)
         assert step.action == action
         assert step.elements == []
-        assert step.target_element is None
+        assert step.element_weights is None
         rows = rows_for_ac_step(step, RAW_IMAGE)
         assert [row["id"] for row in rows] == [
             f"android_control_7_step{index}:action",
@@ -993,13 +1120,13 @@ def test_terminal_step_yields_terminate_rows_without_an_accessibility_tree(tmp_p
     assert step.ac_action is None
     assert step.instruction is None
     assert step.elements == []
-    assert step.target_element is None
+    assert step.element_weights is None
     assert step.reference == {
         "thought": "",
         "action": "",
         "tool_call": {"name": "mobile_use", "arguments": {"action": "terminate"}},
         "ac_action": None,
-        "element_position": None,
+        "element_positions": [],
     }
     rows = rows_for_ac_step(step, "episode/step_001_screenshot.png")
     assert [row["id"] for row in rows] == [
@@ -1037,7 +1164,7 @@ def test_rows_for_ac_step_requires_the_marked_screenshot_for_element_rows(tmp_pa
     ]
 
 
-def test_rows_for_ac_step_rejects_an_element_target_outside_the_candidates(tmp_path):
+def test_rows_for_ac_step_rejects_element_weights_over_the_wrong_candidates(tmp_path):
     directory = tmp_path / "episode"
     record = ac_episode(
         ac_step(
@@ -1050,16 +1177,43 @@ def test_rows_for_ac_step_rejects_an_element_target_outside_the_candidates(tmp_p
     )
     step = parse_ac_step(record, 0, directory=directory)
     # A hand-built step must not mint an all-zeros target, which would silently
-    # teach the model that no candidate is the answer.
+    # teach the model that no candidate is the answer, and it must describe the
+    # very candidate list the row is asked about.
     for broken in (
-        replace(step, target_element=None),
-        replace(step, target_element=len(step.elements)),
-        replace(step, target_element=-1),
+        replace(step, element_weights=None),
+        replace(step, element_weights=[0.0] * len(step.elements)),
+        replace(step, element_weights=[0.0]),
+        replace(step, element_weights=[1.0, 0.0, 0.0]),
         replace(step, elements=[]),
     ):
-        with pytest.raises(ValueError, match="element target"):
+        with pytest.raises(ValueError, match="element weights"):
             rows_for_ac_step(broken, RAW_IMAGE, (MARKED_IMAGE, "marked"))
     assert rows_for_ac_step(step, RAW_IMAGE, (MARKED_IMAGE, "marked"))[2]["target"] == [0.0, 1.0]
+
+
+def test_multi_hit_element_rows_are_soft_and_pass_validate_rows(tmp_path):
+    directory = tmp_path / "episode"
+    nodes = [
+        node(text="Card", boundsInScreen={"left": 0, "top": 0, "right": 100, "bottom": 100}),
+        node(text="Button", boundsInScreen={"left": 50, "top": 50, "right": 100, "bottom": 100}),
+        node(text="Elsewhere", boundsInScreen={"left": 10, "top": 150, "right": 20, "bottom": 160}),
+    ]
+    record = ac_episode(
+        ac_step(
+            0, {"action_type": "click", "x": 75, "y": 75}, "Tap", directory=directory, nodes=nodes
+        )
+    )
+    step = parse_ac_step(record, 0, directory=directory)
+    assert step.reference["element_positions"] == [0, 1]
+    weights = step.element_weights
+    assert weights is not None
+    assert weights[2] == 0.0
+    assert 0 < weights[0] < weights[1] < 1
+    assert abs(sum(weights) - 1) <= 1e-9
+    marked = (MARKED_IMAGE, image_digest(write_png(directory / "step_000_marked.png")))
+    rows = rows_for_ac_step(step, RAW_IMAGE, marked)
+    assert rows[2]["target"] == step.element_weights
+    validate_rows(rows, root=tmp_path)
 
 
 def test_state_template_is_empty_at_the_first_step(tmp_path):
@@ -1130,7 +1284,7 @@ def test_reference_keeps_the_raw_action_and_the_mapped_arguments(tmp_path):
             "arguments": {"action": "swipe", "direction": "right"},
         },
         "ac_action": {"action_type": "scroll", "direction": "left"},
-        "element_position": None,
+        "element_positions": [],
     }
 
 
@@ -1256,7 +1410,7 @@ def test_parse_step_never_reads_the_a11y_tree_for_other_actions(tmp_path):
         step, reason = parse_step(record, index, episode_dir=directory)
         assert reason is None, actions[index]
         assert step.elements == []
-        assert step.target_element is None
+        assert step.element_weights is None
 
 
 def test_parse_step_checks_the_screenshot_before_the_action(tmp_path):
@@ -1315,7 +1469,7 @@ def test_parse_step_never_raises_on_junk_inside_a_valid_step(tmp_path):
     record = ac_episode(entry)
     step, reason = parse_step(record, 0, episode_dir=directory)
     assert reason is None
-    assert step.target_element == 0
+    assert step.element_weights == [1.0, 0.0]
     assert [element["text"] for element in step.elements] == ["ok", "also ok"]
     assert step.reference == {
         "thought": "",
@@ -1325,7 +1479,7 @@ def test_parse_step_never_raises_on_junk_inside_a_valid_step(tmp_path):
             "arguments": {"action": "click", "coordinate": [75, 75]},
         },
         "ac_action": {"action_type": "click", "x": 75, "y": 75, "junk": entry["action"]["junk"]},
-        "element_position": 0,
+        "element_positions": [0],
     }
     rows = rows_for_ac_step(step, RAW_IMAGE, (MARKED_IMAGE, "marked"))
     assert len(rows) == 3
@@ -1424,17 +1578,37 @@ def test_datasets_cover_the_five_families():
 
 
 def load_script():
+    name = "prepare_android_control_data"
     spec = importlib.util.spec_from_file_location(
-        "prepare_android_control_data",
-        Path(__file__).parents[1] / "scripts/prepare_android_control_data.py",
+        name, Path(__file__).parents[1] / "scripts/prepare_android_control_data.py"
     )
     module = importlib.util.module_from_spec(spec)
+    # A forked worker unpickles the job function by the module it is defined in,
+    # so the dynamically loaded script has to be registered under its own name.
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
 
 prepare = load_script()
 ROOT = Path(__file__).parents[1]
+ORIGINAL_PROCESS_EPISODE = prepare.process_episode
+
+# Set by the parallel test below: a file every worker appends its pid to.
+WORKER_PIDS: Path | None = None
+
+
+def recording_process_episode(episode_dir, **kwargs):
+    """`prepare.process_episode` with a pid record and a pause.
+
+    Module level on purpose: the parallel pool pickles the worker by reference,
+    and a function defined inside a test cannot be pickled at all.
+    """
+    if WORKER_PIDS is not None:
+        with WORKER_PIDS.open("a") as stream:
+            stream.write(f"{os.getpid()}\n")
+    time.sleep(0.2)
+    return ORIGINAL_PROCESS_EPISODE(episode_dir, **kwargs)
 
 
 def cli_step(directory, index, action, instruction, *, color, nodes=None):
@@ -1668,6 +1842,78 @@ def test_cli_is_deterministic(tmp_path):
     assert second["images"] == first["images"]
 
 
+def read_output(output: Path) -> dict:
+    """Every published file of one conversion, as bytes."""
+    names = [f"{split}.jsonl" for split in prepare.SPLITS]
+    return {
+        name: (output / name).read_bytes() for name in (*names, "excluded.jsonl", "manifest.json")
+    }
+
+
+def parallel_corpus(tmp_path: Path) -> Path:
+    """Eight episodes of three steps, each step with its own screenshot bytes.
+
+    Big enough that a four-worker pool hands several episodes to each worker,
+    and the first episode clicks into nested boxes so the soft targets of a
+    multi-hit step go through the whole pipeline.
+    """
+    source = tmp_path / "corpus"
+    for episode_id in range(8):
+        directory = source / str(episode_id)
+        directory.mkdir(parents=True)
+        nodes = None
+        if episode_id == 0:
+            nodes = [
+                node(
+                    text="Card", boundsInScreen={"left": 0, "top": 0, "right": 100, "bottom": 100}
+                ),
+                node(
+                    text="Button",
+                    boundsInScreen={"left": 50, "top": 50, "right": 100, "bottom": 100},
+                ),
+            ]
+        write_episode(
+            source,
+            episode_id,
+            click_step(directory, 0, (episode_id, 0, 0), nodes=nodes),
+            cli_step(directory, 1, {"action_type": "wait"}, "Wait", color=(episode_id, 0, 1)),
+            cli_step(directory, 2, None, None, color=(episode_id, 0, 2)),
+        )
+    return source
+
+
+def test_cli_parallel_workers_write_the_serial_output(tmp_path):
+    source = parallel_corpus(tmp_path)
+    output = tmp_path / "out"
+    serial = prepare.convert(source, output, workers=1)
+    serial_files = read_output(output)
+    parallel = prepare.convert(source, output, workers=4)
+    # Identical bytes, not merely equivalent rows: the merge is ordered, so the
+    # workers cannot reorder a split file, the manifest, or the exclusions.
+    assert read_output(output) == serial_files
+    assert parallel == serial
+    assert parallel["sha256"] == serial["sha256"]
+    assert parallel["images"] == serial["images"]
+    assert "uniform" in parallel["dataset_weighting"]
+    # Again, so an ordering bug that scheduling happens to hide cannot survive.
+    prepare.convert(source, output, workers=4)
+    assert read_output(output) == serial_files
+
+
+def test_cli_parallel_workers_share_the_episodes(tmp_path, monkeypatch):
+    global WORKER_PIDS
+    source = parallel_corpus(tmp_path)
+    WORKER_PIDS = tmp_path / "worker-pids.txt"
+    monkeypatch.setattr(prepare, "process_episode", recording_process_episode)
+    try:
+        prepare.convert(source, tmp_path / "out", workers=4)
+    finally:
+        WORKER_PIDS = None
+    # More than one process really did the work: the pool is not a serial loop
+    # wearing a worker count.
+    assert len(set((tmp_path / "worker-pids.txt").read_text().split())) > 1
+
+
 def test_cli_records_exclusions_without_aborting_the_batch(tmp_path):
     source = tmp_path / "corpus"
     (source / "0").mkdir(parents=True)  # no metadata_0.json at all
@@ -1707,12 +1953,13 @@ def test_cli_records_exclusions_without_aborting_the_batch(tmp_path):
         ("3", "unparsable_metadata", "parse"),
         ("4", "unparsable_metadata", "parse"),
     ]
-    # An unreadable metadata file names the error it hit; a step exclusion and a
-    # structurally wrong document carry no detail of their own.
+    # An unreadable metadata file names the error it hit, a structurally wrong
+    # document names the field that failed, and a step exclusion carries no
+    # detail of its own.
     assert "metadata_0.json" in entries[0]["detail"]
     assert entries[1]["detail"] == ""
     assert entries[2]["detail"] == ""
-    assert entries[3]["detail"] == ""
+    assert entries[3]["detail"] == "key 'goal' is not a string"
     assert entries[4]["detail"].startswith("JSONDecodeError")
     assert sum(entry["n"] for entry in manifest["counts"]) == 2
     # The failure paths store nothing they cannot reference.
@@ -1743,6 +1990,99 @@ def test_cli_writes_no_image_for_a_step_that_fails_late(tmp_path, monkeypatch):
     assert manifest["images"] == []
     assert list((output / "images").glob("*.png")) == []
     assert (output / "train.jsonl").read_text() == ""
+
+
+def png_chunk(kind: bytes, body: bytes) -> bytes:
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+
+def corrupted_png(size=SCREENSHOT) -> bytes:
+    """A PNG whose container is valid and whose pixels cannot be decoded.
+
+    The chunk CRCs are correct and the IDAT is a valid zlib stream, so the
+    container walk `Image.verify()` performs passes; every scanline starts with
+    a filter type PNG does not define, so decoding the pixels fails. This is the
+    shape the header-only check used to accept and then abort a whole run over.
+    """
+    width, height = size
+    stride = 1 + width * 3
+    raw = bytearray(stride * height)  # black pixels, filter byte 99 per row
+    for row in range(height):
+        raw[row * stride] = 99
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", header)
+        + png_chunk(b"IDAT", zlib.compress(bytes(raw)))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def test_cli_excludes_a_screenshot_whose_pixels_do_not_decode(tmp_path):
+    source = tmp_path / "corpus"
+    broken = source / "0"
+    broken.mkdir(parents=True)
+    entry = cli_step(broken, 0, {"action_type": "wait"}, "Wait", color=(31, 0, 0))
+    screenshot = broken / "step_000_screenshot.png"
+    screenshot.write_bytes(corrupted_png())
+    with Image.open(screenshot) as handle:
+        handle.verify()  # the container checks pass; only the pixels are broken
+    write_episode(source, 0, entry)
+    healthy = source / "1"
+    healthy.mkdir(parents=True)
+    write_episode(
+        source,
+        1,
+        cli_step(healthy, 0, {"action_type": "wait"}, "Wait", color=(31, 0, 1)),
+    )
+    output = tmp_path / "out"
+    # The step is refused at parse time, so the run finishes and publishes its
+    # splits instead of aborting the whole batch at the very end.
+    manifest = prepare.convert(source, output)
+    assert manifest["exclusions"] == {"parse:missing_image": 1}
+    # The refused step stores nothing; the healthy episode is untouched.
+    assert len(manifest["images"]) == 1
+    assert sorted(path.name for path in (output / "images").iterdir()) == manifest["images"]
+    assert [row["id"] for row in stored_rows(output)] == [
+        "android_control_1_step0:action",
+        "android_control_1_step0:complete",
+    ]
+    entry = json.loads((output / "excluded.jsonl").read_text().splitlines()[0])
+    assert entry["id"] == "android_control_0_step0"
+    assert entry["reason"] == "missing_image"
+    for split in prepare.SPLITS:
+        assert manifest["sha256"][split] == prepare.digest_file(output / f"{split}.jsonl")
+
+
+def test_cli_names_the_step_and_field_that_breaks_the_metadata(tmp_path):
+    source = tmp_path / "corpus"
+    healthy = source / "0"
+    healthy.mkdir(parents=True)
+    write_episode(
+        source, 0, cli_step(healthy, 0, {"action_type": "wait"}, "Wait", color=(30, 0, 0))
+    )
+    directory = source / "1"
+    directory.mkdir(parents=True)
+    kept = cli_step(directory, 0, {"action_type": "wait"}, "Wait", color=(30, 0, 1))
+    broken = cli_step(directory, 1, {"action_type": "wait"}, "Wait", color=(30, 0, 2))
+    del broken["action"]
+    write_episode(source, 1, kept, broken)
+    output = tmp_path / "out"
+    manifest = prepare.convert(source, output)
+    assert manifest["exclusions"] == {"parse:unparsable_metadata": 1}
+    entry = json.loads((output / "excluded.jsonl").read_text())
+    assert entry == {
+        "id": "1",
+        "reason": "unparsable_metadata",
+        "detail": "step 1: missing key 'action'",
+        "stage": "parse",
+    }
+    # The document is refused whole -- its other steps go with it -- while the
+    # healthy episode converts as usual.
+    assert [row["id"] for row in stored_rows(output)] == [
+        "android_control_0_step0:action",
+        "android_control_0_step0:complete",
+    ]
 
 
 def test_cli_excludes_an_episode_whose_two_ids_disagree(tmp_path):
@@ -1929,6 +2269,31 @@ def test_cli_checks_the_budget_against_the_final_rows(tmp_path):
     assert manifest["exclusions"] == {"parse:token_budget": 1}
     entry = json.loads((output / "excluded.jsonl").read_text())
     assert entry["detail"] == str(max(lengths))
+
+
+def test_cli_parallel_workers_keep_the_token_check(tmp_path):
+    source = tmp_path / "corpus"
+    directory = source / "0"
+    directory.mkdir(parents=True)
+    write_episode(
+        source,
+        0,
+        token_heavy_step(directory, 0, color=(32, 0, 0)),
+        cli_step(directory, 1, {"action_type": "wait"}, "Wait", color=(32, 0, 1)),
+    )
+    second = source / "1"
+    second.mkdir(parents=True)
+    write_episode(source, 1, cli_step(second, 0, {"action_type": "wait"}, "Wait", color=(32, 1, 0)))
+    output = tmp_path / "out"
+    serial = prepare.convert(source, output, processor=StubProcessor())
+    serial_files = read_output(output)
+    assert serial["exclusions"] == {"parse:token_budget": 1}
+    # The workers never see the processor itself: they read the module global
+    # the fork inherited, and reach the same verdict on the same step.
+    parallel = prepare.convert(source, output, processor=StubProcessor(), workers=4)
+    assert read_output(output) == serial_files
+    assert parallel == serial
+    assert parallel["token_check"] == "enabled"
 
 
 def test_cli_skips_the_model_when_token_checks_are_disabled(tmp_path, monkeypatch):

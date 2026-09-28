@@ -2,19 +2,25 @@
 
 Deterministic: numerically sorted episode directories, content-addressed
 screenshots, the split seed, and the conversion rules decide every output byte.
-Run from the repository root.
+Episodes may be converted in parallel (`--workers`); the merge is ordered, so
+the published files are the ones a serial run would have written. Run from the
+repository root.
 """
 
 import argparse
+import contextlib
 import hashlib
 import io
 import json
+import multiprocessing
 import os
 import platform
 import shutil
 import subprocess
 import sys
 from collections import Counter
+from functools import partial
+from itertools import count
 from pathlib import Path
 
 import PIL
@@ -25,7 +31,7 @@ from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from dohnuts.android_control_data import (
     AC_ACTIONS,
     ELEMENT_INSTRUCTION,
-    parse_metadata,
+    metadata_detail,
     parse_step,
     rows_for_ac_step,
 )
@@ -49,14 +55,24 @@ SPLITS = ["train", "dev", "calibration", "test"]
 # without flooding stderr on a small input.
 PROGRESS_EVERY = 1000
 
+# The token-check processor: a module global rather than a job argument because
+# it holds a tokenizer and an image processor that do not pickle, while a forked
+# worker inherits the object as it stands when the pool is created.
+_TOKEN_PROCESSOR = None
+
+# Temporary names of `staged_write`, unique within a process and across them.
+_TEMP_NAMES = count()
+
 # The rules behind a `screenshot_choice` row are stated in the manifest, so a
 # consumer can tell what its label indices mean without reading this script.
 ELEMENT_RULE = (
     "A click or long_press step lists the visible, non-degenerate, clickable nodes "
     "of its step_NNN_a11y.json in window order and node order; the kept nodes are "
     "numbered contiguously r0..r{N-1} (nothing is deduplicated), the ground truth "
-    "is the smallest node containing the recorded tap point with ties going to the "
-    "earlier candidate, and only steps with 2..128 candidates are converted."
+    "is every node whose box contains the recorded tap point -- weighted by inverse "
+    "box area and normalized over those hits, so a single hit is a one-hot and the "
+    "smaller of several nested boxes carries the larger share -- and only steps "
+    "with 2..128 candidates are converted."
 )
 MARKED_IMAGES = (
     "The screenshot of a screenshot_choice row is a set-of-mark rendering: every "
@@ -145,6 +161,27 @@ def image_path(output: Path, sha256: str) -> Path:
     return Path(output) / "images" / (sha256 + ".png")
 
 
+@contextlib.contextmanager
+def staged_write(target: Path):
+    """Yield a temporary sibling of `target`, renamed over it on success.
+
+    Several workers can store the same content-addressed file, and a reader can
+    open a name the moment it appears, so writing the final name directly would
+    let either of them see half a PNG. Filling a temporary file and renaming it
+    is atomic within one directory; a failure removes the temporary file rather
+    than leaving it behind for the next run to trip over.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged = target.with_name(f".{target.name}.{os.getpid()}.{next(_TEMP_NAMES)}.tmp")
+    try:
+        yield staged
+        os.replace(staged, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            staged.unlink()
+        raise
+
+
 def store_raw(step, target: Path) -> None:
     """Copy the step screenshot to its content-addressed `target`.
 
@@ -155,8 +192,8 @@ def store_raw(step, target: Path) -> None:
     if not target.exists() or digest_file(target) != step.image_sha256:
         # Re-copy a target whose content does not match its name: a killed
         # previous run can leave a truncated file that later runs would trust.
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(step.image, target)
+        with staged_write(target) as staged:
+            shutil.copyfile(step.image, staged)
 
 
 def render_marked(image: Path, elements: list[dict]) -> tuple[bytes, str]:
@@ -182,11 +219,210 @@ def store_marked(target: Path, payload: bytes) -> None:
     """Write one rendered set-of-mark PNG to its content-addressed `target`."""
     sha256 = target.name.removesuffix(".png")
     if not target.exists() or digest_file(target) != sha256:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(payload)
+        with staged_write(target) as staged:
+            staged.write_bytes(payload)
 
 
-def convert(source: Path, output: Path, *, processor=None) -> dict:
+def process_episode(episode_dir: Path, *, output: Path, root: Path, token_check: bool) -> dict:
+    """Convert one episode into the plain-data slice of the run it contributes.
+
+    Everything returned is picklable, because the result crosses a process
+    boundary when the run is parallel: `rows`, `excluded`, `images`, `audit`,
+    `element_rows`, `empty_targets`, and `metadata_bytes` (the raw metadata file
+    the parent folds into its digest in episode order -- a digest cannot be
+    merged after the fact, so the bytes have to travel).
+
+    Never raises. Each step of the episode is already guarded, and an episode
+    that fails outside those guards comes back as a single `unexpected`
+    exclusion with none of its half-made rows, so one bad directory can neither
+    abort the batch nor kill a pool worker.
+    """
+    name = Path(episode_dir).name
+    try:
+        return convert_episode(episode_dir, name, output=output, root=root, token_check=token_check)
+    except Exception as error:
+        return {
+            "rows": [],
+            "excluded": [
+                {
+                    "id": name,
+                    "reason": "unexpected",
+                    "detail": f"{type(error).__name__}: {error}",
+                    "stage": "parse",
+                }
+            ],
+            "images": [],
+            "audit": {"parse:unexpected": 1},
+            "element_rows": 0,
+            "empty_targets": {},
+            "metadata_bytes": None,
+        }
+
+
+def convert_episode(
+    episode_dir: Path, name: str, *, output: Path, root: Path, token_check: bool
+) -> dict:
+    """Parse, probe, store and derive the rows of one episode.
+
+    The body of the conversion loop, keyed by the directory `name` the episode
+    is addressed by; `process_episode` turns whatever escapes here into an
+    exclusion.
+    """
+    audit: Counter = Counter()
+    excluded: list[dict] = []
+    rows: list[dict] = []
+    images_written: list[str] = []
+    empty_targets: dict[str, bool] = {}
+    element_rows = 0
+    record, raw, detail = read_metadata(episode_dir, name)
+    if record is not None:
+        # A valid JSON document of the wrong shape is as unusable as a torn
+        # file, and comes back with the same reason; the detail names the first
+        # step or field that does not satisfy the schema.
+        violation = metadata_detail(record)
+        if violation:
+            record, detail = None, violation
+    if record is not None and int(name) != record["episode_id"]:
+        # The metadata file is named after its directory while the rows are
+        # keyed by the record's id: a corpus whose two ids disagree would be
+        # keyed unpredictably, so the episode is excluded instead.
+        detail = f"episode_id mismatch: dir {name} vs record {record['episode_id']}"
+        record = None
+    if record is None:
+        # One unreadable episode out of 15,283 is not a reason to stop the
+        # batch, and the directory name is the only id the episode has left.
+        audit["parse:unparsable_metadata"] += 1
+        excluded.append(
+            {"id": name, "reason": "unparsable_metadata", "detail": detail, "stage": "parse"}
+        )
+    else:
+        for index in range(len(record["steps"])):
+            step_id = f"android_control_{record['episode_id']}_step{index}"
+            try:
+                step, reason = parse_step(record, index, episode_dir=episode_dir)
+                if step is None:
+                    audit[f"parse:{reason}"] += 1
+                    excluded.append(
+                        {"id": step_id, "reason": reason, "detail": "", "stage": "parse"}
+                    )
+                    continue
+                if token_check:
+                    # The budget is checked before anything is written, and
+                    # the probe rows are the rows this step would mint: only
+                    # the element question carries the candidate texts, so
+                    # the answer is the same either way. The probe's raw path
+                    # stands in for the marked copy because marking never
+                    # changes the dimensions `token_length` reads (never the
+                    # pixels), and its duplicated alias never leaves this
+                    # computation.
+                    probe = (str(step.image), step.image_sha256)
+                    lengths = [
+                        token_length(_TOKEN_PROCESSOR, row)
+                        for row in rows_for_ac_step(
+                            step,
+                            str(step.image),
+                            marked=probe if step.element_weights is not None else None,
+                        )
+                    ]
+                    if any(length > MAX_LENGTH for length in lengths):
+                        audit["parse:token_budget"] += 1
+                        excluded.append(
+                            {
+                                "id": step.id,
+                                "reason": "token_budget",
+                                "detail": str(max(lengths)),
+                                "stage": "parse",
+                            }
+                        )
+                        continue
+                raw_target = image_path(output, step.image_sha256)
+                marked = None
+                marked_png = None
+                if step.element_weights is not None:
+                    payload, marked_sha256 = render_marked(step.image, step.elements)
+                    marked_png = (image_path(output, marked_sha256), payload)
+                    marked = (os.path.relpath(marked_png[0], root), marked_sha256)
+                # Rows are minted before anything is written, and an image is
+                # written and listed only for a step whose rows exist: no
+                # failure can leave a file on disk that the manifest omits.
+                produced = rows_for_ac_step(step, os.path.relpath(raw_target, root), marked=marked)
+                store_raw(step, raw_target)
+                images_written.append(raw_target.name)
+                if marked_png is not None:
+                    store_marked(*marked_png)
+                    images_written.append(marked_png[0].name)
+                rows.extend(produced)
+                if step.element_weights is not None:
+                    element_rows += 1
+                    # The payload is `{}` exactly when the candidate carries
+                    # neither a text nor a description, which makes the question
+                    # unanswerable from the prompt: the row counts as an empty
+                    # target only when no candidate the point touched carries
+                    # one, since any of them is a correct answer.
+                    empty_targets[f"{step.id}:element"] = not any(
+                        element["text"] or element["content_description"]
+                        for position, element in enumerate(step.elements)
+                        if step.element_weights[position] > 0
+                    )
+            except Exception as error:
+                # A filesystem or decode failure outside the rule parsers must
+                # not abort the batch, and the half-made rows are dropped:
+                # a step is never partially converted.
+                audit["parse:unexpected"] += 1
+                excluded.append(
+                    {
+                        "id": step_id,
+                        "reason": "unexpected",
+                        "detail": f"{type(error).__name__}: {error}",
+                        "stage": "parse",
+                    }
+                )
+                continue
+    return {
+        "rows": rows,
+        "excluded": excluded,
+        "images": images_written,
+        "audit": dict(audit),
+        "element_rows": element_rows,
+        "empty_targets": empty_targets,
+        "metadata_bytes": raw,
+    }
+
+
+def episode_results(episodes: list[Path], *, output: Path, root: Path, workers: int):
+    """Yield one `process_episode` result per episode, in episode order.
+
+    `workers == 1` runs the very same function in this process, so a serial run
+    and a parallel one differ in nothing but who does the work. Above that, a
+    forked pool hands episodes to `workers` processes and `imap` yields their
+    results in submission order -- which is what keeps the merged rows,
+    exclusions, image list and metadata digest identical to the serial run, no
+    matter how the workers interleave. The jobs carry no processor: the token
+    check reads the module global the fork inherited.
+    """
+    job = partial(
+        process_episode, output=output, root=root, token_check=_TOKEN_PROCESSOR is not None
+    )
+    if workers <= 1:
+        for episode_dir in episodes:
+            yield job(episode_dir)
+        return
+    context = multiprocessing.get_context("fork")
+    with context.Pool(workers) as pool:
+        yield from pool.imap(job, episodes, chunksize=1)
+
+
+def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> dict:
+    """Convert every episode under `source` into the splits under `output`.
+
+    `processor` enables the token budget check; `workers` above 1 converts that
+    many episodes at a time. The workers only ever run rules on their own
+    episode and store content-addressed files, so the run is as deterministic
+    as the serial one: every episode's results are merged in episode order,
+    which fixes the row order, the counters, the image list, and the metadata
+    digest. Returns the manifest it published.
+    """
+    global _TOKEN_PROCESSOR
     root = repository_root()
     if Path.cwd().resolve() != root:
         raise SystemExit(f"Run from the repository root: {root}")
@@ -199,6 +435,7 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
         output.mkdir(parents=True, exist_ok=True)
     except OSError as error:
         raise SystemExit(f"Cannot create the output directory {output}: {error}") from error
+    _TOKEN_PROCESSOR = processor
     audit: Counter = Counter()
     excluded: list[dict] = []
     rows: list[dict] = []
@@ -207,113 +444,18 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
     element_rows = 0
     metadata_files_hashed = 0
     metadata_sha256 = hashlib.sha256()
-    for number, episode_dir in enumerate(episodes, 1):
-        name = episode_dir.name
-        record, raw, detail = read_metadata(episode_dir, name)
-        if raw is not None:
+    for number, result in enumerate(
+        episode_results(episodes, output=output, root=root, workers=workers), 1
+    ):
+        if result["metadata_bytes"] is not None:
             metadata_files_hashed += 1
-            metadata_sha256.update(raw)
-        if record is not None:
-            # A valid JSON document of the wrong shape is as unusable as a torn
-            # file, and comes back with the same reason; there is no exception
-            # text to report, so the entry carries no detail.
-            record, _ = parse_metadata(record)
-            detail = ""
-        if record is not None and int(name) != record["episode_id"]:
-            # The metadata file is named after its directory while the rows are
-            # keyed by the record's id: a corpus whose two ids disagree would be
-            # keyed unpredictably, so the episode is excluded instead.
-            detail = f"episode_id mismatch: dir {name} vs record {record['episode_id']}"
-            record = None
-        if record is None:
-            # One unreadable episode out of 15,283 is not a reason to stop the
-            # batch, and the directory name is the only id the episode has left.
-            audit["parse:unparsable_metadata"] += 1
-            excluded.append(
-                {"id": name, "reason": "unparsable_metadata", "detail": detail, "stage": "parse"}
-            )
-        else:
-            for index in range(len(record["steps"])):
-                step_id = f"android_control_{record['episode_id']}_step{index}"
-                try:
-                    step, reason = parse_step(record, index, episode_dir=episode_dir)
-                    if step is None:
-                        audit[f"parse:{reason}"] += 1
-                        excluded.append(
-                            {"id": step_id, "reason": reason, "detail": "", "stage": "parse"}
-                        )
-                        continue
-                    if processor is not None:
-                        # The budget is checked before anything is written, and
-                        # the probe rows are the rows this step would mint: only
-                        # the element question carries the candidate texts, so
-                        # the answer is the same either way. The probe's raw path
-                        # stands in for the marked copy because marking never
-                        # changes the dimensions `token_length` reads (never the
-                        # pixels), and its duplicated alias never leaves this
-                        # computation.
-                        probe = (str(step.image), step.image_sha256)
-                        lengths = [
-                            token_length(processor, row)
-                            for row in rows_for_ac_step(
-                                step,
-                                str(step.image),
-                                marked=probe if step.target_element is not None else None,
-                            )
-                        ]
-                        if any(length > MAX_LENGTH for length in lengths):
-                            audit["parse:token_budget"] += 1
-                            excluded.append(
-                                {
-                                    "id": step.id,
-                                    "reason": "token_budget",
-                                    "detail": str(max(lengths)),
-                                    "stage": "parse",
-                                }
-                            )
-                            continue
-                    raw_target = image_path(output, step.image_sha256)
-                    marked = None
-                    marked_png = None
-                    if step.target_element is not None:
-                        payload, marked_sha256 = render_marked(step.image, step.elements)
-                        marked_png = (image_path(output, marked_sha256), payload)
-                        marked = (os.path.relpath(marked_png[0], root), marked_sha256)
-                    # Rows are minted before anything is written, and an image is
-                    # written and listed only for a step whose rows exist: no
-                    # failure can leave a file on disk that the manifest omits.
-                    produced = rows_for_ac_step(
-                        step, os.path.relpath(raw_target, root), marked=marked
-                    )
-                    store_raw(step, raw_target)
-                    images_written.add(raw_target.name)
-                    if marked_png is not None:
-                        store_marked(*marked_png)
-                        images_written.add(marked_png[0].name)
-                    rows.extend(produced)
-                    if step.target_element is not None:
-                        element_rows += 1
-                        target = step.elements[step.target_element]
-                        # The payload is `{}` exactly when the ground-truth
-                        # candidate carries neither a text nor a description,
-                        # which makes the question unanswerable from the prompt.
-                        empty_targets[f"{step.id}:element"] = not (
-                            target["text"] or target["content_description"]
-                        )
-                except Exception as error:
-                    # A filesystem or decode failure outside the rule parsers must
-                    # not abort the batch, and the half-made rows are dropped:
-                    # a step is never partially converted.
-                    audit["parse:unexpected"] += 1
-                    excluded.append(
-                        {
-                            "id": step_id,
-                            "reason": "unexpected",
-                            "detail": f"{type(error).__name__}: {error}",
-                            "stage": "parse",
-                        }
-                    )
-                    continue
+            metadata_sha256.update(result["metadata_bytes"])
+        audit.update(result["audit"])
+        excluded.extend(result["excluded"])
+        rows.extend(result["rows"])
+        images_written.update(result["images"])
+        empty_targets.update(result["empty_targets"])
+        element_rows += result["element_rows"]
         if number % PROGRESS_EVERY == 0:
             print(
                 json.dumps(
@@ -389,7 +531,7 @@ def convert(source: Path, output: Path, *, processor=None) -> dict:
         for reason in ("no_target_element", "too_few_candidates", "too_many_candidates")
     ]
     # The hit rate is over the steps that asked an element question at all: the
-    # audit counts the three ways `resolve_element_choice` can refuse one, and
+    # audit counts the three ways `resolve_element_target` can refuse one, and
     # `element_rows` counts the steps that resolved and within budget (one choice
     # row each). A step that resolved but was excluded by the budget is in
     # neither count, so the rates here and in the manifest stay additive.
@@ -464,14 +606,22 @@ def main(argv=None):
         "--model", type=Path, default=None, help="Local model used for the token budget check"
     )
     parser.add_argument("--no-token-check", dest="token_check", action="store_false")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Episodes to convert at a time; the output is identical to --workers 1",
+    )
     args = parser.parse_args(argv)
+    if args.workers < 1:
+        raise SystemExit(f"--workers must be at least 1, not {args.workers}")
     processor = None
     if args.model is not None and args.token_check:
         try:
             processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
         except (OSError, ValueError) as error:
             raise SystemExit(f"Cannot load the token-check model {args.model}: {error}") from error
-    convert(args.input, args.output, processor=processor)
+    convert(args.input, args.output, processor=processor, workers=args.workers)
 
 
 if __name__ == "__main__":

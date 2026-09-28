@@ -312,8 +312,9 @@ rows that repeat it.
   instructions agree ("Swipe up for Product details" on `scroll: down` steps,
   "Swipe down" on `scroll: up` steps).
 - `reference` also carries `ac_action` (the raw source action, or null on the
-  terminal step) and `element_position` (the hit-tested candidate position, or
-  null outside the element family); neither enters model input.
+  terminal step) and `element_positions` (every candidate the action point
+  touched, ascending, or `[]` outside the element family); neither enters model
+  input.
 - The last step of every episode carries a null action and becomes `terminate`
   with `complete = true`. Episodes are treated as successful demonstrations; the
   parsed corpus no longer carries the source `goal_status` field that would
@@ -324,10 +325,15 @@ with a non-degenerate box on screen, in window order then node order. They are
 numbered contiguously `r0..r{N-1}`: a node that is not clickable, or has an
 unusable box, consumes no number, and nothing is deduplicated, so clickable
 containers with children stay candidates and the keys cannot be read off the raw
-node list. The ground truth is the candidate whose box contains the action's
-pixel point — smallest area first, earlier candidate on a tie — and a point that
-hits no candidate excludes the step (`no_target_element`) instead of guessing.
-Fewer than 2 or more than 128 candidates also exclude the step
+node list. The ground truth is a distribution over the candidates whose box
+contains the action's pixel point: every hit weighs `1 / box area`, normalized
+over the hits, so the smaller — more specific — box of a nested pair carries the
+larger share and a single hit is a one-hot. The element row is a soft label, and
+the training loss already accepts one because it only one-hots a length-`n`
+target (`rlcd.py`). A point that hits no candidate excludes the step
+(`no_target_element`) instead of guessing, and the sizes a step was resolved
+from, where they matter, are `reference.element_positions`. Fewer than 2 or more
+than 128 candidates also exclude the step
 (`too_few_candidates`, `too_many_candidates`). A criterion is
 `"UI element {i}: {payload}"`, where the payload is JSON holding only a
 non-empty `text` and/or `content_description`, in that key order, and `{}` when
@@ -369,11 +375,16 @@ steps) costs about six minutes.
 (`unparsable_metadata`, `missing_image`, `missing_a11y`, `unknown_action`,
 `too_few_candidates`, `too_many_candidates`, `no_target_element`, `token_budget`,
 `unexpected`); `unparsable_metadata` also covers an episode whose directory id
-and record id disagree. The isolate stage drops rows (`cross_split_group`,
-`duplicate_input`). Both land in `excluded.jsonl` with
+and record id disagree, and its `detail` names the first field or step that fails
+the schema (`step 1: missing key 'action'`). The isolate stage drops rows
+(`cross_split_group`, `duplicate_input`). Both land in `excluded.jsonl` with
 `{id, reason, detail, stage}` and in the manifest's `exclusions` counts.
 Parse-stage entries carry the step id or the episode directory name; isolate-stage
-entries carry the row id with its family suffix.
+entries carry the row id with its family suffix. `missing_image` is decided by a
+full decode of the screenshot, not by its container: a PNG whose CRCs are
+consistent over a stream the decoder rejects fails on its own step rather than
+surfacing at the end-of-run self-check, which used to abort the whole batch and
+write no splits at all.
 
 **Manifest.** `element_stats` and `element_resolution` both describe the element
 family and both carry a `basis` field, but they answer different questions and
@@ -422,9 +433,11 @@ containers: an independent corpus-wide probe found 21,507 of 49,924 resolvable
 targets unlabeled (43.1%), a 150-episode sample put the per-split rate at 44–49%,
 and small samples vary widely (60% over the 21-episode run). The numbered
 screenshot carries the signal, and `element_stats.empty_target_payload_rate` is
-the authoritative per-run number. The ground-truth element is inferred by hit
-test rather than given, so a point that lands in several boxes resolves by the
-smallest-area rule. Marked bytes depend on
+the authoritative per-run number. The ground-truth element is inferred from the
+recorded point rather than given, so a point that lands in several boxes is
+answered with a distribution over all of them, weighted by inverse area — a
+soft label the loss accepts, which is also the honest answer when two nested
+boxes are both plausible targets. Marked bytes depend on
 the Pillow version. The label numbering differs from the hand-built smoke row in
 `example-data/train.jsonl`, which numbers dataset indices with gaps instead of
 contiguous clickable-only candidates. As in the GUI converter, symbol links
@@ -433,7 +446,9 @@ inside the input root can still resolve outside it.
 ```bash
 # Run from the repository root. --input is the directory of {episode_id} episode
 # directories; --model points at a local snapshot, or the token check is skipped.
+# --workers converts that many episodes at a time (forked processes); results
+# are merged in episode order, so the splits are byte-identical to a serial run.
 pdm run python scripts/prepare_android_control_data.py \
   --input example-data/android_control_parsered/parsered \
-  --output data/processed/ac-v1 --model Qwen/Qwen3.5-0.8B
+  --output data/processed/ac-v1 --model Qwen/Qwen3.5-0.8B --workers 8
 ```
