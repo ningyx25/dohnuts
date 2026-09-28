@@ -10,8 +10,12 @@ and a protobuf accessibility forest; here the input is the plain element dicts
 image library leaks into the row rules.
 
 Marking is a pure function of `(image, elements)`: no randomness, no clock, no
-environment, so equal inputs always give equal pixels and therefore
-byte-identical PNGs, which is what content-addressed file names rely on.
+environment reads, and the same pixels always encode to the same PNG bytes,
+which is what content-addressed file names rely on. That determinism is only as
+strong as the renderer under it, though: the label face is the font bundled with
+Pillow, rasterised by FreeType and encoded by Pillow's PNG writer, so bumping
+Pillow changes the bytes of an otherwise identical mark and every file name
+derived from them. The module is pure, but not environment-independent.
 """
 
 from PIL import Image, ImageDraw, ImageFont
@@ -44,9 +48,10 @@ def label_font(image: Image.Image) -> ImageFont.FreeTypeFont | ImageFont.ImageFo
     try:
         return ImageFont.load_default(size=size)
     except TypeError as error:
-        # `load_default` grew its `size` argument in Pillow 10.1. Without it the
-        # labels would silently come out at a different scale, so fail here
-        # rather than fall back to a look nothing else was tuned against.
+        # Belt and braces: `size=` has existed since Pillow 10.1 and dohnuts
+        # requires 11, so this cannot fire on a supported install. It is here so
+        # that an undeclared older Pillow fails loudly instead of drawing every
+        # label at a scale nothing else was tuned against.
         raise RuntimeError(
             "ImageFont.load_default(size=...) is unavailable; set-of-mark rendering "
             "needs Pillow >= 10.1 (dohnuts requires Pillow >= 11)"
@@ -57,16 +62,25 @@ def mark_screenshot(image: Image.Image, elements: list[dict]) -> Image.Image:
     """Return a NEW RGB copy of `image` with every candidate element boxed and numbered.
 
     The copy is what lets callers keep using the screenshot they passed in; a
-    non-RGB input is converted first. Elements are drawn in list order and
-    numbered by their position in it, which is the numbering the `r{position}`
-    criteria keys use: an element's own `index` field is ignored, so a list that
-    was filtered or reordered still gets the numbers the row names. Elements
-    whose `bounds` are missing or malformed are skipped and keep their slot, so
-    that alignment holds even for a partial list. Nothing is drawn outside the
-    image: PIL clips whatever runs past an edge, which is exactly the behaviour
-    wanted for a box that touches one.
+    non-RGB input is converted first. Only the pixels of the input matter:
+    anything the source carried in `Image.info` — an ICC profile, a DPI, a
+    timestamp — is dropped, because the PNG encoder would otherwise write it
+    out and two screenshots with equal pixels would hash differently. That
+    changes the bytes of every mark produced before it, so it belongs before the
+    first conversion writes a file; names derived from marked bytes must never
+    mix the two behaviours. Elements are drawn in list order and numbered by
+    their position in it, which is the numbering the `r{position}` criteria keys
+    use: an element's own `index` field is ignored, so a list that was filtered
+    or reordered still gets the numbers the row names. Elements whose `bounds`
+    are missing or malformed are skipped and keep their slot, so that alignment
+    holds even for a partial list. Nothing is drawn outside the image: PIL clips
+    whatever runs past an edge, which is exactly the behaviour wanted for a box
+    that touches one.
     """
     marked = image.convert("RGB")
+    # `convert` copies `image.info` onto the copy and `save` writes what it finds
+    # there, so the copy starts empty.
+    marked.info.clear()
     draw = ImageDraw.Draw(marked)
     font = label_font(marked)
     for position, element in enumerate(elements):

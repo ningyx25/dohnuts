@@ -219,7 +219,15 @@ def extract_elements(a11y: dict, *, screen_size: tuple[int, int]) -> list[dict]:
 
 
 def element_bounds(element: dict) -> tuple[float, float, float, float] | None:
-    """Read an element's `[x_min, y_min, x_max, y_max]`, or None when unusable."""
+    """Read an element's `[x_min, y_min, x_max, y_max]`, or None when unusable.
+
+    Unusable covers more than a missing or mistyped field: a non-finite
+    coordinate (`inf`, `nan`) and an inverted box (`x_min >= x_max` or
+    `y_min >= y_max`, including the degenerate zero-area one) are refused too,
+    because nothing downstream can act on them. This is the one place that
+    decides, so `hit_test` never has to reason about a box it cannot compare
+    against and the marking code never hands a reversed rectangle to PIL.
+    """
     bounds = element.get("bounds") if isinstance(element, dict) else None
     if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
         return None
@@ -227,6 +235,10 @@ def element_bounds(element: dict) -> tuple[float, float, float, float] | None:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
     x_min, y_min, x_max, y_max = bounds
+    if not all(math.isfinite(value) for value in bounds):
+        return None
+    if x_min >= x_max or y_min >= y_max:
+        return None
     return x_min, y_min, x_max, y_max
 
 

@@ -27,6 +27,9 @@ SCREEN = (100, 2400)
 BACKGROUND = (0, 0, 255)
 BOXES = [(10, 20, 60, 80), (10, 100, 60, 160)]
 
+# A stand-in for the ICC profile every real screenshot carries.
+ICC_PROFILE = bytes(range(256)) * 2
+
 # How far past a box's top-left corner to look for its chip. The chip starts at
 # the corner itself and is a few dozen pixels across at the largest label size.
 CHIP_SEARCH = 60
@@ -49,20 +52,21 @@ def png_bytes(image):
     return buffer.getvalue()
 
 
-def chip_box(marked, corner):
+def chip_box(marked, corner, span=CHIP_SEARCH):
     """The white chip at `corner` as `(left, top, right, bottom)`, or None.
 
     The screenshot's background is never white, so the chip is simply the white
     region in the window that starts at the corner; the box returned is the
-    inclusive-exclusive pixel box PIL's `crop` wants.
+    inclusive-exclusive pixel box PIL's `crop` wants. `span` narrows the window
+    when a neighbouring chip could otherwise fall inside it.
     """
     x_min, y_min = corner
     width, height = marked.size
     pixels = marked.load()
     found = [
         (x, y)
-        for y in range(y_min, min(height, y_min + CHIP_SEARCH))
-        for x in range(x_min, min(width, x_min + CHIP_SEARCH))
+        for y in range(y_min, min(height, y_min + span))
+        for x in range(x_min, min(width, x_min + span))
         if pixels[x, y] == CHIP_COLOR
     ]
     if not found:
@@ -120,6 +124,39 @@ def test_marking_the_same_input_twice_gives_byte_identical_pngs():
     assert png_bytes(marked) == png_bytes(marked)
     # The marks really are in there: the marked image differs from the source.
     assert png_bytes(marked) != png_bytes(image)
+
+
+def test_marks_depend_on_the_pixels_and_not_on_the_source_metadata():
+    # Real screenshots are RGBA and carry an ICC profile. `convert` copies
+    # `Image.info` onto the copy and `save` writes what it finds there, so an
+    # identical-pixels screenshot would encode to different bytes — and land on
+    # a different content-addressed name — purely because of its metadata.
+    plain = Image.new("RGBA", SMALL, (10, 20, 30, 255))
+    tagged = plain.copy()
+    tagged.info["icc_profile"] = ICC_PROFILE
+    tagged.info["dpi"] = (72, 72)
+    elements = [element(BOXES[0])]
+    marked = mark_screenshot(tagged, elements)
+    assert png_bytes(marked) == png_bytes(mark_screenshot(plain, elements))
+    assert marked.info == {}
+    # The sources keep their own metadata; only the copy is stripped.
+    assert tagged.info == {"icc_profile": ICC_PROFILE, "dpi": (72, 72)}
+    assert tagged.tobytes() == plain.tobytes()
+
+
+def test_the_marks_use_the_literal_colours():
+    marked = marked_pair(SCREEN)
+    pixels = marked.load()
+    _x_min, y_min, x_max, y_max = BOXES[0]
+    assert pixels[x_max, (y_min + y_max) // 2] == (0, 255, 0)
+    chip = chip_box(marked, BOXES[0][:2])
+    assert chip is not None
+    # The chip is white and the glyph inside it is black.
+    assert pixels[chip[0], chip[1]] == (255, 255, 255)
+    colors = marked.crop(chip).getcolors(maxcolors=1 << 16)
+    assert colors is not None
+    assert (255, 255, 255) in [color for _count, color in colors]
+    assert (0, 0, 0) in [color for _count, color in colors]
 
 
 def test_every_box_is_outlined_in_green_with_a_two_pixel_stroke():
@@ -184,6 +221,23 @@ def test_chip_numbering_follows_position_not_the_index_field():
     assert glyph_mask("0", font) != glyph_mask("7", font)
 
 
+def test_three_digit_labels_render_and_widen_their_chip():
+    # Candidate lists run to MAX_CANDIDATES, so labels reach "127".
+    image = Image.new("RGB", (128 * 30, 200), BACKGROUND)
+    elements = [element((position * 30 + 2, 20, position * 30 + 26, 60)) for position in range(128)]
+    marked = mark_screenshot(image, elements)
+    font = label_font(marked)
+    chip = chip_box(marked, (elements[-1]["bounds"][0], 20), span=28)
+    assert chip is not None
+    glyph = font.getbbox("127")
+    single = font.getbbox("7")
+    assert chip[2] - chip[0] == glyph[2] - glyph[0] + 2 * CHIP_PADDING
+    assert chip[2] - chip[0] > single[2] - single[0] + 2 * CHIP_PADDING
+    crop = marked.crop(chip)
+    assert ink(crop) == glyph_mask("127", font)
+    assert ink(crop) != glyph_mask("7", font)
+
+
 def test_the_input_image_is_never_mutated():
     image = Image.new("RGB", SMALL, BACKGROUND)
     before = image.tobytes()
@@ -226,6 +280,10 @@ def test_elements_without_usable_bounds_are_skipped():
         {"bounds": [1, 2, 3]},
         {"bounds": [0, 0, "x", 10]},
         {"bounds": [0, 0, 10, 10, 20]},
+        {"bounds": [10, 10, 5, 5]},  # inverted: PIL would reject the rectangle
+        {"bounds": [10, 10, 10, 10]},  # degenerate
+        {"bounds": [float("inf"), 0, 10, 10]},  # `round` would raise
+        {"bounds": [float("nan"), 0, 10, 10]},
         None,
         element(BOXES[1]),  # the only one that can be drawn
     ]
@@ -238,10 +296,10 @@ def test_elements_without_usable_bounds_are_skipped():
         assert pixels[0, y] == BACKGROUND
         assert pixels[10, y] == BACKGROUND
     assert chip_box(marked, BOXES[0][:2]) is None
-    # A skipped element keeps its slot, so the survivor is still numbered 6.
+    # A skipped element keeps its slot, so the survivor is still numbered 10.
     font = label_font(marked)
     chip = chip_box(marked, BOXES[1][:2])
-    assert ink(marked.crop(chip)) == glyph_mask("6", font)
+    assert ink(marked.crop(chip)) == glyph_mask("10", font)
 
 
 def test_boxes_running_off_the_edge_are_clipped():

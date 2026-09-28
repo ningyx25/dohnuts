@@ -14,6 +14,7 @@ from dohnuts.android_control_data import (
     MAX_CANDIDATES,
     MIN_CANDIDATES,
     SCROLL_TO_SWIPE_DIRECTION,
+    element_bounds,
     element_description,
     extract_elements,
     hit_test,
@@ -390,6 +391,30 @@ def test_validate_element_ports_the_dataset_rules():
     )
     assert not validate_element({}, screen_size=SCREEN)
     assert not validate_element("node", screen_size=SCREEN)
+
+
+def test_element_bounds_rejects_unusable_boxes():
+    assert element_bounds(element(0, (10, 20, 60, 80))) == (10, 20, 60, 80)
+    assert element_bounds(element(0, (10.5, 20, 60, 80.25))) == (10.5, 20, 60, 80.25)
+    # Inverted and zero-area boxes have no interior to act on, so nothing
+    # downstream is allowed to see one.
+    assert element_bounds(element(0, (10, 10, 5, 5))) is None
+    assert element_bounds(element(0, (10, 10, 10, 10))) is None
+    assert element_bounds(element(0, (0, 10, 10, 5))) is None
+    # Nor does a coordinate that is not a finite number.
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        assert element_bounds(element(0, (bad, 0, 10, 10))) is None
+        assert element_bounds(element(0, (0, 0, 10, bad))) is None
+
+
+def test_hit_test_ignores_inverted_and_non_finite_element_bounds():
+    elements = [
+        {"bounds": [10, 10, 5, 5]},
+        {"bounds": [float("nan"), 0, 10, 10]},
+        {"bounds": [float("inf"), 0, 10, 10]},
+        element(3, (0, 0, 100, 100)),
+    ]
+    assert hit_test(elements, 5, 5) == 3
 
 
 def test_hit_test_prefers_the_smallest_containing_element():
