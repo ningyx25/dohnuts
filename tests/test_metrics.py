@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from dohnuts.metrics import fit_temperatures, summarize
+from dohnuts.metrics import by_dataset, fit_temperatures, summarize
 
 
 def test_twenty_latency_samples_do_not_report_maximum_as_p95():
@@ -36,6 +36,30 @@ def test_temperature_fits_soft_targets_without_changing_order():
     temperatures = fit_temperatures(rows)
     assert temperatures["noul"] == pytest.approx(4 / math.log(3), rel=0, abs=0.02)
     assert summarize(rows, temperatures)["nll"] < summarize(rows)["nll"]
+
+
+def test_by_dataset_suppresses_index_f1_for_mutable_vocabularies():
+    # The element candidates of `screenshot_choice` differ per row, so index 0 of
+    # one row is not index 0 of the next; a fixed vocabulary keeps its macro-F1.
+    rows = [
+        {
+            "dataset": "screenshot_choice",
+            "type": "choice",
+            "logits": [2.0, 0.0],
+            "target": [1.0, 0.0],
+        },
+        {
+            "dataset": "screenshot_choice",
+            "type": "choice",
+            "logits": [0.0, 2.0],
+            "target": [0.0, 1.0],
+        },
+        {"dataset": "gui_button", "type": "choice", "logits": [2.0, 0.0], "target": [1.0, 0.0]},
+        {"dataset": "gui_button", "type": "choice", "logits": [0.0, 2.0], "target": [0.0, 1.0]},
+    ]
+    result = by_dataset(rows)
+    assert "macro_f1" not in result["screenshot_choice"]
+    assert result["gui_button"]["macro_f1"] == pytest.approx(1.0, rel=0, abs=5e-8)
 
 
 def test_ordinal_distance_and_soft_accuracy():

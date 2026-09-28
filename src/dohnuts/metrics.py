@@ -67,7 +67,14 @@ def by_dataset(records, temperatures=None):
     result = {key: summarize(rows, temperatures) for key, rows in sorted(groups.items())}
     # Candidate indices differ by question on these datasets; index macro-F1 is invalid.
     for key, metrics in result.items():
-        if key in {"aokvqa", "scienceqa", "typed_decisions", "screenqa_choice", "clevr_attribute"}:
+        if key in {
+            "aokvqa",
+            "scienceqa",
+            "typed_decisions",
+            "screenqa_choice",
+            "clevr_attribute",
+            "screenshot_choice",
+        }:
             metrics.pop("macro_f1", None)
     result["macro_accuracy"] = (
         float(np.mean([m["accuracy"] for m in result.values()])) if result else None

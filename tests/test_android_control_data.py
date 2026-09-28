@@ -1,5 +1,7 @@
 """Android Control step parsing, action mapping, element extraction, and row rules."""
 
+import hashlib
+import importlib.util
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +32,7 @@ from dohnuts.gui_data import (
     BUTTONS,
     COMPLETE_CRITERIA,
     INSTRUCTIONS,
+    SPLIT_SEED,
     SWIPE_DIRECTIONS,
     image_digest,
     split_for,
@@ -1414,3 +1417,344 @@ def test_datasets_cover_the_five_families():
         "button": "gui_button",
     }
     assert ELEMENT_INSTRUCTION == "Which action should be taken next to complete the user's task?"
+
+
+# --- Task 4: episode discovery, image storage, isolation, and the CLI ---------
+
+
+def load_script():
+    spec = importlib.util.spec_from_file_location(
+        "prepare_android_control_data",
+        Path(__file__).parents[1] / "scripts/prepare_android_control_data.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+prepare = load_script()
+ROOT = Path(__file__).parents[1]
+
+
+def cli_step(directory, index, action, instruction, *, color, nodes=None):
+    """One step entry whose screenshot bytes are unique (`color` sets them).
+
+    `ac_step` writes the file the metadata entry points at; rewriting it with a
+    colour no other step uses keeps two episodes from sharing a screenshot, which
+    the cross-split isolation rule would otherwise have to resolve.
+    """
+    entry = ac_step(index, action, instruction, directory=directory, nodes=nodes)
+    write_png(directory / f"step_{index:03d}_screenshot.png", color=color)
+    return entry
+
+
+def click_step(directory, index, color, *, nodes=None, x=75, y=75):
+    nodes = click_nodes() if nodes is None else nodes
+    return cli_step(
+        directory,
+        index,
+        {"action_type": "click", "x": x, "y": y},
+        "Tap JOIN A MEETING",
+        color=color,
+        nodes=nodes,
+    )
+
+
+def write_episode(source: Path, episode_id: int, *entries, goal=GOAL) -> Path:
+    """Create `<source>/<episode_id>` and the metadata file naming its steps."""
+    directory = source / str(episode_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    record = ac_episode(*entries, goal=goal, episode_id=episode_id)
+    (directory / f"metadata_{episode_id}.json").write_text(json.dumps(record))
+    return directory
+
+
+def stored_rows(output: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for split in prepare.SPLITS
+        for line in (output / f"{split}.jsonl").read_text().splitlines()
+    ]
+
+
+def sample_corpus(tmp_path: Path) -> Path:
+    """Three episodes: every family, one blank candidate, one click per split."""
+    source = tmp_path / "corpus"
+    first = source / "0"
+    first.mkdir(parents=True)
+    write_episode(
+        source,
+        0,
+        click_step(first, 0, (10, 20, 30)),
+        cli_step(
+            first,
+            1,
+            {"action_type": "scroll", "direction": "down"},
+            "Scroll down",
+            color=(10, 20, 31),
+        ),
+        cli_step(first, 2, {"action_type": "navigate_back"}, "Press back", color=(10, 20, 32)),
+        cli_step(first, 3, None, None, color=(10, 20, 33)),
+    )
+    second = source / "1"
+    second.mkdir(parents=True)
+    write_episode(
+        source,
+        1,
+        cli_step(
+            second, 0, {"action_type": "scroll", "direction": "up"}, "Scroll up", color=(11, 20, 30)
+        ),
+        cli_step(second, 1, None, None, color=(11, 20, 31)),
+    )
+    # The second candidate carries neither text nor a description, so its payload
+    # is the empty object the manifest counts.
+    blank = [
+        click_nodes()[0],
+        node(boundsInScreen={"left": 50, "top": 50, "right": 100, "bottom": 100}),
+    ]
+    third = source / "10"
+    third.mkdir(parents=True)
+    write_episode(
+        source,
+        10,
+        click_step(third, 0, (12, 20, 30), nodes=blank),
+        cli_step(third, 1, None, None, color=(12, 20, 31)),
+    )
+    return source
+
+
+def test_cli_writes_the_splits_and_a_manifest(tmp_path):
+    source = sample_corpus(tmp_path)
+    output = tmp_path / "out"
+    returned = prepare.convert(source, output)
+    manifest = json.loads((output / "manifest.json").read_text())
+    # The returned manifest and the published one differ only in the shapes JSON
+    # has no tuple for.
+    assert json.dumps(returned, sort_keys=True) == json.dumps(manifest, sort_keys=True)
+    assert returned["split_limits"] == [("calibration", 10), ("dev", 20), ("test", 30)]
+    assert manifest["schema_version"] == 1
+    assert manifest["split_seed"] == SPLIT_SEED
+    assert manifest["split_limits"] == [["calibration", 10], ["dev", 20], ["test", 30]]
+    assert manifest["source"]["episodes"] == 3
+    assert len(manifest["source"]["metadata_sha256"]) == 64
+    assert manifest["path_convention"].startswith("repository-root relative")
+    assert manifest["token_check"] == "skipped"
+    assert manifest["exclusions"] == {}
+    assert (output / "excluded.jsonl").read_text() == ""
+    assert set(manifest["sha256"]) == set(prepare.SPLITS)
+    for split in prepare.SPLITS:
+        path = output / f"{split}.jsonl"
+        assert path.exists()
+        assert manifest["sha256"][split] == prepare.digest_file(path)
+    assert (output / "dev.jsonl").read_text() == ""
+    counts = {(entry["dataset"], entry["split"]): entry["n"] for entry in manifest["counts"]}
+    assert counts == {
+        ("gui_action", "calibration"): 2,
+        ("gui_action", "test"): 2,
+        ("gui_action", "train"): 4,
+        ("gui_button", "train"): 1,
+        ("gui_complete", "calibration"): 2,
+        ("gui_complete", "test"): 2,
+        ("gui_complete", "train"): 4,
+        ("gui_swipe", "calibration"): 1,
+        ("gui_swipe", "train"): 1,
+        ("screenshot_choice", "test"): 1,
+        ("screenshot_choice", "train"): 1,
+    }
+    assert [(entry["dataset"], entry["split"]) for entry in manifest["counts"]] == sorted(
+        (entry["dataset"], entry["split"]) for entry in manifest["counts"]
+    )
+    assert manifest["action_classes"] == {
+        "calibration": {"swipe": 1, "terminate": 1},
+        "test": {"click": 1, "terminate": 1},
+        "train": {"click": 1, "system_button": 1, "swipe": 1, "terminate": 1},
+    }
+    assert manifest["element_stats"]["train"] == {
+        "rows": 1,
+        "candidates_min": 2,
+        "candidates_mean": 2.0,
+        "candidates_max": 2,
+        "empty_target_payloads": 0,
+        "empty_target_payload_rate": 0.0,
+    }
+    assert manifest["element_stats"]["test"] == {
+        "rows": 1,
+        "candidates_min": 2,
+        "candidates_mean": 2.0,
+        "candidates_max": 2,
+        "empty_target_payloads": 1,
+        "empty_target_payload_rate": 1.0,
+    }
+    assert manifest["element_resolution"] == {
+        "element_rows": 2,
+        "no_target_element": 0,
+        "too_few_candidates": 0,
+        "too_many_candidates": 0,
+        "hit_rate": 1.0,
+    }
+    assert "uniform" in manifest["dataset_weighting"]
+    assert manifest["vocabularies"]["ac_actions"] == AC_ACTIONS
+    assert manifest["vocabularies"]["buttons"] == BUTTONS
+    assert manifest["vocabularies"]["swipe_directions"] == SWIPE_DIRECTIONS
+    assert manifest["vocabularies"]["instructions"] == {
+        **INSTRUCTIONS,
+        "element": ELEMENT_INSTRUCTION,
+    }
+    assert manifest["vocabularies"]["complete_criteria"] == COMPLETE_CRITERIA
+    assert manifest["vocabularies"]["element_rule"]
+    assert manifest["vocabularies"]["marked_images"]
+    assert manifest["environment"]["python"]
+    assert manifest["environment"]["pillow"]
+    assert len(manifest["images"]) == 10
+    assert all(name.endswith(".png") for name in manifest["images"])
+    digest = hashlib.sha256()
+    for episode_id in (0, 1, 10):
+        digest.update((source / str(episode_id) / f"metadata_{episode_id}.json").read_bytes())
+    assert manifest["source"]["metadata_sha256"] == digest.hexdigest()
+    rows = stored_rows(output)
+    assert len(rows) == 21
+    validate_rows(rows, root=ROOT)
+    for row in rows:
+        with Image.open(ROOT / row["image"]) as image:
+            assert image.convert("RGB").size == SCREENSHOT
+    # Every row of a step shares the group and the split `split_for` assigned.
+    assert {row["split"] for row in rows if row["group"] == "task:android_control_0"} == {"train"}
+
+
+def test_cli_pins_marked_and_raw_screenshots_to_their_names(tmp_path):
+    source = tmp_path / "corpus"
+    directory = source / "0"
+    directory.mkdir(parents=True)
+    write_episode(
+        source,
+        0,
+        click_step(directory, 0, (9, 9, 9)),
+        cli_step(directory, 1, None, None, color=(9, 9, 10)),
+    )
+    output = tmp_path / "out"
+    prepare.convert(source, output)
+    rows = stored_rows(output)
+    element = next(row for row in rows if row["dataset"] == "screenshot_choice")
+    action = next(row for row in rows if row["id"] == "android_control_0_step0:action")
+    marked = ROOT / element["image"]
+    raw = ROOT / action["image"]
+    # The element row asks about the marked copy; the raw copy is what every
+    # other row of the same step shows, and both names are their own digests.
+    assert element["image"] != action["image"]
+    marked_sha = hashlib.sha256(marked.read_bytes()).hexdigest()
+    raw_sha = hashlib.sha256(raw.read_bytes()).hexdigest()
+    assert marked.name == marked_sha + ".png"
+    assert raw.name == raw_sha + ".png"
+    assert element["aliases"] == ["image-bytes:" + raw_sha, "image-bytes:" + marked_sha]
+    # The stored raw copy is byte-identical to the source screenshot, so the
+    # decode `validate_rows` performs is of the very bytes the digest names.
+    assert raw.read_bytes() == (directory / "step_000_screenshot.png").read_bytes()
+    with Image.open(marked) as image:
+        assert image.size == SCREENSHOT
+
+
+def test_cli_is_deterministic(tmp_path):
+    source = sample_corpus(tmp_path)
+    output = tmp_path / "out"
+    first = prepare.convert(source, output)
+    second = prepare.convert(source, output)
+    assert second == first
+    assert second["sha256"] == first["sha256"]
+    assert second["images"] == first["images"]
+
+
+def test_cli_records_exclusions_without_aborting_the_batch(tmp_path):
+    source = tmp_path / "corpus"
+    (source / "0").mkdir(parents=True)  # no metadata_0.json at all
+    second = source / "1"
+    second.mkdir(parents=True)
+    write_episode(
+        source,
+        1,
+        click_step(second, 0, (2, 0, 0), x=5, y=190),  # taps where nothing lies
+        cli_step(second, 1, None, None, color=(2, 0, 1)),
+    )
+    third = source / "2"
+    third.mkdir(parents=True)
+    entry = cli_step(third, 0, {"action_type": "wait"}, "Wait", color=(3, 0, 0))
+    (third / "step_000_screenshot.png").unlink()
+    write_episode(source, 2, entry)
+    # Episode 3 has a metadata file that parses as JSON but not as an episode.
+    fourth = source / "3"
+    fourth.mkdir(parents=True)
+    (fourth / "metadata_3.json").write_text(json.dumps({"episode_id": 3}))
+    output = tmp_path / "out"
+    manifest = prepare.convert(source, output)
+    assert manifest["exclusions"] == {
+        "parse:missing_image": 1,
+        "parse:no_target_element": 1,
+        "parse:unparsable_metadata": 2,
+    }
+    entries = [json.loads(line) for line in (output / "excluded.jsonl").read_text().splitlines()]
+    assert [(entry["id"], entry["reason"], entry["stage"]) for entry in entries] == [
+        ("0", "unparsable_metadata", "parse"),
+        ("android_control_1_step0", "no_target_element", "parse"),
+        ("android_control_2_step0", "missing_image", "parse"),
+        ("3", "unparsable_metadata", "parse"),
+    ]
+    # An unreadable metadata file names the error it hit; a step exclusion and a
+    # structurally wrong document carry no detail of their own.
+    assert "metadata_0.json" in entries[0]["detail"]
+    assert entries[1]["detail"] == ""
+    assert entries[2]["detail"] == ""
+    assert entries[3]["detail"] == ""
+    assert sum(entry["n"] for entry in manifest["counts"]) == 2
+
+
+def test_cli_refuses_to_run_outside_the_repository_root(tmp_path, monkeypatch):
+    monkeypatch.chdir(ROOT / "scripts")
+    with pytest.raises(SystemExit, match="Run from the repository root"):
+        prepare.convert(Path("."), tmp_path / "out")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit, match="Run from the dohnuts repository root"):
+        prepare.convert(tmp_path, tmp_path / "out")
+
+
+def test_cli_rejects_inputs_without_episode_directories(tmp_path):
+    source = tmp_path / "corpus"
+    source.mkdir()
+    with pytest.raises(SystemExit, match="No episode directories found"):
+        prepare.convert(source, tmp_path / "out")
+    with pytest.raises(SystemExit, match="No episode directories found"):
+        prepare.convert(tmp_path / "missing", tmp_path / "out")
+    # Only all-digit directory names are episodes: files and other directories
+    # are not part of the corpus.
+    (source / "notes.txt").write_text("not an episode")
+    (source / "12").write_text("a file, not a directory")
+    (source / "episode_5").mkdir()
+    with pytest.raises(SystemExit, match="No episode directories found"):
+        prepare.convert(source, tmp_path / "out")
+
+
+def test_cli_warns_on_empty_splits(tmp_path, capsys):
+    source = tmp_path / "corpus"
+    directory = source / "0"
+    directory.mkdir(parents=True)
+    write_episode(
+        source, 0, cli_step(directory, 0, {"action_type": "wait"}, "Wait", color=(5, 5, 5))
+    )
+    prepare.convert(source, tmp_path / "out")
+    captured = capsys.readouterr()
+    assert json.loads(captured.err) == {"warning": "empty splits: dev, calibration, test"}
+    assert "warning" not in captured.out
+
+
+def test_cli_reports_progress_on_a_long_run(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(prepare, "PROGRESS_EVERY", 1)
+    source = tmp_path / "corpus"
+    directory = source / "0"
+    directory.mkdir(parents=True)
+    write_episode(
+        source,
+        0,
+        cli_step(directory, 0, {"action_type": "wait"}, "Wait", color=(6, 6, 6)),
+        cli_step(directory, 1, None, None, color=(6, 6, 7)),
+    )
+    prepare.convert(source, tmp_path / "out")
+    captured = capsys.readouterr()
+    assert captured.err.splitlines()[0] == json.dumps({"progress": {"episodes": 1, "rows": 4}})

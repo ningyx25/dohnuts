@@ -1,0 +1,373 @@
+"""Convert Android Control episodes into Dohnuts decision splits.
+
+Deterministic: numerically sorted episode directories, content-addressed
+screenshots, the split seed, and the conversion rules decide every output byte.
+Run from the repository root.
+"""
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
+import PIL
+from PIL import Image
+
+from dohnuts.android_control_data import (
+    AC_ACTIONS,
+    ELEMENT_INSTRUCTION,
+    parse_metadata,
+    parse_step,
+    rows_for_ac_step,
+)
+from dohnuts.android_control_mark import mark_screenshot
+from dohnuts.gui_data import (
+    BUTTONS,
+    COMPLETE_CRITERIA,
+    INSTRUCTIONS,
+    SPLIT_LIMITS,
+    SPLIT_SEED,
+    SWIPE_DIRECTIONS,
+    isolate,
+    validate_rows,
+)
+
+SPLITS = ["train", "dev", "calibration", "test"]
+
+# One progress line per this many episodes keeps a multi-hour run observable
+# without flooding stderr on a small input.
+PROGRESS_EVERY = 1000
+
+# The rules behind a `screenshot_choice` row are stated in the manifest, so a
+# consumer can tell what its label indices mean without reading this script.
+ELEMENT_RULE = (
+    "A click or long_press step lists the visible, non-degenerate, clickable nodes "
+    "of its step_NNN_a11y.json in window order and node order; the kept nodes are "
+    "numbered contiguously r0..r{N-1} (nothing is deduplicated), the ground truth "
+    "is the smallest node containing the recorded tap point with ties going to the "
+    "earlier candidate, and only steps with 2..128 candidates are converted."
+)
+MARKED_IMAGES = (
+    "The screenshot of a screenshot_choice row is a set-of-mark rendering: every "
+    "candidate is boxed and numbered in the same order as the criteria, nothing "
+    "else is drawn, and the PNG drops the image metadata of its source, so its "
+    "bytes are a pure function of the pixels, the candidate list, and the Pillow "
+    "version recorded under environment."
+)
+
+
+def digest_file(path: Path) -> str:
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def repository_root() -> Path:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as error:
+        raise SystemExit("Run from the dohnuts repository root: no git repository found") from error
+    return Path(result.stdout.strip()).resolve()
+
+
+def episode_dirs(source: Path) -> list[Path]:
+    """The episode directories directly under `source`, in numeric id order.
+
+    An episode is a directory whose name is an all-digit id, which is what the
+    corpus uses and what its metadata file name is built from. Anything else --
+    a README, a stray file, a directory with a textual name -- is not part of the
+    corpus and is ignored. The sort key includes the name so that ids which only
+    differ by leading zeros still order the same way on every run.
+    """
+    try:
+        children = list(source.iterdir())
+    except OSError:
+        return []
+    episodes = [
+        child
+        for child in children
+        if child.name.isascii() and child.name.isdigit() and child.is_dir()
+    ]
+    return sorted(episodes, key=lambda path: (int(path.name), path.name))
+
+
+def read_metadata(episode_dir: Path, name: str) -> tuple[object | None, bytes | None, str]:
+    """Read `<episode_dir>/metadata_<name>.json`: value, raw bytes, failure note.
+
+    A missing, unreadable, or non-JSON file comes back as `(None, bytes-or-None,
+    detail)` so that one bad episode is excluded instead of aborting the batch.
+    The bytes come back whenever the file could be read at all, because the
+    manifest hashes them whether or not they parse.
+    """
+    path = episode_dir / f"metadata_{name}.json"
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        return None, None, f"{type(error).__name__}: {error}"
+    try:
+        return json.loads(raw), raw, ""
+    except ValueError as error:
+        # JSONDecodeError and UnicodeDecodeError are both ValueError, and a torn
+        # or non-UTF-8 file must not abort the batch with a traceback.
+        return None, raw, f"{type(error).__name__}: {error}"
+
+
+def store_raw(step, output: Path) -> Path:
+    """Copy the step screenshot to its content-addressed name; return that path.
+
+    The copy is byte-identical to the source: the row rules alias the file by the
+    digest of the bytes `parse_step` hashed and `validate_rows` decodes the
+    stored copy, so re-encoding here would break both.
+    """
+    target = output / "images" / (step.image_sha256 + ".png")
+    if not target.exists() or digest_file(target) != step.image_sha256:
+        # Re-copy a target whose content does not match its name: a killed
+        # previous run can leave a truncated file that later runs would trust.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(step.image, target)
+    return target
+
+
+def store_marked(image: Path, elements: list[dict], output: Path) -> tuple[Path, str]:
+    """Render the set-of-mark screenshot of one step; return its path and digest.
+
+    The name comes from a sha256 of the exact bytes written, computed before the
+    write, so the file is content-addressed by construction and a rerun over an
+    existing file with a matching digest has nothing to do. The PNG is encoded
+    from an in-memory buffer rather than saved to a path, which is what keeps the
+    bytes -- and therefore every name derived from them -- a property of the
+    image and the candidate list alone.
+    """
+    with Image.open(image) as handle:
+        marked = mark_screenshot(handle, elements)
+    buffer = io.BytesIO()
+    marked.save(buffer, format="PNG")
+    payload = buffer.getvalue()
+    sha256 = hashlib.sha256(payload).hexdigest()
+    target = output / "images" / (sha256 + ".png")
+    if not target.exists() or digest_file(target) != sha256:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    return target, sha256
+
+
+def convert(source: Path, output: Path) -> dict:
+    root = repository_root()
+    if Path.cwd().resolve() != root:
+        raise SystemExit(f"Run from the repository root: {root}")
+    source = Path(source)
+    episodes = episode_dirs(source)
+    if not episodes:
+        raise SystemExit(f"No episode directories found under {source}")
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise SystemExit(f"Cannot create the output directory {output}: {error}") from error
+    audit: Counter = Counter()
+    excluded: list[dict] = []
+    rows: list[dict] = []
+    images_written: set[str] = set()
+    element_rows = 0
+    metadata_sha256 = hashlib.sha256()
+    for number, episode_dir in enumerate(episodes, 1):
+        name = episode_dir.name
+        record, raw, detail = read_metadata(episode_dir, name)
+        if raw is not None:
+            metadata_sha256.update(raw)
+        if record is not None:
+            # A valid JSON document of the wrong shape is as unusable as a torn
+            # file, and comes back with the same reason; there is no exception
+            # text to report, so the entry carries no detail.
+            record, _ = parse_metadata(record)
+            detail = ""
+        if record is None:
+            # One unreadable episode out of 15,283 is not a reason to stop the
+            # batch, and the directory name is the only id the episode has left.
+            audit["parse:unparsable_metadata"] += 1
+            excluded.append(
+                {"id": name, "reason": "unparsable_metadata", "detail": detail, "stage": "parse"}
+            )
+        else:
+            for index in range(len(record["steps"])):
+                step_id = f"android_control_{record['episode_id']}_step{index}"
+                try:
+                    step, reason = parse_step(record, index, episode_dir=episode_dir)
+                    if step is None:
+                        audit[f"parse:{reason}"] += 1
+                        excluded.append(
+                            {"id": step_id, "reason": reason, "detail": "", "stage": "parse"}
+                        )
+                        continue
+                    raw_target = store_raw(step, output)
+                    images_written.add(raw_target.name)
+                    marked = None
+                    if step.target_element is not None:
+                        marked_target, marked_sha256 = store_marked(
+                            step.image, step.elements, output
+                        )
+                        images_written.add(marked_target.name)
+                        marked = (os.path.relpath(marked_target, root), marked_sha256)
+                    rows.extend(
+                        rows_for_ac_step(step, os.path.relpath(raw_target, root), marked=marked)
+                    )
+                    if step.target_element is not None:
+                        element_rows += 1
+                except Exception as error:
+                    # A filesystem or decode failure outside the rule parsers must
+                    # not abort the batch, and the half-made rows are dropped:
+                    # a step is never partially converted.
+                    audit["parse:unexpected"] += 1
+                    excluded.append(
+                        {
+                            "id": step_id,
+                            "reason": "unexpected",
+                            "detail": f"{type(error).__name__}: {error}",
+                            "stage": "parse",
+                        }
+                    )
+                    continue
+        if number % PROGRESS_EVERY == 0:
+            print(
+                json.dumps({"progress": {"episodes": number, "rows": len(rows)}}),
+                file=sys.stderr,
+                flush=True,
+            )
+    dropped: list = []
+    kept = isolate(rows, audit, dropped)
+    try:
+        validate_rows(kept, root=root)
+    except ValueError as error:
+        raise SystemExit(f"Self-check failed: {error}") from error
+    counts: Counter = Counter()
+    classes: dict[str, Counter] = {}
+    candidates: dict[str, list[int]] = {}
+    empty_payloads: Counter = Counter()
+    try:
+        handles = {split: (output / f"{split}.jsonl").open("w") for split in SPLITS}
+        try:
+            for row in kept:
+                handles[row["split"]].write(json.dumps(row, ensure_ascii=False) + "\n")
+                counts[(row["dataset"], row["split"])] += 1
+                if row["dataset"] == "gui_action":
+                    label = list(AC_ACTIONS)[row["target"].index(1.0)]
+                    classes.setdefault(row["split"], Counter())[label] += 1
+                elif row["dataset"] == "screenshot_choice":
+                    criteria = list(row["question"]["criteria"].values())
+                    candidates.setdefault(row["split"], []).append(len(criteria))
+                    if criteria[row["target"].index(1.0)].endswith(": {}"):
+                        # `element_description` renders a candidate without text
+                        # and without a description as the empty object, which is
+                        # the one payload that asks nothing of the model.
+                        empty_payloads[row["split"]] += 1
+        finally:
+            for handle in handles.values():
+                handle.close()
+    except OSError as error:
+        raise SystemExit(f"Cannot write the split files under {output}: {error}") from error
+    with (output / "excluded.jsonl").open("w") as stream:
+        for entry in [*excluded, *dropped]:
+            stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    empty = [split for split in SPLITS if not any(key[1] == split for key in counts)]
+    if empty:
+        print(
+            json.dumps({"warning": "empty splits: " + ", ".join(empty)}),
+            file=sys.stderr,
+            flush=True,
+        )
+    element_stats = {}
+    for split in SPLITS:
+        widths = candidates.get(split)
+        if not widths:
+            continue
+        empties = empty_payloads[split]
+        element_stats[split] = {
+            "rows": len(widths),
+            "candidates_min": min(widths),
+            "candidates_mean": sum(widths) / len(widths),
+            "candidates_max": max(widths),
+            "empty_target_payloads": empties,
+            "empty_target_payload_rate": empties / len(widths),
+        }
+    misses = [
+        audit[f"parse:{reason}"]
+        for reason in ("no_target_element", "too_few_candidates", "too_many_candidates")
+    ]
+    # The hit rate is over the steps that asked an element question at all: the
+    # audit counts the three ways `resolve_element_choice` can refuse one, and
+    # `element_rows` counts the steps it resolved (one choice row each).
+    asked = element_rows + sum(misses)
+    element_resolution = {
+        "element_rows": element_rows,
+        "no_target_element": misses[0],
+        "too_few_candidates": misses[1],
+        "too_many_candidates": misses[2],
+        "hit_rate": element_rows / asked if asked else None,
+    }
+    manifest = {
+        "schema_version": 1,
+        "split_seed": SPLIT_SEED,
+        "split_limits": SPLIT_LIMITS,
+        "source": {
+            "input": str(source),
+            "episodes": len(episodes),
+            "metadata_sha256": metadata_sha256.hexdigest(),
+        },
+        "path_convention": f"repository-root relative ({root})",
+        "counts": [
+            {"dataset": dataset, "split": split, "n": count}
+            for (dataset, split), count in sorted(counts.items())
+        ],
+        "action_classes": {
+            split: dict(sorted(values.items())) for split, values in sorted(classes.items())
+        },
+        "element_stats": element_stats,
+        "element_resolution": element_resolution,
+        "exclusions": dict(sorted(audit.items())),
+        "images": sorted(images_written),
+        "dataset_weighting": (
+            "TrainingBatches draws a dataset name uniformly at random before drawing a row "
+            "from it, so the five dataset names carry equal weight regardless of how many "
+            "rows each has; because gui_button and gui_swipe rows only exist on the steps "
+            "that press a button or scroll, those rows are relatively upweighted"
+        ),
+        "token_check": "skipped",
+        "vocabularies": {
+            "ac_actions": AC_ACTIONS,
+            "buttons": BUTTONS,
+            "swipe_directions": SWIPE_DIRECTIONS,
+            "instructions": {**INSTRUCTIONS, "element": ELEMENT_INSTRUCTION},
+            "complete_criteria": COMPLETE_CRITERIA,
+            "element_rule": ELEMENT_RULE,
+            "marked_images": MARKED_IMAGES,
+        },
+        "environment": {"python": platform.python_version(), "pillow": PIL.__version__},
+        "sha256": {split: digest_file(output / f"{split}.jsonl") for split in SPLITS},
+    }
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(json.dumps(manifest), flush=True)
+    return manifest
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Directory of `{episode_id}` episode directories (not an output directory)",
+    )
+    parser.add_argument("--output", type=Path, required=True, help="Split directory to create")
+    args = parser.parse_args(argv)
+    convert(args.input, args.output)
+
+
+if __name__ == "__main__":
+    main()
