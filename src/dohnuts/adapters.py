@@ -6,10 +6,11 @@ from collections import OrderedDict
 
 import torch
 from peft import LoraConfig, get_peft_model
+from torch import nn
 from transformers import AutoModel, AutoProcessor
 
 from dohnuts.execution import language_forward
-from dohnuts.recipe import IMAGE_PIXELS
+from dohnuts.recipe import IMAGE_PIXELS, STAGES
 
 
 class Qwen35Adapter:
@@ -20,6 +21,7 @@ class Qwen35Adapter:
     max_input_tokens = 4096
     marker = "<|fim_suffix|>"
     image_prefix = "<|vision_start|><|image_pad|><|vision_end|>\n"
+    _vision_trainable = False
 
     def processor(self, checkpoint):
         return AutoProcessor.from_pretrained(checkpoint, local_files_only=True)
@@ -50,36 +52,52 @@ class Qwen35Adapter:
     def hidden_size(self, backbone):
         return backbone.config.text_config.hidden_size
 
-    def adapt_language(self, backbone, *, training):
-        config = LoraConfig(
-            r=8,
-            lora_alpha=16,
-            lora_dropout=0.0,
-            bias="none",
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "in_proj_qkv",
-                "in_proj_z",
-                "in_proj_b",
-                "in_proj_a",
-                "out_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-        )
-        backbone.language_model = get_peft_model(backbone.language_model, config)
-        if training:
-            backbone.language_model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
+    def apply_stage(self, backbone, stage, *, lora_rank, lora_alpha, training):
+        """Open exactly the parameters a stage owns, adapting language in place.
+
+        Enumerating every language ``nn.Linear`` covers the gated delta rule and
+        attention paths without a hand-maintained name list, and never touches
+        the visual tower or the decision head.
+        """
+        if stage not in STAGES:
+            raise ValueError(f"Unsupported training stage: {stage}")
+        backbone.requires_grad_(False)
+        if stage != "warmup":
+            if hasattr(backbone.language_model, "merge_and_unload"):
+                raise ValueError("The language model is already adapted")
+            targets = [
+                name
+                for name, module in backbone.language_model.named_modules()
+                if isinstance(module, nn.Linear)
+            ]
+            backbone.language_model = get_peft_model(
+                backbone.language_model,
+                LoraConfig(
+                    r=lora_rank,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=0.0,
+                    bias="none",
+                    target_modules=targets,
+                ),
             )
-        backbone.visual.requires_grad_(False)
+            if training:
+                backbone.language_model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+        if stage in {"joint", "vision_top"}:
+            backbone.visual.merger.requires_grad_(True)
+        if stage == "vision_top":
+            for block in backbone.visual.blocks[-4:]:
+                block.requires_grad_(True)
+        self._vision_trainable = stage in {"joint", "vision_top"}
+        if self._vision_trainable:
+            cache = getattr(backbone, "_dohnuts_image_cache", None)
+            if cache is not None:
+                cache.clear()
 
     def merge(self, backbone):
-        backbone.language_model = backbone.language_model.merge_and_unload(safe_merge=True)
+        if hasattr(backbone.language_model, "merge_and_unload"):
+            backbone.language_model = backbone.language_model.merge_and_unload(safe_merge=True)
 
     def freeze_vision(self, backbone):
         backbone.visual.eval()
@@ -138,7 +156,16 @@ class Qwen35Adapter:
         embeddings = backbone.get_input_embeddings()(input_ids)
         position_ids = None
         if "pixel_values" in inputs:
-            features = self.image_features(backbone, inputs)
+            if self._vision_trainable:
+                # Cached features come from frozen weights; a moving vision tower
+                # must recompute them with gradients or the update is silently wrong.
+                # The pooled output splits into one tensor per image, in image order.
+                split = backbone.get_image_features(
+                    inputs["pixel_values"], inputs["image_grid_thw"], return_dict=True
+                ).pooler_output
+                features = torch.cat(list(split))
+            else:
+                features = self.image_features(backbone, inputs)
             if inputs.get("shared_image"):
                 features = features.repeat(input_ids.shape[0], 1)
             features = features.to(embeddings.dtype)

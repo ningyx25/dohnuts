@@ -1094,7 +1094,7 @@ def test_token_length_matches_the_training_collator(image_root):
 def test_token_length_counts_words_and_image_patches(image_root):
     step = step_for(image_root, "demo_step1", {"action": "wait", "time": 1})
     row = rows_for_step(step, str(step.image))[0]
-    prompt, _ = prepare.render_question(
+    prompt, _, _ = prepare.render_question(
         prepare.render(row["state"]), row["question"], has_image=True
     )
     # An 8x8 screenshot resizes to 532x532: 19x19 = 361 patches at factor 28, minus

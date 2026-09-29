@@ -13,7 +13,7 @@ from PIL import Image
 from dohnuts.adapters import Qwen35Adapter
 from dohnuts.execution import plan_prefix
 from dohnuts.model import marker_positions
-from dohnuts.predictor import render, render_question
+from dohnuts.predictor import locate_decision_positions, render, render_question
 from dohnuts.recipe import MAX_LENGTH
 
 
@@ -42,7 +42,7 @@ class DecisionCollator:
         self.max_length = MAX_LENGTH
 
     def __call__(self, records, *, permutation_seed=None):
-        texts, images, targets, types = [], [], [], []
+        texts, stem_ends, images, targets, types = [], [], [], [], []
         rng = random.Random(permutation_seed)
         for record in records:
             question = copy.deepcopy(record["question"])
@@ -60,8 +60,11 @@ class DecisionCollator:
                 target = [target[i] for i in order]
             has_image = bool(record.get("image"))
             state = render(record["state"])
-            text, _ = render_question(state, question, has_image=has_image, adapter=self.adapter)
+            text, _, stem_end = render_question(
+                state, question, has_image=has_image, adapter=self.adapter
+            )
             texts.append(text)
+            stem_ends.append(stem_end)
             if has_image:
                 with Image.open(record["image"]) as image:
                     images.append(image.convert("RGB"))
@@ -70,6 +73,9 @@ class DecisionCollator:
         inputs = self.adapter.batch_inputs(self.processor, texts, images)
         if inputs["input_ids"].shape[1] > self.max_length:
             raise ValueError(f"Token budget exceeded: {[r['id'] for r in records]}")
+        decision_positions = locate_decision_positions(
+            self.processor, texts, stem_ends, input_ids=inputs["input_ids"]
+        )
         maximum = max(map(len, targets))
         positions = torch.zeros(len(records), maximum, dtype=torch.long)
         mask = torch.zeros_like(positions, dtype=torch.bool)
@@ -81,18 +87,26 @@ class DecisionCollator:
             mask[row, : len(target)] = True
             target_tensor[row, : len(target)] = torch.tensor(target)
         plan_prefix(inputs, positions)
-        return inputs, positions, mask, target_tensor, torch.tensor([t == "score" for t in types])
+        return (
+            inputs,
+            positions,
+            decision_positions,
+            mask,
+            target_tensor,
+            torch.tensor([t == "score" for t in types]),
+        )
 
 
 def to_gpu(batch):
-    inputs, positions, mask, target, ordinal = batch
+    """Move a collated batch to the GPU, whatever tuple width the collator returns."""
+    inputs, *other = batch
     inputs = {
         k: v.to("cuda", dtype=torch.bfloat16 if k == "pixel_values" else v.dtype, non_blocking=True)
         if isinstance(v, torch.Tensor)
         else v
         for k, v in inputs.items()
     }
-    return inputs, *(v.to("cuda", non_blocking=True) for v in (positions, mask, target, ordinal))
+    return inputs, *(v.to("cuda", non_blocking=True) for v in other)
 
 
 def prefetch_batches(loader):

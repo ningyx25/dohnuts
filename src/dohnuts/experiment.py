@@ -129,11 +129,16 @@ def memory():
     }
 
 
-def environment(model: DecisionModel, checkpoint: Path):
+def environment(model: DecisionModel, checkpoint: Path, *, method=None):
     from transformers.models.qwen3_5 import modeling_qwen3_5 as implementation
 
     return {
         "kind": "environment",
+        "method": method,
+        "stage": model.stage,
+        "projection_dim": model.projection_dim,
+        "lora_rank": model.lora_rank,
+        "lora_alpha": model.lora_alpha,
         "platform": platform.platform(),
         "python": platform.python_version(),
         "versions": {
@@ -153,6 +158,7 @@ def environment(model: DecisionModel, checkpoint: Path):
         "gpu_properties": str(torch.cuda.get_device_properties(0)),
         "checkpoint_revision": model_revision(checkpoint),
         "parameters": sum(p.numel() for p in model.parameters()),
+        "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "head_parameters": sum(p.numel() for p in model.head.parameters()),
         "attention": "sdpa",
         "dtype": str(next(model.backbone.parameters()).dtype),

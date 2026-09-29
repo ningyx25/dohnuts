@@ -145,7 +145,7 @@ def read_metadata(episode_dir: Path, name: str) -> tuple[object | None, bytes | 
 
 def token_length(processor, row: dict) -> int:
     """Rendered tokens plus expanded image placeholders, as prepare_data.filter_data counts."""
-    prompt, _ = render_question(render(row["state"]), row["question"], has_image=True)
+    prompt, _, _ = render_question(render(row["state"]), row["question"], has_image=True)
     length = len(processor.tokenizer(prompt, truncation=False)["input_ids"])
     factor = processor.image_processor.patch_size * processor.image_processor.merge_size
     with Image.open(row["image"]) as image:

@@ -46,10 +46,27 @@ selection includes its existing best checkpoint, followed by calibration,
 evaluation, and acceptance. Checkpoint steps are experiment coordinates, not
 additional product versions.
 
-The RLCD controls are `--sigma` and `--ce-weight`, defaulting to 0.3 and
-1.0; `--steps` sets the total update budget. `--data`, `--model`, and `--output` identify local assets and output locations.
-They do not select architectures or change the fixed method. Different backbone
+The training objective is `--method`, one of `rlcd` (the default), `sft`, or
+`grpo`. `--sigma` and `--ce-weight` configure `rlcd` and default to 0.3 and 1.0.
+`--stage` opens parameters in four steps: `warmup` trains the decision head
+alone, `text` adds language LoRA (the default), `joint` also opens the vision
+merger, and `vision_top` also opens the top four vision blocks. The two vision
+stages trade the frozen-image cache for correct gradients, so they recompute
+every image feature. `--projection-dim`, `--lora-rank`, and `--lora-alpha`
+default to 256, 8, and 16. `--steps` sets the total update budget, and `--data`,
+`--model`, and `--output` identify local assets and output locations.
+
+Objective details beyond those flags, such as `grpo.group_size` or
+`sft.brier_weight`, belong in the generated `recipe-seed-*.json`. The file is a
+closed recipe: the trainer rejects any configuration that differs from
+`training_recipe(...)`. Flags do not select architectures; different backbone
 support uses the [adapter interface](design.md).
+
+Checkpoints written before the two-projection head change carry
+`format_version: 1`. Both the resume path and `Predictor.from_checkpoint` refuse
+them, because the decision-head parameter keys and the frozen recipe have
+changed. Start a new run; use `--initialize-from` only with an export written by
+the current recipe.
 
 Base initialization and checkpoint initialization use the same 26-group mixture
 and training workflow. To initialize from an exported checkpoint:
@@ -61,7 +78,7 @@ pdm run python scripts/run_experiment.py --initialize-from runs/v1/checkpoint --
 The checkpoint supplies the starting parameters and a fresh optimizer/schedule.
 The runner automatically resumes a saved update in its output directory, restoring
 optimizer and sampling state. Both modes use the same fused kernels, differentiable
-prefix sharing, frozen-image cache, RLCD objective, development selection and
+prefix sharing, frozen-image cache, training objective, development selection and
 calibration. There is no separate incremental training program.
 
 ## Outputs
@@ -70,7 +87,7 @@ The default data directory is `data/processed/v1`; outputs go to `runs/v1`:
 
 | Artifact | Contents |
 | --- | --- |
-| `checkpoint/` | Selected LoRA/head weights, base revision, temperatures, selection metadata, checksum |
+| `checkpoint/` | Selected head/LoRA/vision weights, method, stage, projection dimension, base revision, temperatures, selection metadata, checksum |
 | `seed-42/resources.jsonl` | Timestamped GPU memory, power, utilization, temperature and process RSS |
 | `seed-42/metrics.jsonl` | Loss, reward, development accuracy, learning rate, and GPU memory |
 | `seed-42/test-predictions.jsonl` | Stable example IDs, targets, raw logits |
@@ -82,7 +99,7 @@ The default data directory is `data/processed/v1`; outputs go to `runs/v1`:
 | `jevbench/` | JevBench public-task predictions, raw evidence, and same-ID reference comparisons |
 | `metrics/` | CSV tables, comparison JSON, and a self-contained results report |
 | `figures/` | Separately rendered comparison figures, chart data, and source checksums |
-| `recipe.json` | Fixed settings, exposed RLCD values, and source hashes |
+| `recipe.json` | Fixed settings, the objective's effective options, and source hashes |
 
 ```python
 from dohnuts.predictor import Predictor

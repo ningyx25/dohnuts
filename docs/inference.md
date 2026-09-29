@@ -39,10 +39,15 @@ from dohnuts.predictor import Predictor
 model = Predictor.from_checkpoint("PsiACE/Dohnuts-0.1.0-0.8B")
 ```
 
-The loader verifies the checkpoint's weight checksum and base revision, merges
-LoRA, and applies its saved calibration temperatures. The checkpoint contains
-the decision head as well as LoRA; load it through Dohnuts. It is not a standalone
-Transformers language model or a standard PEFT adapter export.
+The loader verifies the checkpoint's weight checksum, base revision, method,
+stage, and decision-head width, merges LoRA, and applies its saved calibration
+temperatures. The checkpoint contains the decision head as well as LoRA; load it
+through Dohnuts. It is not a standalone Transformers language model or a
+standard PEFT adapter export.
+
+Checkpoints written before the two-projection decision head carry
+`format_version: 1` and are refused with an explicit error. Evaluate a published
+version from the commit that produced it, or retrain with the current recipe.
 
 The same method accepts a local checkpoint directory. An optional `revision`
 pins a Hub commit, and `base_model` supplies an existing local base with its
@@ -79,6 +84,9 @@ answers = result["answers"]
 
 Questions are independent: each sees the state and its own instructions and
 candidates. A question cannot refer to another question's answer in the same call.
+The decision readout is the token that ends the question stem, before the first
+candidate; it reads the state and the instructions but no candidate description,
+and one readout scores every candidate through the candidate projection.
 
 | Type | Criteria | Answer fields |
 | --- | --- | --- |
