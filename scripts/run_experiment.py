@@ -31,6 +31,11 @@ def main():
     parser.add_argument(
         "--ce-weight", type=float, default=1.0, help="Auxiliary cross-entropy weight"
     )
+    parser.add_argument("--method", default="rlcd", help="Training objective: rlcd, sft, or grpo")
+    parser.add_argument("--stage", default="text", help="Opened parameters: warmup..vision_top")
+    parser.add_argument("--projection-dim", type=int, default=256, help="Decision head width")
+    parser.add_argument("--lora-rank", type=int, default=8, help="Language LoRA rank")
+    parser.add_argument("--lora-alpha", type=int, default=16, help="Language LoRA alpha")
     args = parser.parse_args()
     policy = RLCDConfig(sigma=args.sigma, ce_weight=args.ce_weight)
     recipe_path = args.output / "recipe.json"
@@ -38,7 +43,17 @@ def main():
     steps = args.steps
     if steps is None:
         steps = previous["recipe"]["steps"] if previous else TRAINING_STEPS
-    recipe = training_recipe(model=args.model, data=args.data, rlcd=policy, steps=steps)
+    recipe = training_recipe(
+        model=args.model,
+        data=args.data,
+        rlcd=policy,
+        steps=steps,
+        method=args.method,
+        stage=args.stage,
+        projection_dim=args.projection_dim,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+    )
     args.output.mkdir(parents=True, exist_ok=True)
     logs = args.output / "logs"
     logs.mkdir(exist_ok=True)

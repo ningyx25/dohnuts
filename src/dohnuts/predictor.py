@@ -61,20 +61,71 @@ def options_for(question):
 
 
 def render_question(state_text, question, *, has_image=False, adapter=None):
-    """One prompt template shared by training, evaluation, and serving."""
+    """One prompt template shared by training, evaluation, and serving.
+
+    Also returns the character offset at which the question stem ends. That
+    boundary locates the decision readout: the last token starting before it
+    cannot describe any candidate option.
+    """
     adapter = adapter or Qwen35Adapter()
     marker = adapter.marker
     labels, options = options_for(question)
-    content = (
+    stem = (
         f"State: {state_text}\n{question['type']} question: "
         f"{question.get('instructions', '')}\nOptions:\n"
     )
-    if marker in content or any(marker in option for option in options):
+    if marker in stem or any(marker in option for option in options):
         raise ValueError("Input contains the reserved candidate marker")
-    content += "".join(f"- {option}{marker}" for option in options)
-    if has_image:
-        content = adapter.image_prefix + content
-    return content, labels
+    prefix = adapter.image_prefix if has_image else ""
+    content = prefix + stem + "".join(f"- {option}{marker}" for option in options)
+    return content, labels, len(prefix) + len(stem)
+
+
+def _stem_end_token(offsets, stem_end):
+    """The last token to prefer is one fully inside the stem; never a candidate."""
+    inside = [i for i, (start, end) in enumerate(offsets) if end > start and end <= stem_end]
+    if inside:
+        return inside[-1]
+    containing = [i for i, (start, end) in enumerate(offsets) if end > start and start < stem_end]
+    if not containing:
+        raise ValueError("The question stem produced no decision token")
+    return containing[-1]
+
+
+def _placeholder_shift(raw_ids, row_ids, image_token_id):
+    """The processor replaces one image placeholder with one token per patch."""
+    if image_token_id is None:
+        return 0
+    raw_index = next((i for i, token in enumerate(raw_ids) if token == image_token_id), None)
+    if raw_index is None:
+        return 0
+    expanded = (row_ids == image_token_id).nonzero(as_tuple=True)[0]
+    if not expanded.numel():
+        raise ValueError("The rendered prompt lost its image placeholder")
+    return int(expanded[0]) - raw_index + int(expanded.numel()) - 1
+
+
+def locate_decision_positions(processor, texts, stem_ends, *, input_ids):
+    """Map every stem end to the token that carries the decision query.
+
+    Character offsets come from the fast tokenizer. The processor then expands
+    the single image placeholder into one token per visual patch, shifting every
+    later index, so the expansion is subtracted back out. Right padding keeps a
+    row's index valid inside a batch.
+    """
+    tokenizer = processor.tokenizer
+    if tokenizer.padding_side != "right":
+        raise ValueError("The decision readout requires a right-padded tokenizer")
+    image_token_id = getattr(processor, "image_token_id", None)
+    positions = []
+    for row, (text, stem_end) in enumerate(zip(texts, stem_ends, strict=True)):
+        encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        raw_index = _stem_end_token(encoded["offset_mapping"], stem_end)
+        index = raw_index + _placeholder_shift(encoded["input_ids"], input_ids[row], image_token_id)
+        if int(input_ids[row, index]) != encoded["input_ids"][raw_index]:
+            raise ValueError("The decision position drifted from the rendered prompt")
+        positions.append(index)
+    return torch.tensor(positions, dtype=torch.long)
 
 
 class Predictor:
@@ -102,6 +153,12 @@ class Predictor:
                 )
             )
         config = json.loads((directory / "dohnuts.json").read_text())
+        if config.get("format_version") != 2:
+            raise ValueError(
+                "Checkpoint format_version 1 or unknown is not loadable: the decision head changed "
+                "from one Linear to two projections. Evaluate published versions from the commit "
+                "that produced them, or retrain with the current recipe."
+            )
         if base_model is None:
             base_model = Path(config.get("base_path", BASE_MODEL)).expanduser()
             if not base_model.is_dir():
@@ -109,8 +166,15 @@ class Predictor:
                     config["base_model"], revision=config["base_revision"]
                 )
         base_model = Path(base_model).expanduser()
-        model = DecisionModel(base_model, adapter=adapter)
-        model.enable_lora(checkpointing=False)
+        model = DecisionModel(
+            base_model, adapter=adapter, projection_dim=config.get("projection_dim", 256)
+        )
+        model.enable_stage(
+            config["stage"],
+            lora_rank=config.get("lora_rank") or 8,
+            lora_alpha=config.get("lora_alpha") or 16,
+            checkpointing=False,
+        )
         config = model.load_adapter(directory)
         model.merge()
         predictor = cls(model)
@@ -131,12 +195,13 @@ class Predictor:
             state_text = render(state)
         if image is not None and not isinstance(image, Image.Image):
             raise ValueError("Decode the image as a PIL image before passing it in state['image']")
-        texts, metadata = [], []
+        texts, stem_ends, metadata = [], [], []
         for qid, question in questions.items():
-            content, labels = render_question(
+            content, labels, stem_end = render_question(
                 state_text, question, has_image=image is not None, adapter=self.model.adapter
             )
             texts.append(content)
+            stem_ends.append(stem_end)
             metadata.append((qid, question["type"], labels))
         if image is not None:
             inputs = self.model.adapter.shared_image_inputs(self.model.processor, texts, image)
@@ -146,6 +211,9 @@ class Predictor:
             raise ValueError(
                 "Input exceeds the token budget; no question or candidate was truncated"
             )
+        decision_positions = locate_decision_positions(
+            self.model.processor, texts, stem_ends, input_ids=inputs["input_ids"]
+        )
         maximum = max(len(labels) for _, _, labels in metadata)
         positions = torch.zeros(len(texts), maximum, dtype=torch.long)
         mask = torch.zeros_like(positions, dtype=torch.bool)
@@ -157,12 +225,12 @@ class Predictor:
             )[0]
             mask[row, : len(labels)] = True
         plan_prefix(inputs, positions)
-        return inputs, positions, mask, metadata
+        return inputs, positions, decision_positions, mask, metadata
 
     @torch.inference_mode()
     def predict(self, state, questions):
         self.model.eval()
-        inputs, positions, mask, metadata = self.prepare(state, questions)
+        inputs, positions, decision_positions, mask, metadata = self.prepare(state, questions)
         token_count = int(inputs["attention_mask"].sum())
         has_image = "pixel_values" in inputs
         inputs = {
@@ -170,7 +238,10 @@ class Predictor:
             for key, value in inputs.items()
         }
         positions = positions.to("cuda")
-        logits = self.model(inputs, positions).cpu().masked_fill(~mask, -torch.inf)
+        decision_positions = decision_positions.to("cuda")
+        logits = (
+            self.model(inputs, positions, decision_positions).cpu().masked_fill(~mask, -torch.inf)
+        )
         answers = {}
         for row, (qid, kind, labels) in enumerate(metadata):
             temperature = self.temperatures[QTYPES[kind]]

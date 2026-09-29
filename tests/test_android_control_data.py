@@ -2525,7 +2525,7 @@ def test_token_length_counts_words_and_image_patches(tmp_path):
     record = ac_episode(cli_step(directory, 0, {"action_type": "wait"}, "Wait", color=(24, 0, 0)))
     step = parse_ac_step(record, 0, directory=directory)
     row = rows_for_ac_step(step, str(step.image))[0]
-    prompt, _ = prepare.render_question(
+    prompt, _, _ = prepare.render_question(
         prepare.render(row["state"]), row["question"], has_image=True
     )
     # The 100x200 screenshot resizes to 728x364: 26x13 = 338 patches at the stub

@@ -1,4 +1,4 @@
-"""Resumable mixed-dataset RLCD with development-only checkpoint selection."""
+"""Resumable mixed-dataset training with development-only checkpoint selection."""
 
 import argparse
 import hashlib
@@ -7,7 +7,6 @@ import math
 import random
 import time
 from collections import Counter, deque
-from dataclasses import asdict
 from pathlib import Path
 from typing import cast
 
@@ -17,8 +16,9 @@ from dohnuts import __version__
 from dohnuts.experiment import Sampler, emit, environment, memory
 from dohnuts.metrics import by_dataset, by_primitive_and_candidates, fit_temperatures
 from dohnuts.model import DecisionModel
+from dohnuts.objectives import build_objective
 from dohnuts.recipe import LR_DECAY_STEPS, training_recipe
-from dohnuts.rlcd import RLCDConfig, rlcd_loss
+from dohnuts.rlcd import RLCDConfig
 from dohnuts.training_data import (
     DecisionCollator,
     EvaluationBatches,
@@ -33,14 +33,15 @@ def file_hash(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def save_checkpoint(path, model, optimizer, step, config, score):
+def save_checkpoint(path, model, optimizer, step, config, score, training_state=None):
     payload = {
-        "format_version": 1,
+        "format_version": 2,
         "step": step,
         "config": config,
         "dev_macro_accuracy": score,
         "trainable": {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad},
         "optimizer": optimizer.state_dict(),
+        "training_state": training_state,
         "torch_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all(),
         "python_rng": random.getstate(),
@@ -52,6 +53,11 @@ def save_checkpoint(path, model, optimizer, step, config, score):
 
 def load_checkpoint(model, path, optimizer=None):
     state = torch.load(path, map_location="cpu", weights_only=False)
+    if state.get("format_version") != 2:
+        raise ValueError(
+            "Checkpoint format_version 1 or unknown cannot be resumed: the decision head changed "
+            "from one Linear to two projections. Start a new run from --initialize-from instead."
+        )
     params = dict(model.named_parameters())
     expected = {n for n, p in params.items() if p.requires_grad}
     if set(state["trainable"]) != expected:
@@ -106,8 +112,8 @@ def evaluate(model, groups, collator, output, batch_size=16):
                     flush=True,
                 )
 
-        for (inputs, positions, _, _, _), rows in prefetch_batches(loader):
-            logits = model(inputs, positions)
+        for (inputs, positions, decision_positions, _, _, _), rows in prefetch_batches(loader):
+            logits = model(inputs, positions, decision_positions)
             host = torch.empty_like(logits, device="cpu", pin_memory=True)
             host.copy_(logits, non_blocking=True)
             ready = torch.cuda.Event()
@@ -126,30 +132,41 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
     torch.set_num_threads(config["cpu_threads"])
     torch.manual_seed(config["seed"])
     random.seed(config["seed"])
-    policy = RLCDConfig(**config.get("rlcd", {}))
-    model = DecisionModel(config["model"], adapter=adapter)
-    model.enable_lora()
+    model = DecisionModel(config["model"], adapter=adapter, projection_dim=config["projection_dim"])
+    model.enable_stage(
+        config["stage"], lora_rank=config["lora_rank"], lora_alpha=config["lora_alpha"]
+    )
     parent = None
     if initialize_from is not None:
         metadata = model.load_adapter(initialize_from)
         parent = {"checkpoint": str(initialize_from), "weights_sha256": metadata["weights_sha256"]}
     parameters = [p for p in model.parameters() if p.requires_grad]
+    groups = {"head": [], "lora": [], "merger": [], "vision": []}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("head."):
+            key = "head"
+        elif "lora_" in name:
+            key = "lora"
+        elif ".visual.merger." in name:
+            key = "merger"
+        elif ".visual.blocks." in name:
+            key = "vision"
+        else:
+            raise ValueError(f"Unclassified trainable parameter: {name}")
+        groups[key].append(parameter)
+    rates = {
+        "head": config["head_lr"],
+        "lora": config["backbone_lr"],
+        "merger": config["merger_lr"],
+        "vision": config["vision_lr"],
+    }
     optimizer = torch.optim.AdamW(
         [
-            {
-                "params": [
-                    p
-                    for n, p in model.named_parameters()
-                    if p.requires_grad and not n.startswith("head.")
-                ],
-                "lr": config["backbone_lr"],
-                "initial_lr": config["backbone_lr"],
-            },
-            {
-                "params": model.head.parameters(),
-                "lr": config["head_lr"],
-                "initial_lr": config["head_lr"],
-            },
+            {"params": members, "lr": rates[key], "initial_lr": rates[key]}
+            for key, members in groups.items()
+            if members
         ],
         weight_decay=0.01,
     )
@@ -160,27 +177,37 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         split: file_hash(data / f"{split}.jsonl")
         for split in ["train", "dev", "calibration", "test"]
     }
+    config_path = run / "config.json"
+    previous = json.loads(config_path.read_text()) if config_path.exists() else None
+    lr_decay_steps = (
+        previous["lr_decay_steps"] if previous else min(config["steps"], LR_DECAY_STEPS)
+    )
+    step = 0
+    best = -1.0
+    training_state = None
+    if resume:
+        state = load_checkpoint(model, run / "last.pt", optimizer)
+        step = state["step"]
+        best = state["dev_macro_accuracy"]
+        training_state = state.get("training_state")
+    objective = build_objective(config, model=model, training_state=training_state, resuming=resume)
     frozen = {
         **config,
         "source_hashes": source_hashes,
-        "rlcd": asdict(policy),
+        "objective": objective.describe(),
         "sampling": "uniform dataset, replacement, seed+microbatch index; choice permutation only",
         "dev_selection": "fixed SHA-256 subset per dataset; unweighted dataset macro top-1 accuracy",
+        "lr_decay_steps": lr_decay_steps,
     }
     if parent is not None:
         frozen["initialized_from"] = parent
     if model.adapter.name != "qwen3.5":
         frozen["adapter"] = model.adapter.name
         frozen["base_model"] = model.adapter.base_model
-    config_path = run / "config.json"
-    previous = json.loads(config_path.read_text()) if config_path.exists() else None
-    frozen["lr_decay_steps"] = (
-        previous["lr_decay_steps"] if previous else min(config["steps"], LR_DECAY_STEPS)
-    )
     if previous is not None:
         expected = {
             **previous,
-            "lr_decay_steps": frozen["lr_decay_steps"],
+            "lr_decay_steps": lr_decay_steps,
             "steps": config["steps"],
         }
         if not resume or expected != frozen or config["steps"] < previous["steps"]:
@@ -189,12 +216,7 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
     temporary.write_text(json.dumps(frozen, indent=2) + "\n")
     temporary.replace(config_path)
     collator = DecisionCollator(config["model"], adapter=adapter)
-    step = 0
-    best = -1.0
     if resume:
-        state = load_checkpoint(model, run / "last.pt", optimizer)
-        step = state["step"]
-        best = state["dev_macro_accuracy"]
         # Only saved updates belong to the resumed trajectory. A stopped process
         # may have logged later steps before its next checkpoint was committed.
         metrics_path = run / "metrics.jsonl"
@@ -213,7 +235,7 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
                 "kind": "resume",
                 "step": step,
                 "target_step": config["steps"],
-                "lr_decay_steps": frozen["lr_decay_steps"],
+                "lr_decay_steps": lr_decay_steps,
                 "optimizer_lr": [group["lr"] for group in optimizer.param_groups],
                 "checkpoint_sha256": file_hash(run / "last.pt"),
             },
@@ -221,7 +243,10 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
     else:
         if (run / "metrics.jsonl").exists():
             raise ValueError("Existing run requires --resume")
-        emit(run / "metrics.jsonl", environment(model, Path(config["model"])))
+        emit(
+            run / "metrics.jsonl",
+            environment(model, Path(config["model"]), method=config["method"]),
+        )
         (run / "samples.json").write_text(
             json.dumps(
                 {
@@ -239,7 +264,7 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         best = baseline_metrics["macro_accuracy"]
         # Continuing from a good checkpoint may never improve development quality.
         # In that case the untouched parent remains the selected candidate.
-        save_checkpoint(run / "best.pt", model, optimizer, 0, frozen, best)
+        save_checkpoint(run / "best.pt", model, optimizer, 0, frozen, best, objective.state_dict())
     dataset = TrainingBatches(
         groups,
         collator,
@@ -285,25 +310,72 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
             for group in optimizer.param_groups:
                 group["lr"] = group["initial_lr"] * factor
             stats = Counter()
-            finite = torch.ones((), dtype=torch.bool, device="cuda")
             step_start = time.perf_counter()
+            updates = objective.num_iterations
+            prepared = []
             for _micro in range(config["accumulation"]):
                 batch, key, ids = next(iterator)
-                inputs, positions, mask, target, ordinal = batch
-                logits = model(inputs, positions)
-                loss, metrics = rlcd_loss(logits, target, mask=mask, ordinal=ordinal, config=policy)
-                finite &= torch.isfinite(loss.detach())
-                (loss / config["accumulation"]).backward()
-                stats.update({k: v.detach() / config["accumulation"] for k, v in metrics.items()})
-                stats["loss"] += loss.detach() / config["accumulation"]
-                stats["accuracy"] += (
-                    logits.detach().masked_fill(~mask, -torch.inf).argmax(-1) == target.argmax(-1)
-                ).float().mean() / config["accumulation"]
+                inputs, positions, decision_positions, mask, target, ordinal = batch
+                rollout = None
+                reference_logits = None
+                if objective.needs_rollout and updates > 1:
+                    # One rollout frozen per group; every policy update reuses the
+                    # same actions, advantages, and old log-probabilities.
+                    with torch.no_grad():
+                        rollout = objective.prepare(
+                            model(inputs, positions, decision_positions), target, mask
+                        )
+                    reference_logits = objective.reference_logits(
+                        inputs, positions, decision_positions
+                    )
+                prepared.append(
+                    (
+                        inputs,
+                        positions,
+                        decision_positions,
+                        mask,
+                        target,
+                        ordinal,
+                        rollout,
+                        reference_logits,
+                    )
+                )
                 consumed[key] += len(ids)
-            if not finite:
-                raise RuntimeError(f"Non-finite loss at step {step}; optimizer was not advanced")
-            grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
-            optimizer.step()
+            weight = config["accumulation"] * updates
+            for _update in range(updates):
+                optimizer.zero_grad(set_to_none=True)
+                finite = torch.ones((), dtype=torch.bool, device="cuda")
+                for index, item in enumerate(prepared):
+                    inputs, positions, decision_positions, mask, target, ordinal = item[:6]
+                    rollout, reference_logits = item[6], item[7]
+                    logits = model(inputs, positions, decision_positions)
+                    if objective.needs_rollout and rollout is None:
+                        # A single iteration shares its forward with the rollout.
+                        with torch.no_grad():
+                            rollout = objective.prepare(logits, target, mask)
+                        reference_logits = objective.reference_logits(
+                            inputs, positions, decision_positions
+                        )
+                        prepared[index] = (*item[:6], rollout, reference_logits)
+                    loss, metrics = objective.loss(
+                        logits, target, mask, ordinal, rollout, reference_logits
+                    )
+                    finite &= torch.isfinite(loss.detach())
+                    (loss / config["accumulation"]).backward()
+                    stats.update({k: v.detach() / weight for k, v in metrics.items()})
+                    stats["loss"] += loss.detach() / weight
+                    stats["accuracy"] += (
+                        logits.detach().masked_fill(~mask, -torch.inf).argmax(-1)
+                        == target.argmax(-1)
+                    ).float().mean() / weight
+                if not finite:
+                    raise RuntimeError(
+                        f"Non-finite loss at step {step}; optimizer was not advanced"
+                    )
+                grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
+                # Each iteration is a real policy update from the frozen rollout,
+                # which is what lets the clipped ratio bind.
+                optimizer.step()
             step += 1
             if step == 1 or step % config["log_every"] == 0:
                 torch.cuda.synchronize()
@@ -336,10 +408,22 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
                 emit(run / "metrics.jsonl", {"kind": "dev", "step": step, "metrics": metrics})
                 if score > best:
                     best = score
-                    save_checkpoint(run / "best.pt", model, optimizer, step, frozen, best)
-                save_checkpoint(run / "last.pt", model, optimizer, step, frozen, best)
+                    save_checkpoint(
+                        run / "best.pt",
+                        model,
+                        optimizer,
+                        step,
+                        frozen,
+                        best,
+                        objective.state_dict(),
+                    )
+                save_checkpoint(
+                    run / "last.pt", model, optimizer, step, frozen, best, objective.state_dict()
+                )
             elif step % config["save_every"] == 0:
-                save_checkpoint(run / "last.pt", model, optimizer, step, frozen, best)
+                save_checkpoint(
+                    run / "last.pt", model, optimizer, step, frozen, best, objective.state_dict()
+                )
     emit(
         run / "metrics.jsonl",
         {
@@ -354,7 +438,18 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
 
 def final_evaluation(config, run, *, adapter=None):
     frozen = json.loads((run / "config.json").read_text())
-    for key in ["model", "data", "lora_rank", "image_pixels", "max_length", "backend"]:
+    for key in [
+        "model",
+        "data",
+        "method",
+        "stage",
+        "projection_dim",
+        "lora_rank",
+        "lora_alpha",
+        "image_pixels",
+        "max_length",
+        "backend",
+    ]:
         if config.get(key) != frozen.get(key):
             raise ValueError(f"Evaluation recipe differs from the selected run: {key}")
     data = Path(config["data"])
@@ -362,10 +457,15 @@ def final_evaluation(config, run, *, adapter=None):
         if file_hash(data / f"{split}.jsonl") != expected:
             raise ValueError(f"Evaluation data changed since training: {split}")
     torch.set_num_threads(config["cpu_threads"])
-    model = DecisionModel(config["model"], adapter=adapter)
+    model = DecisionModel(config["model"], adapter=adapter, projection_dim=frozen["projection_dim"])
     if model.adapter.name != frozen.get("adapter", "qwen3.5"):
         raise ValueError("Evaluation adapter differs from the trained model")
-    model.enable_lora(checkpointing=False)
+    model.enable_stage(
+        frozen["stage"],
+        lora_rank=frozen["lora_rank"],
+        lora_alpha=frozen["lora_alpha"],
+        checkpointing=False,
+    )
     state = load_checkpoint(model, run / "best.pt")
     # Calibration and final evaluation use exactly the deployed merged model.
     model.merge()
@@ -437,7 +537,7 @@ def export_checkpoint(state, run, output):
     )
     temporary.replace(weights)
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "project": "dohnuts",
         "distribution": "dohnuts",
         "version": __version__,
@@ -446,7 +546,11 @@ def export_checkpoint(state, run, output):
         "base_path": str(base),
         "base_revision": (base / "revision.txt").read_text().strip(),
         "adapter": config.get("adapter", "qwen3.5"),
+        "method": config["method"],
+        "stage": config["stage"],
+        "projection_dim": config["projection_dim"],
         "lora_rank": config["lora_rank"],
+        "lora_alpha": config["lora_alpha"],
         "image_pixels": config["image_pixels"],
         "max_length": config["max_length"],
         "backend": config.get("backend", {}),
@@ -483,9 +587,16 @@ def main():
         seed=config["seed"],
         rlcd=RLCDConfig(**config.get("rlcd", {})),
         steps=config["steps"],
+        method=config.get("method", "rlcd"),
+        stage=config.get("stage", "text"),
+        projection_dim=config.get("projection_dim", 256),
+        lora_rank=config.get("lora_rank", 8),
+        lora_alpha=config.get("lora_alpha", 16),
+        sft=config.get("sft"),
+        grpo=config.get("grpo"),
     )
     if config != expected:
-        raise ValueError("Training uses the fixed recipe, RLCD controls, and step budget")
+        raise ValueError("Training uses the fixed recipe, objective controls, and step budget")
     if args.action == "train":
         train(config, args.run, resume=args.resume, initialize_from=args.initialize_from)
     else:

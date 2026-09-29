@@ -17,30 +17,46 @@ parallel. Frozen image features are encoded on a cache miss and shared. More
 questions still require more suffix compute.
 
 Each sequence contains the state, question, candidate descriptions, and a
-reserved marker after each candidate. A shared scalar head scores the marker's
-hidden state. A per-question softmax gives the decision distribution. Nominal
-candidate order is shuffled during training; binary and ordinal order are fixed.
-Candidate-order sensitivity is measured on held-out data.
+reserved marker after each candidate. Two projections score every candidate
+against a separate decision vector: the marker hidden state through
+`W_candidate`, the token that ends the question stem through `W_decision`, and
+`dot(W_candidate h_candidate, W_decision h_decision) / sqrt(P)` is the logit.
+The parameter count is independent of the candidate count, and the readout stays
+in FP32 under a BF16 backbone. The decision vector sits before the first
+candidate, so it never reads a candidate description. A per-question softmax
+gives the decision distribution. Nominal candidate order is shuffled during
+training; binary and ordinal order are fixed. Candidate-order sensitivity is
+measured on held-out data.
 
 ## Fixed recipe
 
-The Qwen3.5 adapter freezes the base and vision encoder and trains rank-8
-language LoRA plus the scorer. The training recipe fixes precision, image and
-sequence budgets, optimizer, learning rates, sampling, checkpoint
-selection, and calibration. `recipe.py` is the executable specification.
-Run metadata records all values and data hashes, including values that callers
-cannot change.
+Training opens parameters in four stages. `warmup` trains the decision head
+alone; `text` adds rank-8 language LoRA over every language `nn.Linear`; `joint`
+also opens the vision merger; `vision_top` also opens the top four vision
+blocks. While the vision tower is open its features are recomputed with
+gradients rather than read from the frozen-image cache. Each open group has its
+own learning rate: head, LoRA, merger, and vision.
 
-`RLCDConfig(sigma=0.3, ce_weight=1.0)` is the complete RLCD configuration surface.
-`sigma` controls exploration in logit space; `ce_weight` controls the joint
-cross-entropy term. Four samples, the proper-scoring reward, ordinal distance
-penalty, baseline estimator, and numerical safeguards are fixed. `--steps`
-controls the total update budget.
+The training recipe fixes precision, image and sequence budgets, optimizer,
+learning rates, sampling, checkpoint selection, and calibration. `recipe.py` is
+the executable specification. Run metadata records all values and data hashes,
+including values that callers cannot change.
 
-The release path merges LoRA before calibration and final evaluation. Loading
-the compact checkpoint reconstructs that same merged model from the pinned
-base. The caller does not choose merge state, precision, attention backend,
-LoRA rank, or calibration mode.
+`method` selects one of three objectives over the same candidate logits. `rlcd`
+(the default) is the Laya-aligned estimator, where
+`RLCDConfig(sigma=0.3, ce_weight=1.0)` is the complete configuration surface:
+`sigma` controls exploration in logit space and `ce_weight` weights the joint
+cross-entropy term. `sft` is distribution cross-entropy with optional RPS and
+Brier terms, both zero by default. `grpo` samples candidates per question,
+normalizes rewards within the sampled group, and combines a clipped ratio, an
+exact categorical KL to a fixed reference, and a Brier term. See
+[RLCD and the other objectives](rlcd.md). `--steps` controls the total update
+budget.
+
+The release path merges LoRA before calibration and final evaluation, and a
+`warmup` run has no LoRA to merge. Loading the compact checkpoint reconstructs
+that same merged model from the pinned base. The caller does not choose merge
+state, precision, attention backend, or calibration mode.
 
 ## Model adapters
 
@@ -52,8 +68,8 @@ its identity against the saved artifact.
 | Adapter responsibility | Contract |
 | --- | --- |
 | `name`, `base_model`, `marker`, `image_prefix` | Stable identity, one reserved candidate token, image prompt syntax |
-| `processor`, `load`, `hidden_size` | Load the pinned processor/backbone and size the shared scorer |
-| `adapt_language`, `merge`, `freeze_vision` | Apply the training and deployment lifecycle |
+| `processor`, `load`, `hidden_size` | Load the pinned processor/backbone and size the two projections |
+| `apply_stage`, `merge`, `freeze_vision` | Apply the training and deployment lifecycle |
 | `batch_inputs`, `shared_image_inputs` | Preserve all candidates and process shared images once |
 | `forward` | Return candidate-addressable hidden states and the shared-prefix position offset |
 
@@ -74,7 +90,9 @@ workflow runs this acceptance on its exported weights.
 
 The CPU tests in `tests/test_*.py` cover reported metric meanings, temperature
 calibration, the pinned RLCD objective and gradients, and the regression where
-identical screenshots crossed splits under different source IDs. Run them when
+identical screenshots crossed splits under different source IDs. They also pin
+the two-projection head numerics, the decision readout position, the
+stage-owned parameter sets, and the SFT and GRPO closed forms. Run them when
 changing the corresponding behavior:
 
 ```bash
