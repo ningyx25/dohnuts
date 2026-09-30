@@ -1,7 +1,10 @@
 # Android Control 元素决策数据的构建设计(episode 目录 → Dohnuts direct decisions)
 
 日期:2026-09-28
-状态:已实现(转换管线、文档、端到端冒烟与全语料转换)
+状态:**AC 侧已被 2026-09-30 对齐方案取代**(见
+`2026-09-30-android-control-mobile-jev-alignment-design.md`);本文档保留为历史记录,
+其中 action/complete/element/swipe_dir/button 五族与 `UI element {i}:` 候选格式不再产出。
+gui-v1 相关的结论仍然有效。
 范围:一个确定性转换管线,把 Android Control 的 episode 目录
 (`metadata_{episode_id}.json` + 每步截图 + `step_NNN_a11y.json`)转成 Dohnuts
 决策行:5 个问题族、行级 split、排除审计、元素候选与标号截图,可直接喂给现有

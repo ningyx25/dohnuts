@@ -1,13 +1,13 @@
 """Set-of-mark rendering of a screenshot's candidate UI elements.
 
-An element row asks the model to pick the next UI element and names its
-candidates `r0..r{N-1}` in `question.criteria`, so the screenshot the row ships
-has to carry those same numbers on screen. This module owns that one drawing
-step: a green box per candidate plus a white chip holding its number. It is a
-PIL port of the look of the dataset's own `add_ui_element_mark`, which needs cv2
-and a protobuf accessibility forest; here the input is the plain element dicts
-`dohnuts.android_control_data.extract_elements` returns and a `PIL.Image`, so no
-image library leaks into the row rules.
+A `tap_target` row asks the model to pick an element and names its candidates
+`1..N` in `question.criteria` -- the numbers the agent's own element indices use
+-- so the screenshot the row ships has to carry those same numbers on screen.
+This module owns that one drawing step: a green box per candidate plus a white
+chip holding its number. It is a PIL port of the look of the dataset's own
+`add_ui_element_mark`, which needs cv2 and a protobuf accessibility forest; here
+the input is a list of `(label, element)` pairs and a `PIL.Image`, so no image
+library leaks into the row rules.
 
 Marking is a pure function of `(image, elements)`: no randomness, no clock, no
 environment reads, and the same pixels always encode to the same PNG bytes,
@@ -58,24 +58,22 @@ def label_font(image: Image.Image) -> ImageFont.FreeTypeFont | ImageFont.ImageFo
         ) from error
 
 
-def mark_screenshot(image: Image.Image, elements: list[dict]) -> Image.Image:
-    """Return a NEW RGB copy of `image` with every candidate element boxed and numbered.
+def mark_screenshot(image: Image.Image, candidates: list[tuple[str, object]]) -> Image.Image:
+    """Return a NEW RGB copy of `image` with every candidate boxed and numbered.
 
-    The copy is what lets callers keep using the screenshot they passed in; a
-    non-RGB input is converted first. Only the pixels of the input matter:
-    anything the source carried in `Image.info` — an ICC profile, a DPI, a
-    timestamp — is dropped, because the PNG encoder would otherwise write it
-    out and two screenshots with equal pixels would hash differently. That
+    `candidates` is a list of `(label, element)` pairs, drawn in order; the label
+    is the chip text, so the caller decides the numbering and it is the very key
+    its criteria use. The copy is what lets callers keep using the screenshot
+    they passed in; a non-RGB input is converted first. Only the pixels of the
+    input matter: anything the source carried in `Image.info` — an ICC profile, a
+    DPI, a timestamp — is dropped, because the PNG encoder would otherwise write
+    it out and two screenshots with equal pixels would hash differently. That
     changes the bytes of every mark produced before it, so it belongs before the
     first conversion writes a file; names derived from marked bytes must never
-    mix the two behaviours. Elements are drawn in list order and numbered by
-    their position in it, which is the numbering the `r{position}` criteria keys
-    use: an element's own `index` field is ignored, so a list that was filtered
-    or reordered still gets the numbers the row names. Elements whose `bounds`
-    are missing or malformed are skipped and keep their slot, so that alignment
-    holds even for a partial list. Nothing is drawn outside the image: PIL clips
-    whatever runs past an edge, which is exactly the behaviour wanted for a box
-    that touches one.
+    mix the two behaviours. Elements whose `bounds` are missing or malformed are
+    skipped, so a partial list still marks exactly the elements it names. Nothing
+    is drawn outside the image: PIL clips whatever runs past an edge, which is
+    exactly the behaviour wanted for a box that touches one.
     """
     marked = image.convert("RGB")
     # `convert` copies `image.info` onto the copy and `save` writes what it finds
@@ -83,7 +81,7 @@ def mark_screenshot(image: Image.Image, elements: list[dict]) -> Image.Image:
     marked.info.clear()
     draw = ImageDraw.Draw(marked)
     font = label_font(marked)
-    for position, element in enumerate(elements):
+    for label, element in candidates:
         bounds = element_bounds(element)
         if bounds is None:
             continue
@@ -94,7 +92,6 @@ def mark_screenshot(image: Image.Image, elements: list[dict]) -> Image.Image:
         # `textbbox` reports its far corner one pixel past the last glyph pixel
         # while `rectangle` takes the corners themselves, hence the step back.
         # The chip is filled before the label so it never covers the glyphs.
-        label = str(position)
         text_at = (x_min + CHIP_PADDING, y_min + CHIP_PADDING)
         left, top, right, bottom = draw.textbbox(text_at, label, font=font)
         chip = (

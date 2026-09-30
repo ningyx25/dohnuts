@@ -63,6 +63,11 @@ def options_for(question):
 def render_question(state_text, question, *, has_image=False, adapter=None):
     """One prompt template shared by training, evaluation, and serving.
 
+    Instructions may be a string or, as the mobile-jev rows have it, an object;
+    `render` keeps a string as it is and serialises anything else the way the
+    state is serialised, so a `{'goal', 'rules'}` pair reaches the prompt as the
+    JSON the agent would have sent.
+
     Also returns the character offset at which the question stem ends. That
     boundary locates the decision readout: the last token starting before it
     cannot describe any candidate option.
@@ -72,7 +77,7 @@ def render_question(state_text, question, *, has_image=False, adapter=None):
     labels, options = options_for(question)
     stem = (
         f"State: {state_text}\n{question['type']} question: "
-        f"{question.get('instructions', '')}\nOptions:\n"
+        f"{render(question.get('instructions', ''))}\nOptions:\n"
     )
     if marker in stem or any(marker in option for option in options):
         raise ValueError("Input contains the reserved candidate marker")

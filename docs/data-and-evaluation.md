@@ -253,27 +253,34 @@ pdm run python scripts/prepare_gui_data.py \
 
 `scripts/prepare_android_control_data.py` converts
 [Android Control](https://console.cloud.google.com/storage/browser/gresearch/android_control)
-episodes into decision rows; it is the sibling of the GUI converter above. An
-episode is one directory: `metadata_{episode_id}.json` lists its steps, and every
-step points at a screenshot plus a `step_NNN_a11y.json` accessibility forest.
-Episodes are discovered by an all-digit directory name in numeric order, so
-anything else under `--input` is ignored. The converter reuses the gui-v1 split
-seed, vocabularies, isolation and self-check,
-and adds one question family that needs the element tree: which element to act
-on. The parsed corpus holds 15,283 episodes and 99,131 steps, 83,848 of them with
-an action; output goes under the gitignored `data/processed/` (the `ac-v1`
-convention).
+episodes into decision rows whose prompt is the one android_world's
+`ClientMobileJev` builds for the same screen and goal; the design, the parity
+test and the measured coverage are in
+`docs/superpowers/specs/2026-09-30-android-control-mobile-jev-alignment-design.md`.
+An episode is one directory: `metadata_{episode_id}.json` lists its steps, and
+every step points at a screenshot plus a `step_NNN_a11y.json` accessibility
+forest. Episodes are discovered by an all-digit directory name in numeric order,
+so anything else under `--input` is ignored. The converter reuses the gui-v1 split
+seed, isolation and self-check. The parsed corpus holds 15,283 episodes and
+99,131 steps, 83,848 of them with an action; output goes under the gitignored
+`data/processed/` (the `ac-jev-v1` convention).
 
-Each step yields two or three rows that share state, group and image aliases, one
-question per row:
+Rows are one question each, and the questions are the agent's own:
 
 | Question | Dataset | Type | Candidates | Target | Rows |
 | --- | --- | --- | --- | --- | --- |
-| `action` | `gui_action` | choice | the nine actions (gui-v1's eight plus `open_app` at index 8) | the step's action | every step |
-| `complete` | `gui_complete` | noul | false, true | whether the episode ends here | every step |
-| `element` | `screenshot_choice` | choice | the step's clickable elements | the element under the action's point | click, long_press |
-| `swipe_dir` | `gui_swipe` | choice | up, down, left, right | the finger's direction | scroll |
-| `button` | `gui_button` | choice | Back, Home, Menu, Enter | Back or Home | navigate_back, navigate_home |
+| `operation` | `jev_operation` | choice | the operations the screen offers, in the agent's fixed order | the step's operation | every step |
+| `tap_target` | `jev_tap_target` | choice | the TAP candidates, as `[i] label` | the element under the action's point | click, long_press |
+| `text_value` | `jev_text_value` | choice | the goal's 1..8 word spans, plus `NONE` | the typed span | input_text |
+| `app_target` | `jev_app_target` | choice | the offered app inventory | the app the corpus opened | open_app |
+
+`scroll_target` is deliberately absent: Android Control records a scroll
+direction but no coordinates, so which region moved is unknowable. The state and
+the questions are produced by `dohnuts.mobile_jev_prompt`, a verbatim port of the
+agent's policy, so a row's prompt is what the agent would have posted —
+including the 771-character `RULES`, the `{'goal', 'rules'}` instruction object,
+the nine state keys and the shared 1-based element numbering (TAP targets first,
+then scroll-only regions).
 
 Row ids are `android_control_{episode}_step{n}:{family}`, with `n` the step's
 0-based position in the episode, and the group is
@@ -281,215 +288,150 @@ Row ids are `android_control_{episode}_step{n}:{family}`, with `n` the step's
 are the shared `int(sha256("doh-gui-split-2026:" + group)[:8], 16) % 100`
 (calibration < 10, dev < 20, test < 30, train otherwise), and the shared split
 priority `train < calibration < dev < test` is resolved per record on screenshot
-bytes: a click step's rows carry two `image-bytes:` aliases (the raw screenshot
-and the marked copy), the other rows carry the raw one, and byte-identical
-screenshots never straddle splits, so a repeated initial screen costs only the
-rows that repeat it.
+bytes: a tap_target step's rows carry both `image-bytes:` aliases (the raw frame
+and its mark), and byte-identical screenshots never straddle splits.
 
-**Action mapping.** Android Control actions map onto the mobile_use vocabulary:
+**Operation mapping.** Android Control actions map onto the agent's operations:
 
-| Android Control action | mobile_use action | Extra row |
+| Android Control action | Operation | Target row |
 | --- | --- | --- |
-| click(x, y), long_press(x, y) | click, long_press; the pixel point stays in `reference` | element |
-| scroll(direction) | swipe, direction inverted | swipe_dir |
-| input_text(text) | type; the text stays in `reference` | — |
-| wait | wait | — |
-| open_app(app_name) | open_app (index 8) | — |
-| navigate_back, navigate_home | system_button (Back, Home) | button |
-| null action (the last step) | terminate | complete target is `true` |
+| click(x, y), long_press(x, y) | TAP | tap_target |
+| scroll(direction) | SCROLL_{DIRECTION} | — |
+| input_text(text) | TYPE_TEXT | text_value |
+| open_app(app_name) | OPEN_APP | app_target |
+| navigate_back, navigate_home | BACK, HOME | — |
+| wait | WAIT | — |
+| null action (the last step) | DONE | — |
 
-- `open_app` is appended after the eight gui-v1 actions as index 8, so indices
-  0–7 keep their gui-v1 meaning; its criterion is "open an app by name". The
-  vocabulary keeps all nine classes, so `answer` stays a criterion even though no
-  Android Control action maps to it.
-- Scroll directions are inverted deliberately. Android Control's `direction` is
-  content-ward — `scroll down` reveals content below the fold, so the finger
-  moves up — while gui-v1 derives `swipe_dir` from the finger's displacement.
-  Inverting keeps `up`/`down` meaning the same finger motion in both datasets,
-  and lives in one constant. Cross-correlating the screenshots before and after
-  138 real vertical scroll steps puts content moving up in 28 coherent cases
-  against 10 moving down for `scroll: down`, and the dataset's own step
-  instructions agree ("Swipe up for Product details" on `scroll: down` steps,
-  "Swipe down" on `scroll: up` steps).
+- The scroll mapping is the **identity**, not the inversion gui-v1 uses: Android
+  Control's `direction` is content-ward — `scroll down` reveals content below the
+  fold, so the finger moves up — and the agent's `SCROLL_DOWN` is that same
+  gesture. `SCROLL_TO_SWIPE_DIRECTION` still flips AC onto gui-v1's finger
+  vocabulary inside `reference.tool_call`, and the two mappings must not be
+  confused.
+- A step is excluded whole when the screen does not offer its operation
+  (`operation_not_offered`), so the operation row is always answerable.
+- The last step of every episode carries a null action and becomes DONE. Episodes
+  are treated as successful demonstrations; the parsed corpus no longer carries
+  the source `goal_status` field that would confirm it.
 - `reference` also carries `ac_action` (the raw source action, or null on the
-  terminal step) and `element_positions` (every candidate the action point
-  touched, ascending, or `[]` outside the element family); neither enters model
-  input.
-- The last step of every episode carries a null action and becomes `terminate`
-  with `complete = true`. Episodes are treated as successful demonstrations; the
-  parsed corpus no longer carries the source `goal_status` field that would
-  confirm it.
+  terminal step) and `element_positions` (every TAP candidate the action point
+  touched, ascending, or `[]` outside that family); neither enters model input.
 
-**Element questions.** Candidates are the nodes that are clickable and visible
-with a non-degenerate box on screen, in window order then node order. They are
-numbered contiguously `r0..r{N-1}`: a node that is not clickable, or has an
-unusable box, consumes no number, and nothing is deduplicated, so clickable
-containers with children stay candidates and the keys cannot be read off the raw
-node list. The ground truth is a distribution over the candidates whose box
-contains the action's pixel point: every hit weighs `1 / box area`, normalized
-over the hits, so the smaller — more specific — box of a nested pair carries the
-larger share and a single hit is a one-hot. The element row is a soft label, and
-the training loss already accepts one because it only one-hots a length-`n`
-target (`rlcd.py`). A point that hits no candidate excludes the step
-(`no_target_element`) instead of guessing, and the sizes a step was resolved
-from, where they matter, are `reference.element_positions`. Fewer than 2 or more
-than 128 candidates also exclude the step
-(`too_few_candidates`, `too_many_candidates`). A criterion is
-`"UI element {i}: {payload}"`, where the payload is JSON holding only a
-non-empty `text` and/or `content_description`, in that key order, and `{}` when
-the node has neither; node flags, class names and indices never reach the prompt.
-The instruction is "Which action should be taken next to complete the user's
-task?", taken verbatim from the hand-built element row in
-`example-data/train.jsonl`.
+**Element questions.** TAP candidates are the visible nodes with a usable box
+that are enabled and either clickable or editable, in window order then node
+order, with the agent's shared numbering: tap targets are numbered `1..N` first
+and scroll-only regions continue after them, so a node with no interactive flag
+never consumes a number and nothing is deduplicated. The ground truth is a
+distribution over the candidates whose box contains the action's point: every hit
+weighs `1 / box area`, normalized over the hits, so the smaller — more specific —
+box of a nested pair carries the larger share and a single hit is a one-hot. The
+row is therefore a soft label, and the training loss already accepts one. A point
+that hits no candidate drops the row (`no_target_element`) instead of guessing,
+and `reference.element_positions` lists every hit. Fewer than 2 or more than 128
+candidates also drop the row (`too_few_candidates`, `too_many_candidates`) — the
+agent allows 255 options, a Dohnuts row does not.
 
-**Reading element metrics.** A soft target changes what the per-row numbers
-mean, so the element family is reported with two accuracies. `metrics.summarize`
-takes `label = target.argmax()` and `pred = p.argmax()`, so `accuracy` is
-"the model picked the **dominant** hit" — the largest-weight candidate, and on
-equal weights the earliest one, exactly as `np.argmax` breaks the tie — while
-`soft_accuracy` is `target[pred]`, the mass the model's pick carries, so it
-credits **any** positive-weight hit and a uniform multi-hit row gives 1/`n` to
-even a wrong pick. `macro_f1` is over label indices as before. `nll` and both
-`brier` values read the whole distribution rather than the argmax, so they need
-no reinterpretation. `reference.element_positions` lists every hit, which is
-what a per-row error analysis needs to tell "picked the wrong box" from "picked
-the other box the tap point was in".
+**Text and app questions.** `text_value` offers the goal's 1..8 word n-grams plus
+`NONE`, exactly what the agent offers, and a typed value that is not one of them
+drops the row (`text_not_a_goal_span`); the corpus's typed text is a goal span
+only about half the time. `app_target` offers the app inventory the first pass
+collected from the corpus's own `open_app` names (the device's installed apps are
+not recorded), narrowed per goal by the agent's whole-word rule and capped at
+200; a narrowing that leaves one option drops the row.
 
-**Marked screenshots.** The element row ships a set-of-mark rendering: every
-candidate is boxed in green and numbered with a white chip in the same order as
-the criteria, nothing else is drawn, and the ground truth is not highlighted. The
-label size scales with the image height. The PNG drops the source image's
-metadata, so its bytes are a pure function of the pixels, the candidate list, and
-the Pillow version — content-addressed file names are only reproducible for a
-fixed Pillow, which is why each manifest records `environment.python` and
-`environment.pillow`. The element row points at the marked copy, every other row
-of the step points at the raw copy, and all of them carry both aliases.
+**State.** `goal` is the episode goal verbatim; `app` is the foreground package
+inferred from the accessibility windows (the largest `TYPE_APPLICATION` window,
+keyboard excluded); `visibleText` is every kept element's text and description;
+`elements` is the agent's entry list (`index`, `label`, `editable`, `scrollable`,
+`operations`, plus `checked`/`selected` where they apply); `availableApps` mirrors
+the app question; `recentActions` is the last eight executed decisions with the
+agent's own labels and a `screenChanged` flag computed by comparing consecutive
+screens' fingerprints. `task_progress` is gone: the agent's state has no such
+key.
 
-**State.** `user_query` is the episode goal verbatim. `task_progress` is a
-deterministic template over the completed steps' instructions —
-`"(You have done the following operation on the current device): Step 1: …; Step
-2: …; ."` — and never the current step's instruction; the numbering closes over
-the instructions that exist. The dataset's own narration was human-written and is
-not reproducible, so this wording differs from it by design.
-
-**Token budget.** The budget is checked when `--model` names a local snapshot
-(skip with `--no-token-check`), before anything is written. The estimate mirrors
-the training collator: rendered text tokens plus the expanded image placeholders
-at `IMAGE_PIXELS`, against `MAX_LENGTH = 2048`. A step over budget is excluded
-whole as `token_budget`, with the longest of its rows in `detail`, so a step is
-never partially converted. The check is load-bearing: `DecisionCollator` raises
-on an over-budget batch instead of truncating. Measured on the parsed corpus, 520
-of 49,924 element rows (1.04%) exceed the budget; the worst is 38,642 tokens
-(18.9 times the limit) because one accessibility node's `text` was an entire PDF.
-The median row is 624 tokens and p99 is 2,070. Probing the whole corpus (99,131
-steps) costs about six minutes, and the full run excluded 535 steps as
-`token_budget`, in line with the probe's ~520 rows.
+**Token budget.** The conversion no longer checks one. `MAX_LENGTH = 2048` was
+defined before the aligned prompts existed, and a row is now measured rather than
+excluded: `scripts/report_token_lengths.py` renders every row through the same
+prompt template the collator uses and writes `token_lengths.jsonl` (one line per
+row) plus `token_stats.json` (min/p50/p90/p99/max and `over_max_length` per
+dataset and split). The budget is redefined from those numbers; until it is,
+`DecisionCollator` still refuses an over-`MAX_LENGTH` batch.
 
 **Exclusions and audit.** The parse stage drops whole steps
 (`unparsable_metadata`, `missing_image`, `missing_a11y`, `unknown_action`,
-`too_few_candidates`, `too_many_candidates`, `no_target_element`, `token_budget`,
-`unexpected`); `unparsable_metadata` also covers an episode whose directory id
-and record id disagree, and its `detail` names the first field or step that fails
-the schema (`step 1: missing key 'action'`). The isolate stage drops rows
-(`cross_split_group`, `duplicate_input`). Both land in `excluded.jsonl` with
-`{id, reason, detail, stage}` and in the manifest's `exclusions` counts.
-Parse-stage entries carry the step id or the episode directory name; isolate-stage
-entries carry the row id with its family suffix. Over the full 15,283-episode
-corpus this dropped 1,288 steps as `no_target_element`, 496 as
-`too_few_candidates`, 6 as `too_many_candidates`, 535 as `token_budget`, and 668
-rows as `cross_split_group` (train-heavy, as the per-record rule implies);
-`duplicate_input` and `unexpected` were empty. `missing_image` is decided by a
-full decode of the screenshot, not by its container: a PNG whose CRCs are
-consistent over a stream the decoder rejects fails on its own step, where it
-costs one step, instead of surfacing at the end-of-run self-check, where it used
-to abort the whole batch and write no splits at all. The self-check that closes
-a run walks containers rather than pixels (`gui_data.validate_rows` calls
-`Image.open` and `verify`, a real chunk-and-CRC walk for the PNGs stored here),
-which is sound only because of that parse-time decode: what the self-check sees
-is either a byte-for-byte copy of a source that already decoded, re-copied
-whenever its digest stops matching its name, or bytes this process encoded from
-an image it had just decoded.
+`payload_too_large`, `operation_not_offered`, `unexpected`), and drops single rows
+for their own question (`no_target_element`, `too_few_candidates`,
+`too_many_candidates`, `text_not_a_goal_span`, `app_not_offered`). The isolate
+stage drops rows (`cross_split_group`, `duplicate_input`). All of them land in
+`excluded.jsonl` with `{id, reason, detail, stage}`, where a dropped family
+carries `stage: "family"` and the row id it would have had, and in the manifest's
+`exclusions` counts. `unparsable_metadata` also covers an episode whose directory
+id and record id disagree, and its `detail` names the first field or step that
+fails the schema (`step 1: missing key 'action'`). `missing_image` is decided by
+a full decode of the screenshot, not by its container: a PNG whose CRCs are
+consistent over a stream the decoder rejects fails on its own step instead of
+surfacing at the end-of-run self-check, where it used to abort the whole batch.
 
-**Manifest.** `element_stats` and `element_resolution` both describe the element
-family and both carry a `basis` field, but they answer different questions and
-have different shapes. `element_stats` (`basis: post_isolation`) is a per-split
-map of the element rows that were actually written, with candidate min/mean/max,
-`soft_targets` (element rows whose target has more than one positive weight),
-`multi_hit_rate` (`soft_targets / rows`), `max_hits` (the largest hit count any
-one row of the split carries), and `empty_target_payload_rate` (rows where **no**
-hit candidate carries a payload, so the prompt names no correct answer at all);
-splits without element rows are absent from it.
-`element_resolution` (`basis: pre_isolation`) is a single corpus-wide record of
-the steps whose element question resolved within budget before isolation, with
-`element_rows`, the three refusal counts and `hit_rate` — a step that resolved
-but was then dropped by the token budget counts in neither `element_rows` nor the
-refusals.
+**Manifest.** `family_stats` is a per-split, per-dataset map of row counts,
+candidate min/mean/max, `soft_targets` (rows with more than one positive weight —
+only the element family can have them) and `max_positive_weights`.
+`family_coverage` is corpus-wide and names its `basis`: `steps_asking` counts the
+parsed steps whose operation belongs to that question, `rows` counts what the run
+minted before isolation, and `dropped` attributes each reason to the family that
+asked. `app_inventory` records the inventory size, its 200 cap and where it came
+from. `vocabularies` carries the ported prompt itself — `rules`,
+`operation_descriptions`, `target_question_template`, `text_value_none`,
+`text_value_instructions`, `state_keys`, `question_ids`, `limits` — plus
+`prompt_rule`, `target_rule`, `marked_images` and `deviations`, so a consumer can
+read what a row means without the source. `source.metadata_sha256` hashes only the
+readable metadata files and `metadata_files_hashed` says how many those were.
+`images` lists the PNGs this run wrote under `<output>/images/` (raw and marked,
+content-addressed). The manifest goes to stdout; the inventory line, the
+empty-split warning and the periodic progress lines go to stderr.
 
-`source.metadata_sha256` hashes only the readable metadata files, and
-`metadata_files_hashed` says how many those were. `images` lists the PNG files
-this run wrote under `<output>/images/` (raw and marked, content-addressed). Rows
-are minted before any file is written, so a step that fails before its stores
-writes nothing and the list never names an unreferenced file; a failure between
-the raw and the marked store leaves the raw PNG on disk *and* in `images` while
-its rows are dropped, and a rerun with a different `--input` into the same
-`--output` never cleans the directory, so the list describes this run only. On
-the full corpus the list holds 145,427 names and rows reference 145,399 of them:
-the 28-name gap is exactly that case, screenshots of steps whose rows were later
-dropped by isolation. What
-a rerun does clean is the temporary files of an interrupted run — `convert`
-unlinks `.<name>.<pid>.<n>.tmp` under `images/` before it starts, the only files
-a SIGKILL can strand there — so the directory-equals-manifest property holds
-again for an operator re-running into the same `--output`.
-`vocabularies` carries the nine actions, buttons, swipe directions,
-instructions, complete criteria, and two plain-language entries — `element_rule`
-and `marked_images` — that state the candidate and marking rules without the
-source. `dataset_weighting` records that the five dataset names are drawn
-uniformly, so `gui_button` and `gui_swipe` rows, which exist only on the steps
-that press a button or scroll, are relatively upweighted. The manifest goes to
-stdout; the empty-split warning and the periodic progress lines go to stderr.
+**Marked screenshots.** A tap_target row ships a set-of-mark rendering: every TAP
+candidate is boxed in green and labelled with the criteria key it is offered
+under, nothing else is drawn, and the ground truth is not highlighted. The label
+size scales with the image height, and a candidate with an unusable box is
+skipped rather than renumbering the rest. The PNG drops the source image's
+metadata, so its bytes are a pure function of the pixels, the candidate list and
+the Pillow version — which is why each manifest records `environment.python` and
+`environment.pillow`.
 
-**Metrics.** `screenshot_choice` is in `metrics.py`'s macro-F1 suppression set,
-because its candidate labels are per-row (every row's `r0..r{N-1}` comes from its
-own screen) and macro-F1 over cross-row label indices would be meaningless.
-Per-row accuracy, `macro_accuracy` and checkpoint selection still include it.
+**Metrics.** The four `jev_*` datasets are in `metrics.py`'s macro-F1 suppression
+set: the operation question offers a per-screen subset of a fixed vocabulary and
+the target questions have per-screen candidate lists, so index macro-F1 would
+compare unrelated labels across rows. Per-row accuracy, `macro_accuracy` and
+checkpoint selection still include them.
 
 **Separate output directory.** AC rows are written to their own directory
-(`data/processed/ac-v1`) rather than into `gui-v1`, because `gui_action` here has
-nine classes where gui-v1 has eight. Under one dataset name the by-dataset
-aggregates would mix two label semantics, and both the temperature fit and the
-collator pad to the widest target of a batch or decision type, so the two
-vocabularies stay in separate trees. Indices 0–7 still mean the same action in
-both pipelines.
+(`data/processed/ac-jev-v1`) rather than into `gui-v1`, because the two pipelines
+share no question and no state shape.
 
 **Known limits.** The terminal-step mapping assumes every episode is a successful
-demonstration. `task_progress` is mechanically templated. Ground-truth element
-payloads are frequently `{}` because many clickable nodes are unlabeled
-containers: an independent corpus-wide probe found 21,507 of 49,924 resolvable
-targets unlabeled (43.1%), a 150-episode sample put the per-split rate at 44–49%,
-and small samples vary widely (60% over the 21-episode run). Those three numbers
-were measured under the pre-soft-target definition — one target per row, the
-single hit the old smallest-area rule chose. A row is now counted as an empty
-target only when **no** candidate the tap point touched carries a payload, and
-the full run measured 0.403–0.426 per split, slightly below the pre-change rates
-as expected. `element_stats.empty_target_payload_rate` is the authoritative
-per-run number, and `soft_targets`/`multi_hit_rate`/`max_hits` say how much of
-that run's family was soft: 15,079 of the corpus's 49,652 element rows (30.4%)
-carry more than one hit, with `max_hits` up to 14. The ground-truth element is inferred from the
-recorded point rather than given, so a point that lands in several boxes is
-answered with a distribution over all of them, weighted by inverse area — a
-soft label the loss accepts, which is also the honest answer when two nested
-boxes are both plausible targets. Marked bytes depend on
-the Pillow version. The label numbering differs from the hand-built smoke row in
-`example-data/train.jsonl`, which numbers dataset indices with gaps instead of
-contiguous clickable-only candidates. As in the GUI converter, symbol links
-inside the input root can still resolve outside it.
+demonstration. The foreground package is inferred, not recorded. The ground-truth
+element is inferred from the recorded point rather than given, so a point that
+lands in several boxes is answered with a distribution over all of them — a soft
+label the loss accepts, and the honest answer when two nested boxes are both
+plausible. A history entry's scroll region is the lowest-indexed scroll candidate
+of that screen. Marked bytes depend on the Pillow version. Rows carry screenshots
+even though the agent is text-only, and a row allows 2..128 options where the
+agent allows 255, which costs roughly half the `app_target` rows and a third of
+the `text_value` rows on a 60-episode smoke run (the full-run numbers are in the
+manifest). As in the GUI converter, symbolic links inside the input root can
+still resolve outside it.
 
 ```bash
 # Run from the repository root. --input is the directory of {episode_id} episode
-# directories; --model points at a local snapshot, or the token check is skipped.
-# --workers converts that many episodes at a time (forked processes); results
-# are merged in episode order, so the splits are byte-identical to a serial run.
-pdm run python scripts/prepare_android_control_data.py \
+# directories. --workers converts that many episodes at a time (forked
+# processes); results are merged in episode order, so the splits are byte
+# identical to a serial run.
+python scripts/prepare_android_control_data.py \
   --input example-data/android_control_parsered/parsered \
-  --output data/processed/ac-v1 --model Qwen/Qwen3.5-0.8B --workers 8
+  --output data/processed/ac-jev-v1 --workers 32
+
+# Measure the token length of every row afterwards; nothing was excluded for it.
+python scripts/report_token_lengths.py \
+  --input data/processed/ac-jev-v1 --model Qwen/Qwen3.5-4B-Base --workers 32
 ```

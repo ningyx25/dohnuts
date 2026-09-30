@@ -74,6 +74,15 @@ def by_dataset(records, temperatures=None):
             "screenqa_choice",
             "clevr_attribute",
             "screenshot_choice",
+            # The mobile-jev families offer a per-screen subset of a fixed
+            # vocabulary, or per-screen candidate lists, so index i does not mean
+            # the same thing twice: an operation row on a screen with no scroll
+            # region has twelve options where another has thirteen.
+            "jev_operation",
+            "jev_tap_target",
+            "jev_scroll_target",
+            "jev_text_value",
+            "jev_app_target",
         }:
             metrics.pop("macro_f1", None)
     result["macro_accuracy"] = (

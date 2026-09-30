@@ -1,10 +1,17 @@
-"""Convert Android Control episodes into Dohnuts decision splits.
+"""Convert Android Control episodes into mobile-jev shaped decision splits.
 
-Deterministic: numerically sorted episode directories, content-addressed
+Every row's prompt is the one `ClientMobileJev` builds for the same screen and
+goal (see docs/superpowers/specs/2026-09-30-mobile-jev-prompt-construction-design.md):
+the `state` and the `questions` come from `dohnuts.mobile_jev_prompt`, and the
+row's target is the action the corpus actually recorded.
+
+Deterministic: numerically sorted episode directories, a corpus-level app
+inventory collected in a first pass over the same files, content-addressed
 screenshots, the split seed, and the conversion rules decide every output byte.
-Episodes may be converted in parallel (`--workers`); the merge is ordered, so
-the published files are the ones a serial run would have written. Run from the
-repository root.
+Episodes may be converted in parallel (`--workers`); the merge is ordered, so the
+published files are the ones a serial run would have written. Run from the
+repository root. Token lengths are measured separately by
+`scripts/report_token_lengths.py`; nothing is excluded for its size here.
 """
 
 import argparse
@@ -25,61 +32,71 @@ from pathlib import Path
 
 import PIL
 from PIL import Image
-from transformers import AutoProcessor
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
+from dohnuts import mobile_jev_prompt as jev
 from dohnuts.android_control_data import (
-    AC_ACTIONS,
-    ELEMENT_INSTRUCTION,
+    MAX_CANDIDATES,
+    MIN_CANDIDATES,
+    app_vocabulary,
     metadata_detail,
-    parse_step,
+    parse_episode,
+    question_criteria,
     rows_for_ac_step,
+    tap_candidates,
+    target_family,
 )
 from dohnuts.android_control_mark import mark_screenshot
-from dohnuts.gui_data import (
-    BUTTONS,
-    COMPLETE_CRITERIA,
-    INSTRUCTIONS,
-    SPLIT_LIMITS,
-    SPLIT_SEED,
-    SWIPE_DIRECTIONS,
-    isolate,
-    validate_rows,
-)
-from dohnuts.predictor import render, render_question
-from dohnuts.recipe import IMAGE_PIXELS, MAX_LENGTH
+from dohnuts.gui_data import SPLIT_LIMITS, SPLIT_SEED, isolate, validate_rows
 
 SPLITS = ["train", "dev", "calibration", "test"]
 
-# One progress line per this many episodes keeps a multi-hour run observable
-# without flooding stderr on a small input.
+# One progress line per this many episodes keeps a long run observable without
+# flooding stderr on a small input.
 PROGRESS_EVERY = 1000
 
-# The token-check processor: a module global rather than a job argument because
-# it holds a tokenizer and an image processor that do not pickle, while a forked
-# worker inherits the object as it stands when the pool is created.
-_TOKEN_PROCESSOR = None
+# The family-level reasons each question can lose its row to, so the manifest can
+# attribute a drop to the family that asked for it.
+FAMILY_REASONS = {
+    "operation": (),
+    "tap_target": ("no_target_element", "too_few_candidates", "too_many_candidates"),
+    "text_value": ("text_not_a_goal_span", "too_few_candidates", "too_many_candidates"),
+    "app_target": ("app_not_offered", "too_few_candidates", "too_many_candidates"),
+}
 
 # Temporary names of `staged_write`, unique within a process and across them.
 _TEMP_NAMES = count()
 
-# The rules behind a `screenshot_choice` row are stated in the manifest, so a
-# consumer can tell what its label indices mean without reading this script.
-ELEMENT_RULE = (
-    "A click or long_press step lists the visible, non-degenerate, clickable nodes "
-    "of its step_NNN_a11y.json in window order and node order; the kept nodes are "
-    "numbered contiguously r0..r{N-1} (nothing is deduplicated), the ground truth "
-    "is every node whose box contains the recorded tap point -- weighted by inverse "
-    "box area and normalized over those hits, so a single hit is a one-hot and the "
-    "smaller of several nested boxes carries the larger share -- and only steps "
-    "with 2..128 candidates are converted."
+# The rules behind a row are stated in the manifest, so a consumer can tell what
+# its criteria and targets mean without reading this script.
+PROMPT_RULE = (
+    "Every row's state and question are byte-for-byte what android_world's "
+    "ClientMobileJev builds for the same accessibility tree and goal: the nine "
+    "state keys (goal, app, isEditable, textSource, textEntryAvailableAfterFocus, "
+    "visibleText, elements, availableApps, recentActions) plus an optional "
+    "focusedField, and one question whose id, instructions and criteria text come "
+    "from that policy. The operation question's criteria keep its fixed order "
+    "(OPEN_APP, TAP, TYPE_TEXT, SCROLL_DOWN, SCROLL_UP, SCROLL_LEFT, SCROLL_RIGHT, "
+    "BACK, HOME, ENTER, WAIT, DONE, BLOCKED) and only include what the screen "
+    "offers; element indices are the policy's shared 1-based numbering (TAP "
+    "targets first, then scroll-only regions), and instructions are the "
+    "{'goal', 'rules'} object the policy sends."
+)
+TARGET_RULE = (
+    "A target row exists only for the operation the step recorded: a click lists "
+    "the TAP candidates as '[i] label' and the ground truth is every candidate "
+    "whose box contains the recorded point, weighted by inverse box area and "
+    "normalized over the hits (a single hit is a one-hot); a typed step lists the "
+    "goal's 1..8 word spans plus NONE and the ground truth is the typed span when "
+    "the goal contains it; an open_app step lists the offered app inventory and "
+    "the ground truth is the app the corpus opened. Only steps with 2.."
+    f"{MAX_CANDIDATES} candidates produce the row."
 )
 MARKED_IMAGES = (
-    "The screenshot of a screenshot_choice row is a set-of-mark rendering: every "
-    "candidate is boxed and numbered in the same order as the criteria, nothing "
-    "else is drawn, and the PNG drops the image metadata of its source, so its "
-    "bytes are a pure function of the pixels, the candidate list, and the Pillow "
-    "version recorded under environment."
+    "The screenshot of a tap_target row is a set-of-mark rendering: every TAP "
+    "candidate is boxed and labelled with the criteria key it is offered under, "
+    "nothing else is drawn, and the PNG drops the image metadata of its source, so "
+    "its bytes are a pure function of the pixels, the candidate list, and the "
+    "Pillow version recorded under environment."
 )
 
 
@@ -143,20 +160,17 @@ def read_metadata(episode_dir: Path, name: str) -> tuple[object | None, bytes | 
         return None, raw, f"{type(error).__name__}: {error}"
 
 
-def token_length(processor, row: dict) -> int:
-    """Rendered tokens plus expanded image placeholders, as prepare_data.filter_data counts."""
-    prompt, _, _ = render_question(render(row["state"]), row["question"], has_image=True)
-    length = len(processor.tokenizer(prompt, truncation=False)["input_ids"])
-    factor = processor.image_processor.patch_size * processor.image_processor.merge_size
-    with Image.open(row["image"]) as image:
-        width, height = smart_resize(
-            image.height,
-            image.width,
-            factor=factor,
-            min_pixels=IMAGE_PIXELS,
-            max_pixels=IMAGE_PIXELS,
-        )[::-1]
-    return length + (height // factor) * (width // factor) - 1
+def metadata_documents(episodes: list[Path]):
+    """Yield each episode's metadata value, in episode order, skipping failures.
+
+    The first pass of the run reads the same small files the conversion reads, so
+    the inventory it produces is a property of the input rather than of the
+    worker schedule. Kept as a generator so 15k documents are never all in
+    memory at once.
+    """
+    for episode_dir in episodes:
+        document, _, _ = read_metadata(episode_dir, Path(episode_dir).name)
+        yield document
 
 
 def image_path(output: Path, sha256: str) -> Path:
@@ -189,8 +203,9 @@ def store_raw(step, target: Path) -> None:
     """Copy the step screenshot to its content-addressed `target`.
 
     The copy is byte-identical to the source: the row rules alias the file by the
-    digest of the bytes `parse_step` hashed and the model reads back exactly the
-    bytes that were decoded at parse time, so re-encoding here would break both.
+    digest of the bytes `parse_episode` hashed and the model reads back exactly
+    the bytes that were decoded at parse time, so re-encoding here would break
+    both.
     """
     if not target.exists() or digest_file(target) != step.image_sha256:
         # Re-copy a target whose content does not match its name: a killed
@@ -199,7 +214,22 @@ def store_raw(step, target: Path) -> None:
             shutil.copyfile(step.image, staged)
 
 
-def render_marked(image: Path, elements: list[dict]) -> tuple[bytes, str]:
+def marked_candidates(step) -> list[tuple[str, object]]:
+    """The `(criteria key, element)` pairs a tap_target row's screenshot draws.
+
+    Only a step whose ground truth is a tap target gets a mark: every step whose
+    screen offers TAP has a `tap_target` question, and rendering one for all of
+    them would write a file no row mentions.
+    """
+    if step.target is None or step.target.family != "tap_target":
+        return []
+    criteria = question_criteria(step.request, "tap_target")
+    if criteria is None:  # not reachable: a resolved target needs its question
+        return []
+    return list(zip(criteria, tap_candidates(step.request, step.observation)))
+
+
+def render_marked(image: Path, candidates: list[tuple[str, object]]) -> tuple[bytes, str]:
     """Render the set-of-mark screenshot of one step; return its PNG bytes and digest.
 
     The digest comes from a sha256 of the exact bytes written, computed before
@@ -211,7 +241,7 @@ def render_marked(image: Path, elements: list[dict]) -> tuple[bytes, str]:
     step that never reaches its rows writes nothing at all.
     """
     with Image.open(image) as handle:
-        marked = mark_screenshot(handle, elements)
+        marked = mark_screenshot(handle, candidates)
     buffer = io.BytesIO()
     marked.save(buffer, format="PNG")
     payload = buffer.getvalue()
@@ -226,14 +256,14 @@ def store_marked(target: Path, payload: bytes) -> None:
             staged.write_bytes(payload)
 
 
-def process_episode(episode_dir: Path, *, output: Path, root: Path, token_check: bool) -> dict:
+def process_episode(episode_dir: Path, *, output: Path, root: Path, apps: tuple[str, ...]) -> dict:
     """Convert one episode into the plain-data slice of the run it contributes.
 
     Everything returned is picklable, because the result crosses a process
     boundary when the run is parallel: `rows`, `excluded`, `images`, `audit`,
-    `element_rows`, `empty_targets`, and `metadata_bytes` (the raw metadata file
-    the parent folds into its digest in episode order -- a digest cannot be
-    merged after the fact, so the bytes have to travel).
+    `attempts`, and `metadata_bytes` (the raw metadata file the parent folds into
+    its digest in episode order -- a digest cannot be merged after the fact, so
+    the bytes have to travel).
 
     Never raises. Each step of the episode is already guarded, the metadata read
     reports its own failures, and an episode that fails outside those guards
@@ -250,7 +280,7 @@ def process_episode(episode_dir: Path, *, output: Path, root: Path, token_check:
         document, raw, detail = None, None, ""
     try:
         result = convert_episode(
-            episode_dir, name, document, detail, output=output, root=root, token_check=token_check
+            episode_dir, name, document, detail, output=output, root=root, apps=apps
         )
     except Exception as error:
         result = {
@@ -265,8 +295,8 @@ def process_episode(episode_dir: Path, *, output: Path, root: Path, token_check:
             ],
             "images": [],
             "audit": {"parse:unexpected": 1},
-            "element_rows": 0,
-            "empty_targets": {},
+            "attempts": {},
+            "family_drops": {},
         }
     result["metadata_bytes"] = raw
     return result
@@ -280,9 +310,9 @@ def convert_episode(
     *,
     output: Path,
     root: Path,
-    token_check: bool,
+    apps: tuple[str, ...],
 ) -> dict:
-    """Parse, probe, store and derive the rows of one episode.
+    """Parse, store and mint the rows of one episode.
 
     The body of the conversion loop, keyed by the directory `name` the episode
     is addressed by; `document` is the metadata as read (or None when it could
@@ -293,8 +323,8 @@ def convert_episode(
     excluded: list[dict] = []
     rows: list[dict] = []
     images_written: list[str] = []
-    empty_targets: dict[str, bool] = {}
-    element_rows = 0
+    attempts: Counter = Counter()
+    family_drops: Counter = Counter()
     record = document
     if isinstance(record, dict):
         # A valid JSON document of the wrong shape is as unusable as a torn
@@ -323,50 +353,27 @@ def convert_episode(
             {"id": name, "reason": "unparsable_metadata", "detail": detail, "stage": "parse"}
         )
     else:
-        for index in range(len(record["steps"])):
-            step_id = f"android_control_{record['episode_id']}_step{index}"
+        steps, step_exclusions = parse_episode(record, episode_dir=episode_dir, apps=apps)
+        for entry in step_exclusions:
+            stage = entry["stage"]
+            audit[f"{stage}:{entry['reason']}"] += 1
+            if stage == "family":
+                # The id ends in the family that failed, which is what lets the
+                # manifest attribute a shared reason to the right question.
+                family_drops[f"{entry['id'].rsplit(':', 1)[-1]}:{entry['reason']}"] += 1
+            excluded.append(entry)
+        for step in steps:
             try:
-                step, reason = parse_step(record, index, episode_dir=episode_dir)
-                if step is None:
-                    audit[f"parse:{reason}"] += 1
-                    excluded.append(
-                        {"id": step_id, "reason": reason, "detail": "", "stage": "parse"}
-                    )
-                    continue
-                if token_check:
-                    # The budget is checked before anything is written, and
-                    # the probe rows are the rows this step would mint: only
-                    # the element question carries the candidate texts, so
-                    # the answer is the same either way. The probe's raw path
-                    # stands in for the marked copy because marking never
-                    # changes the dimensions `token_length` reads (never the
-                    # pixels), and its duplicated alias never leaves this
-                    # computation.
-                    probe = (str(step.image), step.image_sha256)
-                    lengths = [
-                        token_length(_TOKEN_PROCESSOR, row)
-                        for row in rows_for_ac_step(
-                            step,
-                            str(step.image),
-                            marked=probe if step.element_weights is not None else None,
-                        )
-                    ]
-                    if any(length > MAX_LENGTH for length in lengths):
-                        audit["parse:token_budget"] += 1
-                        excluded.append(
-                            {
-                                "id": step.id,
-                                "reason": "token_budget",
-                                "detail": str(max(lengths)),
-                                "stage": "parse",
-                            }
-                        )
-                        continue
+                attempts["operation"] += 1
+                family = target_family(step.operation)
+                if family is not None:
+                    attempts[family] += 1
                 raw_target = image_path(output, step.image_sha256)
                 marked = None
                 marked_png = None
-                if step.element_weights is not None:
-                    payload, marked_sha256 = render_marked(step.image, step.elements)
+                candidates = marked_candidates(step)
+                if candidates:
+                    payload, marked_sha256 = render_marked(step.image, candidates)
                     marked_png = (image_path(output, marked_sha256), payload)
                     marked = (os.path.relpath(marked_png[0], root), marked_sha256)
                 # Rows are minted before anything is written, and an image is
@@ -379,18 +386,6 @@ def convert_episode(
                     store_marked(*marked_png)
                     images_written.append(marked_png[0].name)
                 rows.extend(produced)
-                if step.element_weights is not None:
-                    element_rows += 1
-                    # The payload is `{}` exactly when the candidate carries
-                    # neither a text nor a description, which makes the question
-                    # unanswerable from the prompt: the row counts as an empty
-                    # target only when no candidate the point touched carries
-                    # one, since any of them is a correct answer.
-                    empty_targets[f"{step.id}:element"] = not any(
-                        element["text"] or element["content_description"]
-                        for position, element in enumerate(step.elements)
-                        if step.element_weights[position] > 0
-                    )
             except Exception as error:
                 # A filesystem or decode failure outside the rule parsers must
                 # not abort the batch, and the half-made rows are dropped:
@@ -398,7 +393,7 @@ def convert_episode(
                 audit["parse:unexpected"] += 1
                 excluded.append(
                     {
-                        "id": step_id,
+                        "id": step.id,
                         "reason": "unexpected",
                         "detail": f"{type(error).__name__}: {error}",
                         "stage": "parse",
@@ -410,12 +405,14 @@ def convert_episode(
         "excluded": excluded,
         "images": images_written,
         "audit": dict(audit),
-        "element_rows": element_rows,
-        "empty_targets": empty_targets,
+        "attempts": dict(attempts),
+        "family_drops": dict(family_drops),
     }
 
 
-def episode_results(episodes: list[Path], *, output: Path, root: Path, workers: int):
+def episode_results(
+    episodes: list[Path], *, output: Path, root: Path, apps: tuple[str, ...], workers: int
+):
     """Yield one `process_episode` result per episode, in episode order.
 
     `workers == 1` runs the very same function in this process, so a serial run
@@ -423,15 +420,11 @@ def episode_results(episodes: list[Path], *, output: Path, root: Path, workers: 
     forked pool hands episodes to `workers` processes and `imap` yields their
     results in submission order -- which is what keeps the merged rows,
     exclusions, image list and metadata digest identical to the serial run, no
-    matter how the workers interleave. The jobs carry no processor: the token
-    check reads the module global the fork inherited. That is fork-only by
-    design -- under `spawn` or `forkserver` a worker would re-import this module
-    with `_TOKEN_PROCESSOR` at None and silently skip the token check, so the
-    start method is pinned rather than left to the platform default.
+    matter how the workers interleave. The app inventory travels as a job
+    argument rather than a module global, so the output cannot depend on when the
+    pool was forked.
     """
-    job = partial(
-        process_episode, output=output, root=root, token_check=_TOKEN_PROCESSOR is not None
-    )
+    job = partial(process_episode, output=output, root=root, apps=apps)
     if workers <= 1:
         for episode_dir in episodes:
             yield job(episode_dir)
@@ -459,15 +452,34 @@ def sweep_staged(output: Path) -> None:
             stale.unlink()
 
 
-def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> dict:
+def family_stats(counts: Counter, widths: dict, positives: dict) -> dict:
+    """Per split, per dataset: row count and candidate-width distribution."""
+    stats: dict[str, dict] = {}
+    for (dataset, split), n in sorted(counts.items()):
+        candidates = widths.get((dataset, split), [])
+        hits = positives.get((dataset, split), [])
+        stats.setdefault(split, {})[dataset] = {
+            "rows": n,
+            "candidates_min": min(candidates) if candidates else None,
+            "candidates_mean": (sum(candidates) / len(candidates)) if candidates else None,
+            "candidates_max": max(candidates) if candidates else None,
+            # A soft target names more than one correct candidate: the element
+            # family is the only one that can, because a click can land inside
+            # several nested boxes.
+            "soft_targets": sum(1 for count in hits if count > 1),
+            "max_positive_weights": max(hits) if hits else None,
+        }
+    return stats
+
+
+def convert(source: Path, output: Path, *, workers: int = 1) -> dict:
     """Convert every episode under `source` into the splits under `output`.
 
-    `processor` enables the token budget check; `workers` above 1 converts that
-    many episodes at a time. The workers only ever run rules on their own
-    episode and store content-addressed files, so the run is as deterministic
-    as the serial one: every episode's results are merged in episode order,
-    which fixes the row order, the counters, the image list, and the metadata
-    digest. Returns the manifest it published.
+    `workers` above 1 converts that many episodes at a time. The workers only
+    ever run rules on their own episode and store content-addressed files, so the
+    run is as deterministic as the serial one: every episode's results are merged
+    in episode order, which fixes the row order, the counters, the image list,
+    and the metadata digest. Returns the manifest it published.
 
     A rerun into an existing `--output` reuses the screenshots whose bytes still
     match their names, sweeps the temporaries a killed run may have left, and
@@ -475,7 +487,6 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
     where they are, so `manifest["images"]` describes this run rather than the
     directory.
     """
-    global _TOKEN_PROCESSOR
     root = repository_root()
     if Path.cwd().resolve() != root:
         raise SystemExit(f"Run from the repository root: {root}")
@@ -489,20 +500,29 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
     except OSError as error:
         raise SystemExit(f"Cannot create the output directory {output}: {error}") from error
     sweep_staged(output)
-    _TOKEN_PROCESSOR = processor
+    # Pass one: the offered app inventory. The first pass over the corpus is
+    # what lets a row ask which app to open, since Android Control never records
+    # the device's installed apps -- only the apps it actually opened.
+    inventory = tuple(app_vocabulary(metadata_documents(episodes)))
+    print(
+        json.dumps({"inventory": {"apps": len(inventory), "cap": jev.MAX_APPS}}),
+        file=sys.stderr,
+        flush=True,
+    )
     audit: Counter = Counter()
     excluded: list[dict] = []
     rows: list[dict] = []
     images_written: set[str] = set()
-    empty_targets: dict[str, bool] = {}
-    element_rows = 0
+    attempts: Counter = Counter()
+    family_drops: Counter = Counter()
     metadata_files_hashed = 0
     metadata_sha256 = hashlib.sha256()
     merged = 0
     try:
-        for number, result in enumerate(
-            episode_results(episodes, output=output, root=root, workers=workers), 1
-        ):
+        results = episode_results(
+            episodes, output=output, root=root, apps=inventory, workers=workers
+        )
+        for number, result in enumerate(results, 1):
             if result["metadata_bytes"] is not None:
                 metadata_files_hashed += 1
                 metadata_sha256.update(result["metadata_bytes"])
@@ -510,8 +530,8 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
             excluded.extend(result["excluded"])
             rows.extend(result["rows"])
             images_written.update(result["images"])
-            empty_targets.update(result["empty_targets"])
-            element_rows += result["element_rows"]
+            attempts.update(result["attempts"])
+            family_drops.update(result["family_drops"])
             merged = number
             if number % PROGRESS_EVERY == 0:
                 print(
@@ -532,6 +552,10 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
         # itself and report how far the run got, the way the rest of the CLI
         # reports a stop instead of printing a traceback.
         raise SystemExit(f"Interrupted after {merged} of {len(episodes)} episodes") from interrupt
+    # Coverage is measured on the rows this run minted, before isolation drops
+    # the ones that collide across splits, so it stays additive with the family
+    # drop counters. `counts` below is post-isolation, like the split files.
+    minted: Counter = Counter(row["dataset"] for row in rows)
     dropped: list = []
     kept = isolate(rows, audit, dropped)
     try:
@@ -539,28 +563,26 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
     except ValueError as error:
         raise SystemExit(f"Self-check failed: {error}") from error
     counts: Counter = Counter()
-    classes: dict[str, Counter] = {}
-    candidates: dict[str, list[int]] = {}
-    hits: dict[str, list[int]] = {}
-    empty_payloads: Counter = Counter()
+    operations: dict[str, Counter] = {}
+    widths: dict[tuple[str, str], list[int]] = {}
+    positives: dict[tuple[str, str], list[int]] = {}
     try:
         handles = {split: (output / f"{split}.jsonl").open("w") for split in SPLITS}
         try:
             for row in kept:
                 handles[row["split"]].write(json.dumps(row, ensure_ascii=False) + "\n")
                 counts[(row["dataset"], row["split"])] += 1
-                if row["dataset"] == "gui_action":
-                    label = list(AC_ACTIONS)[row["target"].index(1.0)]
-                    classes.setdefault(row["split"], Counter())[label] += 1
-                elif row["dataset"] == "screenshot_choice":
-                    candidates.setdefault(row["split"], []).append(len(row["question"]["criteria"]))
-                    # The positive weights are the hits the row actually teaches;
-                    # more than one makes it a soft target rather than a one-hot.
-                    hits.setdefault(row["split"], []).append(
-                        sum(1 for weight in row["target"] if weight > 0)
-                    )
-                    if empty_targets.get(row["id"]):
-                        empty_payloads[row["split"]] += 1
+                if row["dataset"] == "jev_operation":
+                    criteria = list(row["question"]["criteria"])
+                    operations.setdefault(row["split"], Counter())[
+                        criteria[row["target"].index(1.0)]
+                    ] += 1
+                widths.setdefault((row["dataset"], row["split"]), []).append(
+                    len(row["question"]["criteria"])
+                )
+                positives.setdefault((row["dataset"], row["split"]), []).append(
+                    sum(1 for weight in row["target"] if weight > 0)
+                )
         finally:
             for handle in handles.values():
                 handle.close()
@@ -579,49 +601,29 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
             file=sys.stderr,
             flush=True,
         )
-    element_stats = {}
-    for split in SPLITS:
-        widths = candidates.get(split)
-        if not widths:
-            continue
-        empties = empty_payloads[split]
-        hit_counts = hits[split]
-        soft = sum(1 for count in hit_counts if count > 1)
-        element_stats[split] = {
-            "basis": "post_isolation",
-            "rows": len(widths),
-            "candidates_min": min(widths),
-            "candidates_mean": sum(widths) / len(widths),
-            "candidates_max": max(widths),
-            # How much of the family is a distribution rather than a one-hot:
-            # a soft target names every hit, so the model is only graded on
-            # picking one of them, not on picking the smallest.
-            "soft_targets": soft,
-            "multi_hit_rate": soft / len(widths),
-            "max_hits": max(hit_counts),
-            "empty_target_payloads": empties,
-            "empty_target_payload_rate": empties / len(widths),
+    coverage = {}
+    for family, dataset in (
+        ("operation", "jev_operation"),
+        ("tap_target", "jev_tap_target"),
+        ("text_value", "jev_text_value"),
+        ("app_target", "jev_app_target"),
+    ):
+        asked = attempts.get(family, 0)
+        rows_produced = minted.get(dataset, 0)
+        coverage[family] = {
+            "basis": "rows are pre-isolation; steps_asking counts parsed steps",
+            "dataset": dataset,
+            "steps_asking": asked,
+            "rows": rows_produced,
+            "rate": (rows_produced / asked) if asked else None,
+            "dropped": {
+                reason: family_drops[f"{family}:{reason}"]
+                for reason in FAMILY_REASONS[family]
+                if family_drops.get(f"{family}:{reason}")
+            },
         }
-    misses = [
-        audit[f"parse:{reason}"]
-        for reason in ("no_target_element", "too_few_candidates", "too_many_candidates")
-    ]
-    # The hit rate is over the steps that asked an element question at all: the
-    # audit counts the three ways `resolve_element_target` can refuse one, and
-    # `element_rows` counts the steps that resolved and within budget (one choice
-    # row each). A step that resolved but was excluded by the budget is in
-    # neither count, so the rates here and in the manifest stay additive.
-    asked = element_rows + sum(misses)
-    element_resolution = {
-        "basis": "pre_isolation",
-        "element_rows": element_rows,
-        "no_target_element": misses[0],
-        "too_few_candidates": misses[1],
-        "too_many_candidates": misses[2],
-        "hit_rate": element_rows / asked if asked else None,
-    }
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "split_seed": SPLIT_SEED,
         "split_limits": SPLIT_LIMITS,
         "source": {
@@ -635,28 +637,83 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
             {"dataset": dataset, "split": split, "n": count}
             for (dataset, split), count in sorted(counts.items())
         ],
-        "action_classes": {
-            split: dict(sorted(values.items())) for split, values in sorted(classes.items())
+        "operation_classes": {
+            split: dict(sorted(values.items())) for split, values in sorted(operations.items())
         },
-        "element_stats": element_stats,
-        "element_resolution": element_resolution,
+        "family_stats": family_stats(counts, widths, positives),
+        "family_coverage": coverage,
+        "family_drops": {
+            reason: count for reason, count in sorted(audit.items()) if reason.startswith("family:")
+        },
         "exclusions": dict(sorted(audit.items())),
         "images": sorted(images_written),
+        "app_inventory": {
+            "apps": len(inventory),
+            "offered_cap": jev.MAX_APPS,
+            "source": "corpus open_app display names, sorted by (casefold, name)",
+        },
         "dataset_weighting": (
             "TrainingBatches draws a dataset name uniformly at random before drawing a row "
-            "from it, so the five dataset names carry equal weight regardless of how many "
-            "rows each has; because gui_button and gui_swipe rows only exist on the steps "
-            "that press a button or scroll, those rows are relatively upweighted"
+            "from it, so the four dataset names carry equal weight regardless of how many "
+            "rows each has; because tap_target, text_value and app_target rows only exist on "
+            "the steps that recorded such an action, those rows are relatively upweighted"
         ),
-        "token_check": "skipped" if processor is None else "enabled",
+        "token_stats": (
+            "not measured here; run scripts/report_token_lengths.py over this directory to "
+            "get token_lengths.jsonl and token_stats.json. No row is excluded for its length"
+        ),
         "vocabularies": {
-            "ac_actions": AC_ACTIONS,
-            "buttons": BUTTONS,
-            "swipe_directions": SWIPE_DIRECTIONS,
-            "instructions": {**INSTRUCTIONS, "element": ELEMENT_INSTRUCTION},
-            "complete_criteria": COMPLETE_CRITERIA,
-            "element_rule": ELEMENT_RULE,
+            "rules": jev.RULES,
+            "operation_descriptions": jev.OPERATION_DESCRIPTIONS,
+            "target_question_template": jev.TARGET_QUESTION_TEMPLATE,
+            "text_value_none": jev.TEXT_VALUE_NONE,
+            "text_value_instructions": jev.TEXT_VALUE_EXTRA_INSTRUCTIONS,
+            "state_keys": [
+                "goal",
+                "app",
+                "isEditable",
+                "textSource",
+                "textEntryAvailableAfterFocus",
+                "visibleText",
+                "elements",
+                "availableApps",
+                "recentActions",
+                "focusedField",
+            ],
+            "question_ids": [
+                "operation",
+                "app_target",
+                "tap_target",
+                "scroll_target",
+                "text_value",
+            ],
+            "limits": {
+                "max_choice_options": jev.MAX_CHOICE_OPTIONS,
+                "max_text_candidates": jev.MAX_TEXT_CANDIDATES,
+                "max_text_ngram": jev.MAX_TEXT_NGRAM,
+                "max_apps": jev.MAX_APPS,
+                "max_payload_bytes": jev.MAX_PAYLOAD_BYTES,
+                "min_candidates_per_row": MIN_CANDIDATES,
+                "max_candidates_per_row": MAX_CANDIDATES,
+            },
+            "prompt_rule": PROMPT_RULE,
+            "target_rule": TARGET_RULE,
             "marked_images": MARKED_IMAGES,
+            "deviations": [
+                "rows carry a screenshot (the agent is text only): the raw frame, or the "
+                "marked frame for tap_target",
+                "scroll_target rows are never produced: Android Control records a scroll "
+                "direction but no coordinates, so the scrolled region is unknown",
+                "a row's question has 2..128 options while the agent allows 255",
+                "a history entry's scroll region is the lowest-indexed scroll candidate of "
+                "that screen, because the corpus does not record which region moved",
+                "the app inventory is the corpus's own open_app names, not the device's "
+                "installed apps, and is capped at "
+                + str(jev.MAX_APPS)
+                + " like the agent",
+                "the last step of an episode is assumed to be a successful termination "
+                "(the parsed corpus dropped goal_status)",
+            ],
         },
         "environment": {"python": platform.python_version(), "pillow": PIL.__version__},
         "sha256": {split: digest_file(output / f"{split}.jsonl") for split in SPLITS},
@@ -669,6 +726,11 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
     return manifest
 
 
+def _family_reasons(family: str) -> tuple[str, ...]:
+    """The audit keys that explain why one family produced no row."""
+    return FAMILY_REASONS[family]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -679,10 +741,6 @@ def main(argv=None):
     )
     parser.add_argument("--output", type=Path, required=True, help="Split directory to create")
     parser.add_argument(
-        "--model", type=Path, default=None, help="Local model used for the token budget check"
-    )
-    parser.add_argument("--no-token-check", dest="token_check", action="store_false")
-    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -691,13 +749,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.workers < 1:
         raise SystemExit(f"--workers must be at least 1, not {args.workers}")
-    processor = None
-    if args.model is not None and args.token_check:
-        try:
-            processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
-        except (OSError, ValueError) as error:
-            raise SystemExit(f"Cannot load the token-check model {args.model}: {error}") from error
-    convert(args.input, args.output, processor=processor, workers=args.workers)
+    convert(args.input, args.output, workers=args.workers)
 
 
 if __name__ == "__main__":

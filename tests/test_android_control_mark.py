@@ -1,4 +1,4 @@
-"""Set-of-mark rendering: determinism, drawn marks, and position-based numbering.
+"""Set-of-mark rendering: determinism, drawn marks, and caller-supplied labels.
 
 Everything here is synthetic — screenshots are built with PIL in memory — so the
 tests stay independent of the example-data corpus and of the row rules.
@@ -16,6 +16,7 @@ from dohnuts.android_control_mark import (
     label_font,
     mark_screenshot,
 )
+from dohnuts.mobile_jev_prompt import Element
 
 # Small images keep the property tests quick. The chip tests need a screen tall
 # enough for the label to reach its production size (2400 // 86 = 27 pixels):
@@ -36,13 +37,20 @@ CHIP_SEARCH = 60
 
 
 def element(bounds, index=0, text="", content_description=""):
-    """One extracted element, shaped exactly like `extract_elements` output."""
-    return {
-        "index": index,
-        "text": text,
-        "content_description": content_description,
-        "bounds": list(bounds) if bounds is not None else None,
-    }
+    """One element, exactly as `mobile_jev_prompt.summarize_observation` builds it."""
+    return Element(
+        id=str(index),
+        bounds=tuple(bounds) if bounds is not None else None,
+        text=text,
+        label=content_description,
+    )
+
+
+def labelled(elements, labels=None):
+    """The `(label, element)` pairs `mark_screenshot` draws."""
+    if labels is None:
+        labels = [str(position) for position in range(len(elements))]
+    return list(zip(labels, elements))
 
 
 def png_bytes(image):
@@ -109,14 +117,14 @@ def black_pixels(image):
 def marked_pair(size=SMALL):
     """The two-box screenshot and the result of marking it."""
     elements = [element(bounds, index=position) for position, bounds in enumerate(BOXES)]
-    return mark_screenshot(Image.new("RGB", size, BACKGROUND), elements)
+    return mark_screenshot(Image.new("RGB", size, BACKGROUND), labelled(elements))
 
 
 def test_marking_the_same_input_twice_gives_byte_identical_pngs():
     # Content-addressed file names hash these bytes, so the whole pipeline
     # depends on a second run of the same input landing on the same PNG.
     image = Image.new("RGB", SMALL, BACKGROUND)
-    elements = [element(bounds, index=position) for position, bounds in enumerate(BOXES)]
+    elements = labelled([element(bounds, index=position) for position, bounds in enumerate(BOXES)])
     assert png_bytes(mark_screenshot(image, elements)) == png_bytes(
         mark_screenshot(image, elements)
     )
@@ -135,7 +143,7 @@ def test_marks_depend_on_the_pixels_and_not_on_the_source_metadata():
     tagged = plain.copy()
     tagged.info["icc_profile"] = ICC_PROFILE
     tagged.info["dpi"] = (72, 72)
-    elements = [element(BOXES[0])]
+    elements = labelled([element(BOXES[0])])
     marked = mark_screenshot(tagged, elements)
     assert png_bytes(marked) == png_bytes(mark_screenshot(plain, elements))
     assert marked.info == {}
@@ -207,27 +215,25 @@ def test_box_corners_carry_a_white_chip_with_a_black_label():
     assert masks[1] == glyph_mask("1", font)
 
 
-def test_chip_numbering_follows_position_not_the_index_field():
+def test_chip_labels_are_exactly_what_the_caller_supplied():
     image = Image.new("RGB", SCREEN, BACKGROUND)
-    elements = [element(BOXES[0], index=7), element(BOXES[1], index=3)]
-    marked = mark_screenshot(image, elements)
+    pairs = labelled([element(BOXES[0], index=7), element(BOXES[1], index=3)], ["9", "3"])
+    marked = mark_screenshot(image, pairs)
     font = label_font(marked)
-    # The numbering has to match the `r{position}` criteria keys, so the index
-    # fields must not leak into the drawing.
-    assert ink(marked.crop(chip_box(marked, BOXES[0][:2]))) == glyph_mask("0", font)
-    assert ink(marked.crop(chip_box(marked, BOXES[1][:2]))) == glyph_mask("1", font)
-    # ...which a font that draws every digit alike would pass by accident.
-    assert ink(marked.crop(chip_box(marked, BOXES[0][:2]))) != glyph_mask("7", font)
-    assert glyph_mask("0", font) != glyph_mask("7", font)
+    # The label is the criteria key the row offers, so neither the element's own
+    # index nor its position in the list may leak into the drawing.
+    assert ink(marked.crop(chip_box(marked, BOXES[0][:2]))) == glyph_mask("9", font)
+    assert ink(marked.crop(chip_box(marked, BOXES[1][:2]))) == glyph_mask("3", font)
+    assert ink(marked.crop(chip_box(marked, BOXES[0][:2]))) != glyph_mask("3", font)
 
 
 def test_three_digit_labels_render_and_widen_their_chip():
     # Candidate lists run to MAX_CANDIDATES, so labels reach "127".
     image = Image.new("RGB", (128 * 30, 200), BACKGROUND)
     elements = [element((position * 30 + 2, 20, position * 30 + 26, 60)) for position in range(128)]
-    marked = mark_screenshot(image, elements)
+    marked = mark_screenshot(image, labelled(elements))
     font = label_font(marked)
-    chip = chip_box(marked, (elements[-1]["bounds"][0], 20), span=28)
+    chip = chip_box(marked, (elements[-1].bounds[0], 20), span=28)
     assert chip is not None
     glyph = font.getbbox("127")
     single = font.getbbox("7")
@@ -241,7 +247,7 @@ def test_three_digit_labels_render_and_widen_their_chip():
 def test_the_input_image_is_never_mutated():
     image = Image.new("RGB", SMALL, BACKGROUND)
     before = image.tobytes()
-    marked = mark_screenshot(image, [element(BOXES[0])])
+    marked = mark_screenshot(image, labelled([element(BOXES[0])]))
     assert image.tobytes() == before
     assert image.mode == "RGB"
     assert marked is not image
@@ -251,13 +257,13 @@ def test_the_input_image_is_never_mutated():
 def test_non_rgb_input_is_returned_as_a_new_rgb_image():
     grey = Image.new("L", SMALL, 90)
     before = grey.tobytes()
-    marked = mark_screenshot(grey, [element(BOXES[0])])
+    marked = mark_screenshot(grey, labelled([element(BOXES[0])]))
     assert marked.mode == "RGB"
     assert grey.mode == "L"
     assert grey.tobytes() == before
 
     rgba = Image.new("RGBA", SMALL, (10, 20, 30, 255))
-    assert mark_screenshot(rgba, [element(BOXES[0])]).mode == "RGB"
+    assert mark_screenshot(rgba, labelled([element(BOXES[0])])).mode == "RGB"
     assert rgba.mode == "RGBA"
     assert rgba.tobytes() == Image.new("RGBA", SMALL, (10, 20, 30, 255)).tobytes()
 
@@ -287,7 +293,7 @@ def test_elements_without_usable_bounds_are_skipped():
         None,
         element(BOXES[1]),  # the only one that can be drawn
     ]
-    marked = mark_screenshot(image, elements)
+    marked = mark_screenshot(image, labelled(elements))
     pixels = marked.load()
     for x in range(0, 11):
         assert pixels[x, 0] == BACKGROUND
@@ -296,7 +302,7 @@ def test_elements_without_usable_bounds_are_skipped():
         assert pixels[0, y] == BACKGROUND
         assert pixels[10, y] == BACKGROUND
     assert chip_box(marked, BOXES[0][:2]) is None
-    # A skipped element keeps its slot, so the survivor is still numbered 10.
+    # A skipped element draws nothing; the survivor keeps the label it was given.
     font = label_font(marked)
     chip = chip_box(marked, BOXES[1][:2])
     assert ink(marked.crop(chip)) == glyph_mask("10", font)
@@ -304,7 +310,9 @@ def test_elements_without_usable_bounds_are_skipped():
 
 def test_boxes_running_off_the_edge_are_clipped():
     image = Image.new("RGB", SMALL, BACKGROUND)
-    marked = mark_screenshot(image, [element((-20, -20, 30, 30)), element((60, 150, 500, 400))])
+    marked = mark_screenshot(
+        image, labelled([element((-20, -20, 30, 30)), element((60, 150, 500, 400))])
+    )
     pixels = marked.load()
     assert pixels[30, 30] == MARK_COLOR
     assert pixels[60, 199] == MARK_COLOR
