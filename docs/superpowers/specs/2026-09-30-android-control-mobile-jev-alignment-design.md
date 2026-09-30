@@ -161,44 +161,38 @@ isolate/validate 要逐个走 146k 个 PNG 的容器校验),产物 74GB。
 | 指标 | 值 |
 | --- | --- |
 | episode / metadata 哈希 | 15,283 / 15,283 |
-| 步 | 99,131 步中 97,503 步产出请求;步级排除 `operation_not_offered` 1,612、`token_budget` 227、`missing_a11y` 10、`payload_too_large` 6 |
-| 行(写出) | 151,499:`jev_operation` 96,990、`jev_tap_target` 50,032、`jev_text_value` 2,970、`jev_app_target` 1,507 |
-| split | train 106,112、calibration 14,312、dev 15,816、test 15,259 |
-| 覆盖率(pre-isolation) | operation 97,276/97,503 = 0.998;tap_target 50,141/51,947 = 0.965;text_value 2,973/5,104 = 0.583;app_target 1,512/5,697 = 0.265 |
-| 族级丢弃 | `no_target_element` 1,280、`too_few_candidates` 4,115(tap 361 / app 3,754)、`text_not_a_goal_span` 2,100、`app_not_offered` 431 |
-| 隔离期丢弃 | 403(`cross_split_group` 396、`duplicate_input` 7) |
-| 图像 / app 词表 | 146,225 个内容寻址 PNG / 758 个显示名 |
-| 确定性 | 60-episode 冒烟上 serial 与 `--workers 4` 的 621 行逐字节一致;manifest 仅 `sha256` 不同 |
+| 步 | 99,131 步中 97,503 步产出请求;步级排除 `operation_not_offered` 1,612、`token_budget` 86、`missing_a11y` 10、`payload_too_large` 6 |
+| 行(写出) | **163,551**:`jev_operation` 97,138、`jev_tap_target` 50,128、`jev_scroll_direct` 10,618、`jev_app_target` 5,667 |
+| split | train 114,392、calibration 15,482、dev 17,058、test 16,619 |
+| 覆盖率(pre-isolation) | operation 97,417/97,503 = 0.999;tap_target 50,237/51,947 = 0.967;**scroll_direct 10,637/10,640 = 0.9997**;**app_target 5,697/5,697 = 1.000** |
+| 族级丢弃 | 只有 tap_target:`no_target_element` 1,280、`too_few_candidates` 361 |
+| 隔离期丢弃 | 437(`cross_split_group` + `duplicate_input`) |
+| 图像 / app 词表 | 146,462 个内容寻址 PNG / 758 个显示名 |
+| 确定性 | 60-episode 冒烟上 serial 与 `--workers 4` 的 667 行逐字节一致(含采样后的 app 候选);manifest 仅 `sha256` 不同 |
 
 **token 分布**(`report_token_lengths.py`,`Qwen/Qwen3.5-0.8B` 的 processor,
 `IMAGE_PIXELS=512²`,`MAX_LENGTH = 8192`):
 
 | dataset | rows | p50 | p90 | p99 | max | >8192 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `jev_operation` | 96,990 | 2,126 | 4,888 | 6,308 | 8,178 | 0 |
-| `jev_tap_target` | 50,032 | 2,098 | 4,994 | 6,828 | 8,191 | 0 |
-| `jev_text_value` | 2,970 | 4,364 | 6,336 | 8,035 | 8,192 | 0 |
-| `jev_app_target` | 1,507 | 1,307 | 5,956 | 7,025 | 7,864 | 0 |
-| **全部** | **151,499** | **2,144** | **4,793** | **6,549** | **8,192** | **0** |
+| `jev_operation` | 97,138 | 2,041 | 3,393 | 5,035 | 8,175 | 0 |
+| `jev_tap_target` | 50,128 | 1,962 | 3,776 | 6,323 | 8,185 | 0 |
+| `jev_scroll_direct` | 10,618 | 1,908 | 3,027 | 4,751 | 7,956 | 0 |
+| `jev_app_target` | 5,667 | 1,693 | 2,668 | 4,352 | 6,899 | 0 |
+| **全部** | **163,551** | **1,995** | **3,487** | **5,305** | **8,185** | **0** |
 
-预算的来历:首轮用旧的 2048 测量时,p50 就已经是 2,128、p99 6,653,**78,546/150,300
-行(52.3%)超预算**——旧预算是按 gui-v1 的 `{user_query, task_progress}` 定的。按 p99 取整
-定为 **8192**,同时把 `Qwen35Adapter.max_input_tokens` 从 4096 提到 8192(否则服务侧仍会
-拒绝长 prompt)。实测该预算只切掉 227 步(0.23%),`over_max_length` 为 0 即门禁生效。
+预算的来历:首轮用旧的 2048 测量时,p50 就已经是 2,128、p99 6,653,78,546/150,300 行(52.3%)
+超预算——旧预算是按 gui-v1 的 `{user_query, task_progress}` 定的。按 p99 取整定为 **8192**,
+同时把 `Qwen35Adapter.max_input_tokens` 从 4096 提到 8192。本次门禁只切掉 86 步(0.09%),
+`over_max_length` 为 0 即门禁生效。
 
-**候选上限提到 255 的效果**(首轮 128 → 现在 255,与端口 `MAX_CHOICE_OPTIONS` 一致):
+**迭代历史**(同一管线,三次全量):
 
-| dataset | 128 上限(首轮) | 255 上限(本次) | 变化 |
-| --- | --- | --- | --- |
-| `jev_text_value` | 1,574 | 2,970 | +1,396 |
-| `jev_app_target` | 1,316 | 1,507 | +191 |
-| `jev_tap_target` | 50,193 | 50,032 | −161(门禁) |
-| `jev_operation` | 97,217 | 96,990 | −227(门禁) |
-| 合计 | 150,300 | **151,499** | +1,199 |
-
-`text_value` 的覆盖率因此从 30.9% 升到 58.3%,`app_target` 从 23.2% 升到 26.5%
-(升幅被"goal 只提到一个 app"的 `too_few_candidates` 3,754 步限制);`too_many_candidates`
-这一族级原因不再出现——超过 255 候选的屏在构造问题时就以 `payload_too_large` 整步排除。
+| 版本 | 行数 | 变化 |
+| --- | --- | --- |
+| 首轮:128 候选上限、2048 预算、旧族 | 150,300 | `text_value` 30.9%、`app_target` 23.2%;`token_budget` 未设门禁 |
+| 第二轮:255 候选上限、8192 门禁 | 151,499 | text_value +1,396、app_target +191;门禁切 227 步 |
+| 本轮:SCROLL 合并 + `scroll_direct` + 去 text_value + app 采样 | **163,551** | 新增 `scroll_direct` 10,618;`app_target` 1,507 → **5,667**(覆盖 100%);text_value 归零;门禁只剩 86 步;p90 从 4,793 降到 3,487 |
 
 ## 9. manifest
 

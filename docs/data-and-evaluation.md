@@ -378,14 +378,16 @@ key.
 
 **Token budget.** `MAX_LENGTH` is 8,192, and `Qwen35Adapter.max_input_tokens`
 matches it so serving accepts what training does. The number comes from
-measurement, not taste: the aligned prompts put the median row at 2,144 tokens
-and p99 at 6,549, so the old 2,048 (chosen for gui-v1's short
+measurement, not taste: the aligned prompts put the median row at 2,128 tokens
+and p99 at 6,653, so the old 2,048 (chosen for gui-v1's short
 `{user_query, task_progress}` state) would have refused 52.3% of the corpus. At
-8,192 the check costs 227 steps — 0.23% — which is why it is a gate again:
+8,192 the check costs 86 steps — 0.09% — which is why it is a gate again:
 `--model` turns it on and a step with any over-budget row is excluded whole as
 `token_budget`, because `DecisionCollator` raises on such a batch rather than
 truncating. The run that produced `ac-jev-v1` measures `over_max_length: 0`, so
-every written row fits. `scripts/report_token_lengths.py` still writes
+every written row fits; dropping the text-value rows and capping the app question
+at 31 options also brought the distribution down (p50 1,995, p90 3,487, p99
+5,305, against 2,144 / 4,793 / 6,549 before the reshape). `scripts/report_token_lengths.py` still writes
 `token_lengths.jsonl` (one line per row, so a future budget can be re-derived
 without measuring again) and `token_stats.json` (min/p50/p90/p99/max and
 `over_max_length` per dataset and split) for the record.
@@ -432,24 +434,32 @@ metadata, so its bytes are a pure function of the pixels, the candidate list and
 the Pillow version — which is why each manifest records `environment.python` and
 `environment.pillow`.
 
-**Full run.** The numbers below are for the run that produced `ac-jev-v1`; the
-family list changed after it (see the table above), so they are quoted here for
-the pipeline's shape rather than as current totals. That run held 151,499 rows
-over 97,503 parsed steps — `jev_operation` 96,990, `jev_tap_target` 50,032,
-`jev_text_value` 2,970, `jev_app_target` 1,507 — split train 106,112 /
-calibration 14,312 / dev 15,816 / test 15,259, with 146,225 content-addressed
-images and a 758-name app inventory. 1,612 steps were excluded because the screen
-did not offer the recorded operation, 227 for the token budget, 10 for an
-unreadable forest and 6 for a request over the agent's 150 KB payload limit, and
-isolation dropped 403 rows. The corpus's own action mix is 51,660 clicks, 15,189
-terminal steps, 10,608 scrolls, 5,746 waits, 5,667 `open_app`s, 5,065 typed steps,
-3,026 backs and 29 homes, which is what the four families are sized from.
+**Full run.** The 15,283-episode corpus produced 97,503 parsed steps and
+**163,551 rows** — `jev_operation` 97,138, `jev_tap_target` 50,128,
+`jev_scroll_direct` 10,618, `jev_app_target` 5,667 — split train 114,392 /
+calibration 15,482 / dev 17,058 / test 16,619, with 146,462 content-addressed
+images and a 758-name app inventory. Coverage before isolation is 99.9% for
+`operation`, 96.7% of click steps for `tap_target`, 99.97% of scroll steps for
+`scroll_direct` and **100% of `open_app` steps for `app_target`**; only the tap
+family drops rows (`no_target_element` 1,280, `too_few_candidates` 361). 1,612
+steps were excluded because the screen did not offer the recorded operation, 86
+for the token budget, 10 for an unreadable forest and 6 for a request over the
+agent's 150 KB payload limit, and isolation dropped 437 rows.
 
-**Metrics.** The four `jev_*` datasets are in `metrics.py`'s macro-F1 suppression
-set: the operation question offers a per-screen subset of a fixed vocabulary and
-the target questions have per-screen candidate lists, so index macro-F1 would
-compare unrelated labels across rows. Per-row accuracy, `macro_accuracy` and
-checkpoint selection still include them.
+Two earlier runs of the same pipeline are worth remembering: capped at 128
+candidates it held 150,300 rows with `text_value` at 30.9% and `app_target` at
+23.2%; with the cap at 255 and the 8192-token gate it held 151,499. The reshape
+that merged the scrolls, added `scroll_direct` and dropped `text_value` is what
+took `app_target` from 1,507 rows to 5,667 and the whole set to 163,551.
+
+**Metrics.** `jev_operation`, `jev_tap_target` and `jev_app_target` are in
+`metrics.py`'s macro-F1 suppression set: the operation question offers a
+per-screen subset of a fixed vocabulary and the other two have per-screen
+candidate lists, so index macro-F1 would compare unrelated labels across rows.
+`jev_scroll_direct` is deliberately **not** suppressed — it always offers the
+same four directions in the same order, so its macro-F1 is meaningful, as it is
+for `gui_swipe`. Per-row accuracy, `macro_accuracy` and checkpoint selection
+include every family.
 
 **Separate output directory.** AC rows are written to their own directory
 (`data/processed/ac-jev-v1`) rather than into `gui-v1`, because the two pipelines
