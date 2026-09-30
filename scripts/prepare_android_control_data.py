@@ -39,6 +39,7 @@ import PIL
 from PIL import Image
 from transformers import AutoProcessor
 
+from dohnuts import jev_training_prompt as training
 from dohnuts import mobile_jev_prompt as jev
 from dohnuts.android_control_data import (
     MAX_CANDIDATES,
@@ -759,6 +760,27 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
                 "text_value",
                 "scroll_direct",
             ],
+            "row_families": ["operation", "tap_target", "scroll_direct", "app_target"],
+            "scroll_operation": {
+                "name": training.SCROLL_OPERATION,
+                "description": training.SCROLL_DESCRIPTION,
+                "replaces": ["SCROLL_DOWN", "SCROLL_UP", "SCROLL_LEFT", "SCROLL_RIGHT"],
+            },
+            "scroll_direct_question": {
+                "id": training.SCROLL_DIRECT,
+                "instructions": training.SCROLL_DIRECT_INSTRUCTIONS,
+                "criteria": training.SCROLL_DIRECT_CRITERIA,
+            },
+            "app_sampling": {
+                "min": training.APP_SAMPLE_MIN,
+                "max": training.APP_SAMPLE_MAX,
+                "seed": training.APP_SAMPLE_SEED,
+                "rule": (
+                    "the goal's whole-word app matches when there are at least two and the "
+                    "recorded app is among them; otherwise min..max names sampled from the "
+                    "inventory plus the recorded app, seeded by the step id"
+                ),
+            },
             "limits": {
                 "max_choice_options": jev.MAX_CHOICE_OPTIONS,
                 "max_text_candidates": jev.MAX_TEXT_CANDIDATES,

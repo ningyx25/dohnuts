@@ -1196,6 +1196,14 @@ def test_conversion_writes_splits_a_manifest_and_exclusions(tmp_path):
         "jev_tap_target",
     }
     assert manifest["vocabularies"]["rules"] == jev.RULES
+    assert manifest["vocabularies"]["row_families"] == [
+        "operation", "tap_target", "scroll_direct", "app_target",
+    ]
+    assert manifest["vocabularies"]["scroll_operation"]["name"] == "SCROLL"
+    assert list(manifest["vocabularies"]["scroll_direct_question"]["criteria"]) == [
+        "DOWN", "UP", "LEFT", "RIGHT",
+    ]
+    assert manifest["vocabularies"]["app_sampling"]["min"] == 15
     assert manifest["vocabularies"]["limits"]["max_candidates_per_row"] == MAX_CANDIDATES
     assert manifest["family_coverage"]["operation"]["rows"] == 6
     assert manifest["family_coverage"]["tap_target"] == {
