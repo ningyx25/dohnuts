@@ -265,22 +265,44 @@ seed, isolation and self-check. The parsed corpus holds 15,283 episodes and
 99,131 steps, 83,848 of them with an action; output goes under the gitignored
 `data/processed/` (the `ac-jev-v1` convention).
 
-Rows are one question each, and the questions are the agent's own:
+Rows are one question each, and the questions are the agent's own except for
+three deliberate deviations:
 
 | Question | Dataset | Type | Candidates | Target | Rows |
 | --- | --- | --- | --- | --- | --- |
-| `operation` | `jev_operation` | choice | the operations the screen offers, in the agent's fixed order | the step's operation | every step |
+| `operation` | `jev_operation` | choice | the operations the screen offers, in the agent's fixed order with the scrolls merged | the step's operation | every step |
 | `tap_target` | `jev_tap_target` | choice | the TAP candidates, as `[i] label` | the element under the action's point | click, long_press |
-| `text_value` | `jev_text_value` | choice | the goal's 1..8 word spans, plus `NONE` | the typed span | input_text |
-| `app_target` | `jev_app_target` | choice | the offered app inventory | the app the corpus opened | open_app |
+| `scroll_direct` | `jev_scroll_direct` | choice | `DOWN`, `UP`, `LEFT`, `RIGHT`, in the agent's wording | the recorded direction | scroll |
+| `app_target` | `jev_app_target` | choice | the apps the goal names, else a sample of 15..30 corpus apps plus the recorded one | the app the corpus opened | open_app |
 
-`scroll_target` is deliberately absent: Android Control records a scroll
-direction but no coordinates, so which region moved is unknowable. The state and
-the questions are produced by `dohnuts.mobile_jev_prompt`, a verbatim port of the
-agent's policy, so a row's prompt is what the agent would have posted —
-including the 771-character `RULES`, the `{'goal', 'rules'}` instruction object,
-the nine state keys and the shared 1-based element numbering (TAP targets first,
-then scroll-only regions).
+Three deviations, all applied by `dohnuts.jev_training_prompt` on top of the
+verbatim port in `dohnuts.mobile_jev_prompt`:
+
+- **One SCROLL operation.** The agent offers `SCROLL_DOWN`, `SCROLL_UP`,
+  `SCROLL_LEFT` and `SCROLL_RIGHT`; here they collapse into a single `SCROLL` —
+  at the position the first direction had — and the new `scroll_direct` question
+  chooses the direction. The element entries lose their per-direction operations
+  the same way. Android Control records the direction, so this family has a real
+  ground truth; the region question the agent also asks is still built, but no
+  row is written for it, because the corpus records no scroll coordinates.
+- **A sampled app question.** The agent offers up to 200 installed apps. Here the
+  candidates are the apps the goal names, when there are at least two and the
+  recorded app is among them; otherwise a deterministic sample of 15..30 names
+  from the corpus vocabulary plus the recorded app, seeded by the step so a rerun
+  samples the same names. A goal that names one app — the common case — gets real
+  alternatives instead of a single-option question.
+- **No `text_value` rows.** The typed value is a goal span only about half the
+  time; the question stays in the request (the agent builds it, and
+  `state.textSource` describes it) but no row is written for it, and `TYPE_TEXT`
+  remains an operation.
+
+Everything else is the agent's own: the 771-character `RULES`, the
+`{'goal', 'rules'}` instruction object, the nine state keys, the shared 1-based
+element numbering (TAP targets first, then scroll-only regions), and the tap and
+scroll_target questions. `tests/test_mobile_jev_prompt.py` proves it by feeding
+the same accessibility JSON to both implementations: byte-identical when no
+deviation applies, and identical after removing exactly the deviating fields
+otherwise.
 
 Row ids are `android_control_{episode}_step{n}:{family}`, with `n` the step's
 0-based position in the episode, and the group is
@@ -297,7 +319,7 @@ and its mark), and byte-identical screenshots never straddle splits.
 | --- | --- | --- |
 | click(x, y), long_press(x, y) | TAP | tap_target |
 | scroll(direction) | SCROLL_{DIRECTION} | — |
-| input_text(text) | TYPE_TEXT | text_value |
+| input_text(text) | TYPE_TEXT | — |
 | open_app(app_name) | OPEN_APP | app_target |
 | navigate_back, navigate_home | BACK, HOME | — |
 | wait | WAIT | — |
@@ -333,13 +355,16 @@ drops the row (`too_few_candidates`); the upper bound is 255, the same limit the
 agent's own question format has, so a row is never narrower than the question the
 policy would ask.
 
-**Text and app questions.** `text_value` offers the goal's 1..8 word n-grams plus
-`NONE`, exactly what the agent offers, and a typed value that is not one of them
-drops the row (`text_not_a_goal_span`); the corpus's typed text is a goal span
-only about half the time. `app_target` offers the app inventory the first pass
-collected from the corpus's own `open_app` names (the device's installed apps are
-not recorded), narrowed per goal by the agent's whole-word rule and capped at
-200; a narrowing that leaves one option drops the row.
+**Scroll and app questions.** `scroll_direct` always offers the four directions,
+so it resolves whenever the step is not excluded; its ground truth is the
+recorded direction, and the operation row's `SCROLL` is a separate choice.
+`app_target` offers the goal-named apps when at least two of them are in the
+corpus vocabulary and the recorded app is among them, and otherwise a
+deterministic sample of 15..30 vocabulary names plus the recorded app; a
+vocabulary too small to give a second candidate drops the row
+(`too_few_candidates`). The vocabulary itself is the first pass's collection of
+the corpus's own `open_app` names, because the device's installed apps are not
+recorded.
 
 **State.** `goal` is the episode goal verbatim; `app` is the foreground package
 inferred from the accessibility windows (the largest `TYPE_APPLICATION` window,
@@ -407,17 +432,18 @@ metadata, so its bytes are a pure function of the pixels, the candidate list and
 the Pillow version — which is why each manifest records `environment.python` and
 `environment.pillow`.
 
-**Full run.** The 15,283-episode corpus produced 97,503 parsed steps and 151,499
-rows — `jev_operation` 96,990, `jev_tap_target` 50,032, `jev_text_value` 2,970,
-`jev_app_target` 1,507 — split train 106,112 / calibration 14,312 / dev 15,816 /
-test 15,259, with 146,225 content-addressed images and a 758-name app inventory.
-Coverage before isolation is 99.8% for `operation`, 96.5% of click steps for
-`tap_target`, 58.3% of typed steps for `text_value` and 26.5% of `open_app` steps
-for `app_target`; 1,612 steps were excluded because the screen did not offer the
-recorded operation, 227 for the token budget, 10 for an unreadable forest and 6
-for a request over the agent's 150 KB payload limit, and isolation dropped 403
-rows. The first run of the same pipeline, before the candidate cap moved from 128
-to 255, held 150,300 rows with `text_value` at 30.9% and `app_target` at 23.2%.
+**Full run.** The numbers below are for the run that produced `ac-jev-v1`; the
+family list changed after it (see the table above), so they are quoted here for
+the pipeline's shape rather than as current totals. That run held 151,499 rows
+over 97,503 parsed steps — `jev_operation` 96,990, `jev_tap_target` 50,032,
+`jev_text_value` 2,970, `jev_app_target` 1,507 — split train 106,112 /
+calibration 14,312 / dev 15,816 / test 15,259, with 146,225 content-addressed
+images and a 758-name app inventory. 1,612 steps were excluded because the screen
+did not offer the recorded operation, 227 for the token budget, 10 for an
+unreadable forest and 6 for a request over the agent's 150 KB payload limit, and
+isolation dropped 403 rows. The corpus's own action mix is 51,660 clicks, 15,189
+terminal steps, 10,608 scrolls, 5,746 waits, 5,667 `open_app`s, 5,065 typed steps,
+3,026 backs and 29 homes, which is what the four families are sized from.
 
 **Metrics.** The four `jev_*` datasets are in `metrics.py`'s macro-F1 suppression
 set: the operation question offers a per-screen subset of a fixed vocabulary and
@@ -436,12 +462,14 @@ lands in several boxes is answered with a distribution over all of them — a so
 label the loss accepts, and the honest answer when two nested boxes are both
 plausible. A history entry's scroll region is the lowest-indexed scroll candidate
 of that screen. Marked bytes depend on the Pillow version. Rows carry screenshots
-even though the agent is text-only. The first full run, capped at 128 candidates,
-lost 2,407 `text_value` rows (47% of the typed steps: a goal longer than about
-nineteen words offers more spans than a row may carry) and 530 `app_target` rows;
-the cap is now the agent's own 255, so those rows are produced again and a screen
-wider than that is refused while its question is built. As in the GUI converter,
-symbolic links inside the input root can still resolve outside it.
+even though the agent is text-only. The candidate cap is the agent's own 255; a
+screen wider than that is refused while its question is built. As in the GUI
+converter, symbolic links inside the input root can still resolve outside it.
+The three deviations mean a model trained here cannot be dropped into
+`ClientMobileJev` unchanged: serving needs a bridge that maps `SCROLL` plus the
+chosen direction back onto `SCROLL_DOWN`/`SCROLL_UP`/`SCROLL_LEFT`/`SCROLL_RIGHT`,
+and either samples the app question the same way or accepts the device's own
+inventory.
 
 ```bash
 # Run from the repository root. --input is the directory of {episode_id} episode

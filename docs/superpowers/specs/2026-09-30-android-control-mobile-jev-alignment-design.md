@@ -14,9 +14,10 @@
 ## 1. 目标与成功标准
 
 1. **Parity**:`src/dohnuts/mobile_jev_prompt.py` 构造的 `{'state', 'questions'}` 与
-   android_world 端口对同一棵 a11y 树逐字段相等。测试用 stub harness 直接导入端口,
-   **同一个 a11y JSON** 分别喂给两边比较(见 §7);设 `ANDROID_WORLD_ROOT` 时运行,
-   否则跳过。
+   android_world 端口对同一棵 a11y 树逐字段相等;训练形状
+   (`jev_training_prompt`)与端口只差三处,且每一处都被单独断言(见 §7)。
+   测试用 stub harness 直接导入端口,**同一个 a11y JSON** 分别喂给两边比较;
+   设 `ANDROID_WORLD_ROOT` 时运行,否则跳过。
 2. **确定性**:同一输入 serial 与 parallel 产出的行**逐字节相同**(image 路径按文件名归一
    后比较),manifest 除 `sha256` 外完全相同。
 3. **可审计**:每个未产出的族/步都有原因,写进 `excluded.jsonl`(`stage: parse|family|isolate`)
@@ -37,12 +38,16 @@
 | 6 | `text_value` **严格**:候选恒为 goal 的 1..8 元 n-gram + `NONE`,GT 不命中就不产出行 |
 | 7 | token 预算按全量统计定为 `MAX_LENGTH = 8192`,并在转换时作为门禁(`--model` 启用) |
 | 8 | 行候选上限提到 **255**,与端口一致 |
+| 9 | **四个 `SCROLL_*` 合并为一个 `SCROLL`**,方向由新增的 `jev_scroll_direct` 族选择 |
+| 10 | **不产出 `jev_text_value`**;`TYPE_TEXT` 仅作为 operation 的一个选项保留 |
+| 11 | `jev_app_target` 候选:优先用 goal 整词命中的 app;命中不足 2 个或 GT 不在其中时,从语料词表**确定性随机**抽 15–30 个 + GT |
 | 8 | 统计以**完整语料**为准(`node01:/home/ningyongxin/workplace/proj/dohnuts/example-data/android_control_parsered`) |
 
 ## 3. 代码落点
 
 | 文件 | 职责 |
 | --- | --- |
+| `src/dohnuts/jev_training_prompt.py`(新) | 训练形状的三处偏离:`SCROLL` 合并与 `scroll_direct` 问题、app 候选采样、`text_value` 不出行;端口本身不动 |
 | `src/dohnuts/mobile_jev_prompt.py`(新) | 端口的逐字移植:`RULES`、operation 说明、target 模板、`text_candidates`、`named_apps`、`candidates_for`、`describe_action`/`element_label`、`build_questions`、`build_state`、`build_request`;`Element`/`Phone`/`Observation`/`Action`/`Candidate`/`HistoryEntry`/`QuestionSpace`/`Request` 数据结构 |
 | `src/dohnuts/android_control_data.py`(重写) | AC → `Observation` 的观测层(`iter_nodes`、`clamped_bounds`、`foreground_package`、`summarize_observation`)、候选与命中(`element_bounds`/`element_hits`/`element_target_weights`)、`step_operation`、`parse_episode`、`resolve_target`、`rows_for_ac_step`、`app_vocabulary` |
 | `src/dohnuts/android_control_mark.py` | `mark_screenshot(image, [(label, element), …])`:标签由调用方给,即 criteria 键 |
@@ -60,13 +65,15 @@
 
 | 族(dataset) | 何时产出 | question id | criteria | target |
 | --- | --- | --- | --- | --- |
-| `jev_operation` | 每个解析成功的步 | `operation` | 该屏在场的 operation,固定键序 | GT operation 的 one-hot |
+| `jev_operation` | 每个解析成功的步 | `operation` | 该屏在场的 operation,固定键序(四个 `SCROLL_*` 合并为一个 `SCROLL`) | GT operation 的 one-hot |
 | `jev_tap_target` | click/long_press 且命中 TAP 候选、2..255 候选 | `tap_target` | `[i] label` | 命中候选上的逆面积分布 |
-| `jev_text_value` | input_text 且 GT 文本 ∈ goal n-gram、2..255 候选 | `text_value` | goal span + `NONE` | 该 span 的 one-hot |
-| `jev_app_target` | open_app 且 GT ∈ 候选、2..255 候选 | `app_target` | app 显示名 | 该 app 的 one-hot |
+| `jev_scroll_direct` | scroll 步 | `scroll_direct` | `DOWN/UP/LEFT/RIGHT`(值沿用端口四句说明) | 记录方向的 one-hot |
+| `jev_app_target` | open_app 且 GT ∈ 候选、2..255 候选 | `app_target` | goal 命中的 app,否则 15–30 个采样 + GT | 该 app 的 one-hot |
+| (`jev_text_value`) | 不产出 | — | — | — |
 | (`jev_scroll_target`) | 不产出 | — | — | — |
 
 每步 1–2 行(operation + 至多一个 target 族),与端口"只校验被选中分支"一致。
+`reference.element_positions` 只对 `jev_tap_target` 有意义(其余族为 `[]`)。
 
 ## 5. state 与观测层
 
@@ -84,6 +91,30 @@
   比较得出。**已知近似**:SCROLL 的 `region_id` 取该屏下标最小的滚动候选(无候选时空缺)。
 - 顶层 `scroll_target` 问题仍由构造器生成(state 与端口同形),只是不产出对应行。
 
+### 5.1 SCROLL 合并与 `scroll_direct`
+
+- 四个 `SCROLL_*` 在 operation criteria 里折叠成一个 `SCROLL`(位置 = 原先第一个方向的位置,
+  即 `TYPE_TEXT` 之后、`BACK` 之前),说明文案:
+  `Scroll the screen to reveal more content in one direction; another question chooses that direction.`
+- `state.elements[i].operations` 去重成单个 `SCROLL`(与 TAP 并存时为 `['TAP','SCROLL']`)。
+- 新增问题 `scroll_direct`,criteria 固定为 `DOWN/UP/LEFT/RIGHT`,值逐字复用端口的四句
+  `SCROLL_*` 说明;instructions 为新增文案,并按端口惯例包成 `{goal, rules}`。
+- GT = AC `scroll` 的 `direction`(恒等映射);方向非法时 `step_operation` 仍返回 `None`
+  (整步 `unknown_action`)。
+- history 的 `operation` 记为 `SCROLL`,label 继续用端口的 `describe_action`(含方向、近似区域
+  与 gesture JSON)。
+
+### 5.2 app 候选采样
+
+- `named = named_apps(词表, goal)`(端口整词规则)。
+- `len(named) >= 2` 且(该步没有打开 app,或 GT ∈ named)→ 候选 = `named`(词表顺序)。
+- 否则 → `rng = Random(f'{APP_SAMPLE_SEED}:{step_id}:{gt_app}')`,
+  `k = rng.randint(15, 30)`,`干扰项 = rng.sample(词表 - {GT}, min(k, 其余数量))`,
+  候选 = `{GT} ∪ 干扰项` 按词表顺序;GT 不在词表里时追加在末尾。
+- 种子只依赖 (step_id, GT) 与输入词表 → serial/parallel、重跑都抽到同一组名字。
+- `state.availableApps` 与 `questions.app_target.criteria` 同步替换(端口本来同源)。
+- 词表太小(候选 < 2)时按 `too_few_candidates` 丢该族。
+
 ## 6. 上限与排除
 
 | 情形 | 处理 |
@@ -92,9 +123,9 @@
 | 请求超过 150 KB(端口的 `MAX_PAYLOAD_BYTES`) | 整步排除 `payload_too_large` |
 | GT operation 不在该屏 criteria | 整步排除 `operation_not_offered` |
 | 点击没命中任何候选 | 丢 `tap_target`,`no_target_element` |
-| 候选 <2 或 >255(三个 choice 族都会检查) | 丢该族,`too_few_candidates` / `too_many_candidates` |
+| 候选 <2 或 >255(每个 choice 族都会检查) | 丢该族,`too_few_candidates` / `too_many_candidates` |
 | 任一行超过 `recipe.MAX_LENGTH`(8192,`--model` 启用) | 整步排除 `token_budget`,`detail` 记最长行 |
-| GT 文本不是 goal span | 丢 `text_value`,`text_not_a_goal_span` |
+| `scroll_direct` 里没有记录的方向 | 丢 `scroll_direct`,`no_target_element`(方向非法时已在整步排除) |
 | GT app 不在候选 | 丢 `app_target`,`app_not_offered` |
 
 
@@ -103,16 +134,24 @@
 
 ## 7. 对齐测试(parity)
 
-`tests/test_mobile_jev_prompt.py::test_parity_on_synthetic_screens` 与
-`::test_parity_on_real_accessibility_screens`:把同一份 a11y JSON 分别交给
+`tests/test_mobile_jev_prompt.py` 把同一份 a11y JSON 分别交给
 
 - android_world 端口:序列化成 `UIElement` 列表 → `summarize_state` → `MobileJevPolicy.decide`
   (假 `JevWrapper` 捕获请求);
-- 本仓库:`android_control_data.summarize_observation` → `mobile_jev_prompt.build_request`;
+- 本仓库:`android_control_data.summarize_observation` → `jev_training_prompt.build_training_request`;
 
-断言两边请求 JSON 完全相等。合成用例覆盖 checkable/selected、无可点元素、不可见/出屏节点、
-scroll-only 屏与 goal 收窄 app;真实用例从 `example-data` 抽样 12 个 episode × 2 步。
-`ANDROID_WORLD_ROOT` 未设置时这两个用例跳过,仓库不新增依赖。
+然后按三类断言:
+
+1. **无偏离时逐字节相等**(无滚动区 + goal 命中 ≥2 个 app 且含 GT)—— 覆盖 RULES、state 键序、
+   元素编号、tap/scroll_target 问题等绝大部分 prompt 面;
+2. **只有文档化的 scroll 重构不同**:把 `operation.criteria`、`elements[*].operations`、
+   `scroll_direct` 从两侧剔除后逐字节相等,并单独断言合并后的键序、方向问题的四项与
+   `scroll_target` 仍在;
+3. **只有文档化的 app 采样不同**:剔除 `app_target` 与 `availableApps` 后逐字节相等,并断言
+   候选含 GT、数量在 16..31。
+
+真实语料用例(12 个 episode × 2 步)用第 2、3 类的"剔除后比较"。
+`ANDROID_WORLD_ROOT` 未设置时这些用例跳过,仓库不新增依赖。
 
 ## 8. 实测(node01 全量 15,283 episode)
 
@@ -180,11 +219,20 @@ isolate/validate 要逐个走 146k 个 PNG 的容器校验),产物 74GB。
 ## 10. 已记录的偏差(manifest `vocabularies.deviations`)
 
 1. 行带截图(端口纯文本):非 target 行原图,tap_target 行标号图。
-2. `jev_scroll_target` 不产出(AC 无 scroll 坐标)。
-4. history 里 SCROLL 的区域取最小下标滚动候选。
-5. app 词表来自语料自身的 `open_app` 名,不是设备安装列表(按端口截断 200)。
-6. 末步视为成功终止(parsed 语料丢了 `goal_status`)。
-7. `focusedField` 的键位置以 android_world 端口为准(与上游 JS 不同)。
+2. **一个 `SCROLL` 取代端口的四个 `SCROLL_*`,方向改由新增的 `scroll_direct` 问题选择** ——
+   端口没有这个问题。
+3. **app 候选 = goal 命中(≥2 且 GT 在其中)否则确定性采样 15–30 个 + GT**,而不是端口的
+   安装清单(≤200)。
+4. **不产出 `jev_text_value` 行**(端口的问题仍在 request 里)。
+5. `jev_scroll_target` 不产出(AC 无 scroll 坐标)。
+6. history 里 SCROLL 的区域取最小下标滚动候选。
+7. app 词表来自语料自身的 `open_app` 名。
+8. 末步视为成功终止(parsed 语料丢了 `goal_status`)。
+9. `focusedField` 的键位置以 android_world 端口为准(与上游 JS 不同)。
+
+**服务侧后果**:第 2、3 条使训练数据的请求不再与 `ClientMobileJev` 逐字相同 —— 要用这个模型
+替换 Jev,需要在服务侧加一层桥接(`SCROLL` + 方向映射回 `SCROLL_*`;app 侧要么用同一采样规则,
+要么接受设备给出的任意清单)。
 
 ## 11. 运行
 

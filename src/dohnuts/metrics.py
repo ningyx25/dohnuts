@@ -83,6 +83,9 @@ def by_dataset(records, temperatures=None):
             "jev_scroll_target",
             "jev_text_value",
             "jev_app_target",
+            # `jev_scroll_direct` is deliberately absent: it always offers the
+            # same four directions in the same order, so index macro-F1 is
+            # meaningful there, exactly as it is for gui_swipe.
         }:
             metrics.pop("macro_f1", None)
     result["macro_accuracy"] = (

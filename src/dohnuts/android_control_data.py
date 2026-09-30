@@ -13,12 +13,15 @@ What the corpus can and cannot express decides which rows exist:
 - `operation` exists for every step whose recorded action maps to an operation
   the screen offers.
 - `tap_target` exists for a click whose point lands on a TAP candidate.
-- `text_value` exists when the typed text is one of the goal's n-gram spans,
-  which is the only text the agent offers.
+- `scroll_direct` exists for a scroll: Android Control records the direction,
+  which is exactly what the question asks.
 - `app_target` exists when the opened app is offered and the question has at
   least two options.
-- `scroll_target` is never produced: Android Control records a scroll direction
-  but no coordinates, so the scrolled region cannot be identified.
+- `text_value` is not produced: the agent's question stays in the request, but
+  the value the corpus typed is only a goal span about half the time, and
+  `TYPE_TEXT` is still an operation.
+- `scroll_target` is never produced: the corpus records a scroll direction but
+  no coordinates, so the scrolled region cannot be identified.
 
 The readers (metadata, screenshot, accessibility forest) keep the contract they
 had before: they never raise, they refuse paths that escape the episode
@@ -35,24 +38,25 @@ from typing import Any, TypeGuard
 
 from PIL import Image
 
+from dohnuts import jev_training_prompt as training
 from dohnuts import mobile_jev_prompt as jev
 from dohnuts.gui_data import MAX_CANDIDATES, MIN_CANDIDATES, image_digest, one_hot, split_for
 
 DATASETS = {
     "operation": "jev_operation",
     "tap_target": "jev_tap_target",
-    "scroll_target": "jev_scroll_target",
-    "text_value": "jev_text_value",
+    "scroll_direct": "jev_scroll_direct",
     "app_target": "jev_app_target",
 }
 
 # The mapped actions (`map_action` output) that stand for one agent operation
 # each. Scrolls, the terminal step and the system buttons are handled in
-# `step_operation`, which needs the raw action to tell them apart. The scroll
-# mapping is the identity on purpose: AC's `scroll: down` reveals content below
-# the fold and mobile-jev's SCROLL_DOWN is the same gesture. The finger
-# vocabulary used by gui-v1 lives in `SCROLL_TO_SWIPE_DIRECTION` below and must
-# not be reused here.
+# `step_operation`, which needs the raw action to tell them apart. A scroll
+# becomes the single SCROLL operation; its direction is kept separately and
+# becomes the `scroll_direct` question's answer. The direction mapping is the
+# identity on purpose: AC's `scroll: down` reveals content below the fold and
+# mobile-jev's SCROLL_DOWN is the same gesture. The finger vocabulary used by
+# gui-v1 lives in `SCROLL_TO_SWIPE_DIRECTION` below and must not be reused here.
 STEP_OPERATIONS = {
     "click": "TAP",
     "long_press": "TAP",
@@ -61,10 +65,10 @@ STEP_OPERATIONS = {
     "open_app": "OPEN_APP",
 }
 SCROLL_OPERATIONS = {
-    "down": "SCROLL_DOWN",
-    "up": "SCROLL_UP",
-    "left": "SCROLL_LEFT",
-    "right": "SCROLL_RIGHT",
+    "down": "DOWN",
+    "up": "UP",
+    "left": "LEFT",
+    "right": "RIGHT",
 }
 
 # Android Control records where the content goes, gui-v1 where the finger goes:
@@ -88,7 +92,6 @@ OPERATION_NOT_OFFERED = "operation_not_offered"
 NO_TARGET_ELEMENT = "no_target_element"
 TOO_FEW_CANDIDATES = "too_few_candidates"
 TOO_MANY_CANDIDATES = "too_many_candidates"
-TEXT_NOT_A_GOAL_SPAN = "text_not_a_goal_span"
 APP_NOT_OFFERED = "app_not_offered"
 
 
@@ -556,20 +559,26 @@ def step_operation(action: str, raw: dict | None) -> str | None:
     """The agent operation a mapped Android Control action stands for.
 
     `terminate` is the null action of an episode's last step, which the agent
-    expresses as DONE. Scrolls map by identity (see `STEP_OPERATIONS`), and a
-    scroll with a direction the corpus never writes maps to None.
+    expresses as DONE. Every scroll becomes the single SCROLL operation -- its
+    direction is the `scroll_direct` answer, validated here so a direction the
+    corpus never writes is still an unknown action.
     """
     if action == "terminate":
         return "DONE"
     if action == "swipe":
-        direction = raw.get("direction") if isinstance(raw, dict) else None
-        return SCROLL_OPERATIONS.get(direction) if isinstance(direction, str) else None
+        return training.SCROLL_OPERATION if scroll_direction(raw) else None
     if action == "system_button":
         action_type = raw.get("action_type") if isinstance(raw, dict) else None
         if action_type == "navigate_back":
             return "BACK"
         return "HOME" if action_type == "navigate_home" else None
     return STEP_OPERATIONS.get(action)
+
+
+def scroll_direction(raw: dict | None) -> str | None:
+    """The `scroll_direct` answer of a scroll step: DOWN, UP, LEFT or RIGHT."""
+    direction = raw.get("direction") if isinstance(raw, dict) else None
+    return SCROLL_OPERATIONS.get(direction) if isinstance(direction, str) else None
 
 
 def question_criteria(request: jev.Request, question_id: str) -> dict | None:
@@ -657,13 +666,13 @@ def operation_label(
                 element_id=observation.phone.input_element_id,
             ).as_dict()
         )
-    if operation.startswith("SCROLL_"):
+    if operation == training.SCROLL_OPERATION:
         regions = scroll_region_candidates(request, observation)
         return jev.describe_action(
             jev.Action(
                 "scroll",
                 region_id=regions[0].id if regions else None,
-                direction=operation.removeprefix("SCROLL_").lower(),
+                direction=scroll_direction(raw).lower() if scroll_direction(raw) else None,
             ),
             observation,
         )
@@ -743,7 +752,7 @@ def family_exclusion(step_id: str, family: str, reason: str) -> dict:
 
 TARGET_FAMILIES = {
     "TAP": "tap_target",
-    "TYPE_TEXT": "text_value",
+    "SCROLL": "scroll_direct",
     "OPEN_APP": "app_target",
 }
 
@@ -777,12 +786,11 @@ def resolve_target(
     """Resolve a step's target row, or the family-level exclusion that drops it.
 
     Returns `(target, exclusion-or-None)`. An operation that carries no target
-    question -- WAIT, DONE, BACK, HOME, ENTER and the scrolls -- resolves to
+    question -- TYPE_TEXT, WAIT, DONE, BACK, HOME and ENTER -- resolves to
     `(None, None)`: there is nothing to ask, which is not a failure.
 
     Every target family is checked against the row limits first, because a
-    screen can offer fewer than two candidates or -- for a goal whose spans
-    overflow -- none at all.
+    screen can offer fewer than two candidates or none at all.
     """
     if operation == "TAP":
         weights = tap_target_weights(request, observation, raw)
@@ -796,16 +804,18 @@ def resolve_target(
         else:
             reason = NO_TARGET_ELEMENT
         return None, family_exclusion(step_id, "tap_target", reason)
-    if operation == "TYPE_TEXT":
-        criteria = question_criteria(request, "text_value")
-        text = raw.get("text") if isinstance(raw, dict) else None
-        key = next((key for key, value in (criteria or {}).items() if value == text), None)
+    if operation == training.SCROLL_OPERATION:
+        criteria = question_criteria(request, training.SCROLL_DIRECT)
+        direction = scroll_direction(raw)
         reason = width_reason(criteria) if criteria is not None else TOO_FEW_CANDIDATES
         if reason is not None:
-            return None, family_exclusion(step_id, "text_value", reason)
-        if key is None:
-            return None, family_exclusion(step_id, "text_value", TEXT_NOT_A_GOAL_SPAN)
-        return Target("text_value", key, one_hot(len(criteria), list(criteria).index(key))), None
+            return None, family_exclusion(step_id, "scroll_direct", reason)
+        if direction is None or direction not in criteria:
+            return None, family_exclusion(step_id, "scroll_direct", NO_TARGET_ELEMENT)
+        return (
+            Target("scroll_direct", direction, one_hot(len(criteria), list(criteria).index(direction))),
+            None,
+        )
     if operation == "OPEN_APP":
         criteria = question_criteria(request, "app_target")
         label = raw.get("app_name") if isinstance(raw, dict) else None
@@ -829,12 +839,13 @@ def parse_episode(
     screenshot or accessibility forest cannot be read, its action is unknown,
     the screen offers no such operation, or its request would exceed the payload
     the agent refuses to send. Family-level failures -- a click that hit no
-    candidate, a typed value that is not a goal span, an app that is not offered
-    -- drop one target row and leave the operation row in place.
+    candidate, a scroll with no direction question, an app that is not offered --
+    drop one target row and leave the operation row in place.
 
-    `apps` is the offered inventory, narrowed per goal by
-    `mobile_jev_prompt.build_request` exactly as the agent narrows the installed
-    apps it reads from the device.
+    `apps` is the corpus inventory. `jev_training_prompt.build_training_request`
+    turns it into the question's candidates: the apps the goal names when they
+    can carry the question, otherwise a sample of them plus the app this step
+    opened, seeded by the step so a rerun samples the same names.
 
     History covers the steps that were parsed: a step excluded for a missing
     screen or an unknown action never executed in this data and so contributes
@@ -900,8 +911,16 @@ def parse_episode(
             if operation is None:
                 exclusions.append(exclusion(step_id, "unknown_action"))
                 continue
+        gt_app = raw_action.get("app_name") if operation == "OPEN_APP" and isinstance(raw_action, dict) else None
         try:
-            request = jev.build_request(goal, observation, history, apps)
+            request = training.build_training_request(
+                goal,
+                observation,
+                history,
+                apps,
+                gt_app=gt_app if isinstance(gt_app, str) else None,
+                seed=step_id,
+            )
         except jev.PayloadTooLargeError:
             exclusions.append(exclusion(step_id, "payload_too_large"))
             continue
@@ -939,7 +958,11 @@ def parse_episode(
                     "action": instruction or "",
                     "tool_call": {"name": "mobile_use", "arguments": arguments},
                     "ac_action": ac_action,
-                    "element_positions": target.positions if target is not None else [],
+                    "element_positions": (
+                        target.positions
+                        if target is not None and target.family == "tap_target"
+                        else []
+                    ),
                 },
             )
         )

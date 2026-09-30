@@ -18,6 +18,7 @@ from unittest import mock
 
 import pytest
 
+from dohnuts import jev_training_prompt as training
 from dohnuts import mobile_jev_prompt as prompt
 
 SCREEN = (1080, 2400)
@@ -504,15 +505,17 @@ def ui_element(port, node):
     )
 
 
-def build_side_by_side(port, interface, tree, package, goal, apps, history_pairs=()):
-    """Returns (agent_request, port_request) for the same accessibility tree.
+def build_side_by_side(port, interface, tree, package, goal, apps, history_pairs=(), *, gt_app=None):
+    """Returns (agent_request, training_request) for the same accessibility tree.
 
     Both sides read the very same JSON: the agent through a serialized
     `UIElement` list (which is what `AndroidEnvClient` hands it), and the
-    conversion through `summarize_observation`. Anything that would make them
-    disagree -- a filter, an id, a clamp, a label -- fails the comparison.
+    conversion through `summarize_observation` plus the training overlay.
+    Anything the overlay is not supposed to touch -- a filter, an id, a clamp, a
+    label, the rules text -- fails the comparison.
     """
     import dohnuts.android_control_data as ac  # noqa: PLC0415
+    import dohnuts.jev_training_prompt as training  # noqa: PLC0415
 
     nodes = [node for window in tree["windows"] for node in _nodes(window)]
     state = interface.State([ui_element(port, node) for node in nodes])
@@ -545,7 +548,7 @@ def build_side_by_side(port, interface, tree, package, goal, apps, history_pairs
     # malformed distribution -- after capturing the request.
     with pytest.raises(port.InvalidChoiceError):
         policy.decide(goal, port_observation, history, apps=apps)
-    mine_request = prompt.build_request(
+    mine_request = training.build_training_request(
         goal,
         my_observation,
         [
@@ -553,83 +556,97 @@ def build_side_by_side(port, interface, tree, package, goal, apps, history_pairs
             for op, lb in history_pairs
         ],
         apps,
+        gt_app=gt_app,
+        seed="parity",
     ).as_dict()
     return captured["request"], mine_request
+
+
+def comparable(request, *, scroll=False, apps=False):
+    """The agent's request with the documented deviations removed.
+
+    The overlay is allowed to change exactly three things. Taking those out of
+    both sides leaves everything else -- the rules, the state keys, the element
+    numbering, the tap and scroll_target questions -- under a byte comparison,
+    so an unintended change anywhere else still fails.
+    """
+    import copy  # noqa: PLC0415
+
+    request = copy.deepcopy(request)
+    if scroll:
+        request["questions"]["operation"].pop("criteria")
+        request["questions"].pop("scroll_direct", None)
+        for entry in request["state"]["elements"]:
+            entry.pop("operations", None)
+    if apps:
+        request["questions"].pop("app_target", None)
+        request["state"].pop("availableApps", None)
+    return json.dumps(request, ensure_ascii=False, sort_keys=True)
 
 
 def _nodes(window):
     return (window.get("tree") or {}).get("nodes") or []
 
 
+def tap_only_document():
+    """A screen with a clickable node and no scroll region."""
+    return document(
+        a11y_node(text="Wi-Fi", clickable=True, bounds=(0, 0, 200, 50)),
+        a11y_node(text="Notes", clickable=True, bounds=(0, 60, 200, 110)),
+    )
+
+
+def scroll_document():
+    return document(
+        a11y_node(text="Save", clickable=True, bounds=(0, 0, 200, 50)),
+        a11y_node(text="List", scrollable=True, bounds=(0, 200, 1000, 1000)),
+    )
+
+
 @requires_port
-def test_parity_on_synthetic_screens():
+def test_parity_is_byte_identical_when_no_deviation_applies():
+    """No scroll region, and a goal whose two apps carry the question."""
     port, interface = load_port()
-    cases = [
-        (
-            document(
-                a11y_node(text="Wi-Fi", clickable=True, bounds=(0, 0, 200, 50)),
-                a11y_node(
-                    class_name="android.widget.EditText",
-                    editable=True,
-                    focused=True,
-                    bounds=(0, 100, 200, 150),
-                ),
-                a11y_node(text="List", scrollable=True, bounds=(0, 200, 1000, 1000)),
-            ),
-            "com.example",
-            "Tap Wi-Fi",
-            ["Notes"],
-            (),
-        ),
-        (
-            document(
-                a11y_node(text="Calendar", bounds=(40, 100, 400, 160)),
-                a11y_node(content_description="Search", clickable=True, bounds=(900, 120, 1040, 240)),
-                a11y_node(
-                    hint="Title",
-                    class_name="android.widget.EditText",
-                    editable=True,
-                    focused=True,
-                    bounds=(40, 400, 1040, 500),
-                ),
-                a11y_node(text="Team Sync", bounds=(40, 600, 600, 660)),
-                a11y_node(content_description="Save", clickable=True, bounds=(800, 2000, 1040, 2120)),
-                a11y_node(scrollable=True, bounds=(0, 300, 1080, 2200)),
-                a11y_node(
-                    text="Wi-Fi", clickable=True, checkable=True, checked=True, bounds=(0, 0, 200, 100)
-                ),
-                a11y_node(text="Tab", clickable=True, selected=True, bounds=(0, 0, 100, 100)),
-            ),
-            "com.google.android.calendar",
-            CALENDAR_GOAL,
-            CALENDAR_APPS,
-            (("TAP", "Tap Search."),),
-        ),
-        (document(), "com.example", "Open the Clock app.", ["Clock", "Notes"], ()),
-        (
-            document(a11y_node(clickable=True, bounds=(0, 0, 10, 10))),
-            "com.example",
-            "x",
-            [],
-            (),
-        ),
-        (
-            document(
-                a11y_node(text="invisible", clickable=True, visible=False, bounds=(0, 0, 10, 10)),
-                a11y_node(text="offscreen", clickable=True, bounds=(5000, 5000, 5100, 5100)),
-                a11y_node(text="kept", bounds=(0, 0, 50, 50)),
-            ),
-            "com.example",
-            "Tap kept",
-            [],
-            (),
-        ),
+    apps = ("Clock", "Notes", "Camera")
+    agent, mine = build_side_by_side(
+        port, interface, tap_only_document(), "com.example", "Open Clock and Notes",
+        apps, gt_app="Clock",
+    )
+    assert json.dumps(mine, ensure_ascii=False, sort_keys=True) == json.dumps(
+        agent, ensure_ascii=False, sort_keys=True
+    )
+
+
+@requires_port
+def test_parity_differs_only_in_the_documented_scroll_restructure():
+    port, interface = load_port()
+    agent, mine = build_side_by_side(
+        port, interface, scroll_document(), "com.example", "Tap Save", []
+    )
+    assert comparable(mine, scroll=True) == comparable(agent, scroll=True)
+    # ...and the difference is exactly the one the manifest documents.
+    assert "SCROLL" in mine["questions"]["operation"]["criteria"]
+    assert not [
+        name for name in mine["questions"]["operation"]["criteria"]
+        if name.startswith("SCROLL_")
     ]
-    for tree, package, goal, apps, history in cases:
-        agent, mine = build_side_by_side(port, interface, tree, package, goal, apps, history)
-        assert json.dumps(mine, ensure_ascii=False, sort_keys=True) == json.dumps(
-            agent, ensure_ascii=False, sort_keys=True
-        )
+    assert "scroll_direct" in mine["questions"]
+    assert "scroll_target" in mine["questions"]
+    assert [entry["operations"] for entry in mine["state"]["elements"]] == [["TAP"], ["SCROLL"]]
+
+
+@requires_port
+def test_parity_differs_only_in_the_documented_app_sample():
+    port, interface = load_port()
+    apps = tuple(f"App{index:03d}" for index in range(40))
+    agent, mine = build_side_by_side(
+        port, interface, tap_only_document(), "com.example", "Open App003", apps,
+        gt_app="App003",
+    )
+    assert comparable(mine, apps=True) == comparable(agent, apps=True)
+    offered = list(mine["questions"]["app_target"]["criteria"].values())
+    assert "App003" in offered
+    assert 16 <= len(offered) <= 31
 
 
 @requires_port
@@ -661,25 +678,24 @@ def test_parity_on_real_accessibility_screens():
             except (OSError, ValueError):
                 continue
             agent, mine = build_side_by_side(
-                port, interface, tree, "com.example", goal, ["Clock", "Notes"]
+                port, interface, tree, "com.example", goal, ("Clock", "Notes")
             )
-            assert json.dumps(mine, ensure_ascii=False, sort_keys=True) == json.dumps(
-                agent, ensure_ascii=False, sort_keys=True
+            assert comparable(mine, scroll=True, apps=True) == comparable(
+                agent, scroll=True, apps=True
             ), f"parity mismatch on {directory.name}/{name}"
             checked += 1
     assert checked
 
 
-def test_scroll_direction_mapping_is_identity_for_the_agent_vocabulary():
+def test_the_scroll_vocabulary_is_the_agents_except_for_the_merge():
     """AC's `scroll: down` and mobile-jev's SCROLL_DOWN both reveal content below."""
     assert prompt.SCROLL_DIRECTIONS == ("down", "up", "right", "left")
-    assert set(prompt.OPERATION_DESCRIPTIONS) >= {
-        "SCROLL_DOWN",
-        "SCROLL_UP",
-        "SCROLL_LEFT",
-        "SCROLL_RIGHT",
-    }
     assert prompt.OPERATION_DESCRIPTIONS["SCROLL_DOWN"] == (
         "Scroll down to reveal more content in that direction."
     )
     assert not re.search(r"swipe", prompt.RULES, re.IGNORECASE)
+    # The training shape offers one SCROLL and asks the direction separately,
+    # reusing the agent's own wording for each direction.
+    assert training.SCROLL_OPERATION == "SCROLL"
+    assert list(training.SCROLL_DIRECT_CRITERIA) == ["DOWN", "UP", "LEFT", "RIGHT"]
+    assert training.SCROLL_DIRECT_CRITERIA["UP"] == prompt.OPERATION_DESCRIPTIONS["SCROLL_UP"]

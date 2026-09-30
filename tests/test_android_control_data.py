@@ -22,7 +22,6 @@ from dohnuts.android_control_data import (
     MIN_CANDIDATES,
     NO_TARGET_ELEMENT,
     OPERATION_NOT_OFFERED,
-    TEXT_NOT_A_GOAL_SPAN,
     TOO_FEW_CANDIDATES,
     app_vocabulary,
     clamped_bounds,
@@ -38,6 +37,7 @@ from dohnuts.android_control_data import (
     read_a11y,
     read_screenshot,
     rows_for_ac_step,
+    scroll_direction,
     step_operation,
     step_problem,
     summarize_observation,
@@ -309,7 +309,7 @@ def test_map_action_rejects_unknown_or_malformed_actions():
     assert map_action("click") is None
 
 
-def test_step_operation_maps_scrolls_by_identity_and_the_last_step_to_done():
+def test_step_operation_merges_the_scrolls_and_the_last_step_is_done():
     assert step_operation("click", None) == "TAP"
     assert step_operation("long_press", None) == "TAP"
     # `map_action` names the mapped action "type"; `step_operation` reads that.
@@ -320,13 +320,18 @@ def test_step_operation_maps_scrolls_by_identity_and_the_last_step_to_done():
     assert step_operation("system_button", {"action_type": "navigate_back"}) == "BACK"
     assert step_operation("system_button", {"action_type": "navigate_home"}) == "HOME"
     assert step_operation("terminate", None) == "DONE"
-    # AC's `scroll: down` reveals content below the fold, which is exactly the
-    # agent's SCROLL_DOWN; flipping it here would teach the opposite gesture.
-    assert step_operation("swipe", {"direction": "down"}) == "SCROLL_DOWN"
-    assert step_operation("swipe", {"direction": "up"}) == "SCROLL_UP"
-    assert step_operation("swipe", {"direction": "left"}) == "SCROLL_LEFT"
-    assert step_operation("swipe", {"direction": "right"}) == "SCROLL_RIGHT"
+    # Every scroll is one SCROLL operation now; the direction is the answer to
+    # the separate question, and it keeps AC's own meaning (see
+    # `SCROLL_TO_SWIPE_DIRECTION` for the gui-v1 finger vocabulary, which is a
+    # different mapping).
+    assert step_operation("swipe", {"direction": "down"}) == "SCROLL"
+    assert step_operation("swipe", {"direction": "up"}) == "SCROLL"
+    assert scroll_direction({"direction": "down"}) == "DOWN"
+    assert scroll_direction({"direction": "up"}) == "UP"
+    assert scroll_direction({"direction": "left"}) == "LEFT"
+    assert scroll_direction({"direction": "right"}) == "RIGHT"
     assert step_operation("swipe", {"direction": "diagonal"}) is None
+    assert scroll_direction({"direction": "diagonal"}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -670,7 +675,7 @@ def test_state_is_the_agent_state_with_the_goal_and_the_screen(tmp_path):
     }
 
 
-def test_scroll_step_maps_by_identity_and_produces_no_target_row(tmp_path):
+def test_scroll_step_produces_a_direction_row(tmp_path):
     directory = tmp_path / "episode"
     record = ac_episode(
         ac_step(
@@ -690,18 +695,33 @@ def test_scroll_step_maps_by_identity_and_produces_no_target_row(tmp_path):
     )
     step = only_step(record, directory=directory)
     assert step.action == "swipe"
-    assert step.operation == "SCROLL_DOWN"
+    assert step.operation == "SCROLL"
     assert step.arguments == {"action": "swipe", "direction": "up"}
-    assert step.target is None
-    assert "SCROLL_DOWN" in step.request.questions["operation"]["criteria"]
+    assert step.target is not None
+    assert step.target.family == "scroll_direct"
+    assert step.target.key == "DOWN"
+    assert step.target.weights == [1.0, 0.0, 0.0, 0.0]
+    criteria = step.request.questions["operation"]["criteria"]
+    assert "SCROLL" in criteria
+    assert not [name for name in criteria if name.startswith("SCROLL_")]
+    # The agent's region question is still built; the conversion just never
+    # writes a row for it.
     assert "scroll_target" in step.request.questions
     rows = rows_for_ac_step(step, RAW_IMAGE)
-    assert [row["dataset"] for row in rows] == ["jev_operation"]
-    criteria = list(rows[0]["question"]["criteria"])
-    assert rows[0]["target"][criteria.index("SCROLL_DOWN")] == 1.0
+    assert [row["dataset"] for row in rows] == ["jev_operation", "jev_scroll_direct"]
+    operation, direction = rows
+    assert direction["question"]["criteria"] == {
+        "DOWN": "Scroll down to reveal more content in that direction.",
+        "UP": "Scroll up to reveal more content in that direction.",
+        "LEFT": "Scroll left to reveal more content in that direction.",
+        "RIGHT": "Scroll right to reveal more content in that direction.",
+    }
+    assert direction["target"] == [1.0, 0.0, 0.0, 0.0]
+    assert operation["target"][list(operation["question"]["criteria"]).index("SCROLL")] == 1.0
+    assert direction["reference"]["element_positions"] == []
 
 
-def test_typed_step_is_only_offered_when_the_text_is_a_goal_span(tmp_path):
+def test_typed_step_keeps_type_text_as_an_operation_without_a_target_row(tmp_path):
     directory = tmp_path / "episode"
     nodes = [
         node(
@@ -724,13 +744,16 @@ def test_typed_step_is_only_offered_when_the_text_is_a_goal_span(tmp_path):
     )
     step = only_step(record, directory=directory)
     assert step.operation == "TYPE_TEXT"
-    assert step.target is not None
-    assert step.target.family == "text_value"
-    assert step.request.questions["text_value"]["criteria"][step.target.key] == "Zoho Meet"
+    assert step.target is None
+    # The agent's question is still built and the operation is still offered;
+    # only the row is not written, whatever the typed value was.
+    assert "TYPE_TEXT" in step.request.questions["operation"]["criteria"]
+    assert "Zoho Meet" in step.request.questions["text_value"]["criteria"].values()
     assert step.history_entry.text == "Zoho Meet"
     assert step.history_entry.label == jev.canonical_json(
         {"element_id": "0", "text": "Zoho Meet", "type": "type"}
     )
+    assert [row["dataset"] for row in rows_for_ac_step(step, RAW_IMAGE)] == ["jev_operation"]
 
     outside = ac_episode(
         ac_step(
@@ -744,14 +767,7 @@ def test_typed_step_is_only_offered_when_the_text_is_a_goal_span(tmp_path):
     steps, exclusions = parse(outside, directory=directory)
     assert [item.operation for item in steps] == ["TYPE_TEXT"]
     assert steps[0].target is None
-    assert exclusions == [
-        {
-            "id": "android_control_7_step0:text_value",
-            "reason": TEXT_NOT_A_GOAL_SPAN,
-            "detail": "",
-            "stage": "family",
-        }
-    ]
+    assert exclusions == []
 
 
 def test_open_app_step_targets_the_offered_inventory(tmp_path):

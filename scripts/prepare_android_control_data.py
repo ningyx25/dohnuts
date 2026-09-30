@@ -67,7 +67,7 @@ PROGRESS_EVERY = 1000
 FAMILY_REASONS = {
     "operation": (),
     "tap_target": ("no_target_element", "too_few_candidates", "too_many_candidates"),
-    "text_value": ("text_not_a_goal_span", "too_few_candidates", "too_many_candidates"),
+    "scroll_direct": ("no_target_element", "too_few_candidates", "too_many_candidates"),
     "app_target": ("app_not_offered", "too_few_candidates", "too_many_candidates"),
 }
 
@@ -82,26 +82,30 @@ _TOKEN_PROCESSOR = None
 # The rules behind a row are stated in the manifest, so a consumer can tell what
 # its criteria and targets mean without reading this script.
 PROMPT_RULE = (
-    "Every row's state and question are byte-for-byte what android_world's "
-    "ClientMobileJev builds for the same accessibility tree and goal: the nine "
-    "state keys (goal, app, isEditable, textSource, textEntryAvailableAfterFocus, "
-    "visibleText, elements, availableApps, recentActions) plus an optional "
-    "focusedField, and one question whose id, instructions and criteria text come "
-    "from that policy. The operation question's criteria keep its fixed order "
-    "(OPEN_APP, TAP, TYPE_TEXT, SCROLL_DOWN, SCROLL_UP, SCROLL_LEFT, SCROLL_RIGHT, "
-    "BACK, HOME, ENTER, WAIT, DONE, BLOCKED) and only include what the screen "
-    "offers; element indices are the policy's shared 1-based numbering (TAP "
-    "targets first, then scroll-only regions), and instructions are the "
-    "{'goal', 'rules'} object the policy sends."
+    "Every row's state and question come from android_world's ClientMobileJev "
+    "policy for the same accessibility tree and goal: the nine state keys (goal, "
+    "app, isEditable, textSource, textEntryAvailableAfterFocus, visibleText, "
+    "elements, availableApps, recentActions) plus an optional focusedField, the "
+    "policy's instructions, and its {'goal', 'rules'} wrapper. Three things are "
+    "deliberate deviations, applied by dohnuts.jev_training_prompt: the four "
+    "SCROLL_* operations collapse into one SCROLL whose direction a new "
+    "scroll_direct question chooses; the app question's candidates are the apps "
+    "the goal names when there are at least two and the recorded app is among "
+    "them, otherwise a deterministic sample of 15..30 corpus app names plus the "
+    "recorded app; and no text_value row is produced. The operation question "
+    "keeps the policy's order with the scrolls merged (OPEN_APP, TAP, TYPE_TEXT, "
+    "SCROLL, BACK, HOME, ENTER, WAIT, DONE, BLOCKED) and only includes what the "
+    "screen offers; element indices are the policy's shared 1-based numbering "
+    "(TAP targets first, then scroll-only regions)."
 )
 TARGET_RULE = (
     "A target row exists only for the operation the step recorded: a click lists "
     "the TAP candidates as '[i] label' and the ground truth is every candidate "
     "whose box contains the recorded point, weighted by inverse box area and "
-    "normalized over the hits (a single hit is a one-hot); a typed step lists the "
-    "goal's 1..8 word spans plus NONE and the ground truth is the typed span when "
-    "the goal contains it; an open_app step lists the offered app inventory and "
-    "the ground truth is the app the corpus opened. Only steps with 2.."
+    "normalized over the hits (a single hit is a one-hot); a scroll lists DOWN, "
+    "UP, LEFT and RIGHT and the ground truth is the recorded direction; an "
+    "open_app step lists the app candidates described in prompt_rule and the "
+    "ground truth is the app the corpus opened. Only steps with 2.."
     f"{MAX_CANDIDATES} candidates produce the row."
 )
 MARKED_IMAGES = (
@@ -671,7 +675,7 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
     for family, dataset in (
         ("operation", "jev_operation"),
         ("tap_target", "jev_tap_target"),
-        ("text_value", "jev_text_value"),
+        ("scroll_direct", "jev_scroll_direct"),
         ("app_target", "jev_app_target"),
     ):
         asked = attempts.get(family, 0)
@@ -721,8 +725,8 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
         "dataset_weighting": (
             "TrainingBatches draws a dataset name uniformly at random before drawing a row "
             "from it, so the four dataset names carry equal weight regardless of how many "
-            "rows each has; because tap_target, text_value and app_target rows only exist on "
-            "the steps that recorded such an action, those rows are relatively upweighted"
+            "rows each has; because tap_target, scroll_direct and app_target rows only exist "
+            "on the steps that recorded such an action, those rows are relatively upweighted"
         ),
         "token_stats": (
             "rows over recipe.MAX_LENGTH are excluded whole as parse:token_budget when the "
@@ -753,6 +757,7 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
                 "tap_target",
                 "scroll_target",
                 "text_value",
+                "scroll_direct",
             ],
             "limits": {
                 "max_choice_options": jev.MAX_CHOICE_OPTIONS,
@@ -769,6 +774,14 @@ def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> 
             "deviations": [
                 "rows carry a screenshot (the agent is text only): the raw frame, or the "
                 "marked frame for tap_target",
+                "one SCROLL operation replaces the agent's SCROLL_DOWN/UP/LEFT/RIGHT, and a "
+                "new scroll_direct question chooses the direction; the agent has no such "
+                "question",
+                "the app question offers the goal-named apps when there are at least two "
+                "and the recorded app is among them, otherwise a deterministic sample of "
+                "15..30 corpus app names plus the recorded app, not the agent's installed "
+                "inventory",
+                "no text_value row is produced; the agent's question stays in the request",
                 "scroll_target rows are never produced: Android Control records a scroll "
                 "direction but no coordinates, so the scrolled region is unknown",
                 "a history entry's scroll region is the lowest-indexed scroll candidate of "
