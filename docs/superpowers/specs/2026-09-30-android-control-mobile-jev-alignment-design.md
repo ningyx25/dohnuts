@@ -123,7 +123,7 @@ scroll-only 屏与 goal 收窄 app;真实用例从 `example-data` 抽样 12 个 
 | 步 | 99,131 步中 97,503 步产出请求(与语料步数一致);步级排除 `operation_not_offered` 1,612、`missing_a11y` 10、`payload_too_large` 6 |
 | 行(写出) | 150,300:`jev_operation` 97,217、`jev_tap_target` 50,193、`jev_text_value` 1,574、`jev_app_target` 1,316 |
 | 行(pre-isolation) | 150,703;隔离期丢弃 403(`cross_split_group` 396、`duplicate_input` 7) |
-| split | train 115,268、calibration 14,209、dev 15,673、test 15,150 |
+| split | train 105,268、calibration 14,209、dev 15,673、test 15,150 |
 | 覆盖率(pre-isolation) | operation 97,503/97,503 = 1.000;tap_target 50,302/51,947 = 0.968;text_value 1,577/5,104 = 0.309;app_target 1,321/5,697 = 0.232 |
 | 族级丢弃 | `no_target_element` 1,280、`too_few_candidates` 4,115(tap 361 / text 3 / app 3,754)、`too_many_candidates` 2,941(tap 4 / text 2,407 / app 530)、`text_not_a_goal_span` 1,120、`app_not_offered` 92 |
 | 图像 | 146,613 个内容寻址 PNG;app 词表 758 个显示名 |

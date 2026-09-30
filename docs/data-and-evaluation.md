@@ -406,7 +406,7 @@ the Pillow version — which is why each manifest records `environment.python` a
 
 **Full run.** The 15,283-episode corpus produced 97,503 parsed steps and 150,300
 rows — `jev_operation` 97,217, `jev_tap_target` 50,193, `jev_text_value` 1,574,
-`jev_app_target` 1,316 — split train 115,268 / calibration 14,209 / dev 15,673 /
+`jev_app_target` 1,316 — split train 105,268 / calibration 14,209 / dev 15,673 /
 test 15,150, with 146,613 content-addressed images and a 758-name app inventory.
 Coverage before isolation is 100% for `operation`, 96.8% of click steps for
 `tap_target`, 30.9% of typed steps for `text_value` and 23.2% of `open_app` steps
