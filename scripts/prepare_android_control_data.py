@@ -10,8 +10,13 @@ inventory collected in a first pass over the same files, content-addressed
 screenshots, the split seed, and the conversion rules decide every output byte.
 Episodes may be converted in parallel (`--workers`); the merge is ordered, so the
 published files are the ones a serial run would have written. Run from the
-repository root. Token lengths are measured separately by
-`scripts/report_token_lengths.py`; nothing is excluded for its size here.
+repository root.
+
+`--model` turns on the token budget check, which mirrors the training collator
+(`dohnuts.token_stats.measure` against `recipe.MAX_LENGTH`) and excludes a step
+whole when any of its rows is over budget: `DecisionCollator` raises on such a
+batch instead of truncating. The distribution of every row is reported separately
+by `scripts/report_token_lengths.py`.
 """
 
 import argparse
@@ -32,6 +37,7 @@ from pathlib import Path
 
 import PIL
 from PIL import Image
+from transformers import AutoProcessor
 
 from dohnuts import mobile_jev_prompt as jev
 from dohnuts.android_control_data import (
@@ -47,6 +53,8 @@ from dohnuts.android_control_data import (
 )
 from dohnuts.android_control_mark import mark_screenshot
 from dohnuts.gui_data import SPLIT_LIMITS, SPLIT_SEED, isolate, validate_rows
+from dohnuts.recipe import MAX_LENGTH
+from dohnuts.token_stats import measure
 
 SPLITS = ["train", "dev", "calibration", "test"]
 
@@ -65,6 +73,11 @@ FAMILY_REASONS = {
 
 # Temporary names of `staged_write`, unique within a process and across them.
 _TEMP_NAMES = count()
+
+# The token-check processor: a module global rather than a job argument because
+# it holds a tokenizer that does not pickle, while a forked worker inherits the
+# object as it stands when the pool is created.
+_TOKEN_PROCESSOR = None
 
 # The rules behind a row are stated in the manifest, so a consumer can tell what
 # its criteria and targets mean without reading this script.
@@ -256,7 +269,9 @@ def store_marked(target: Path, payload: bytes) -> None:
             staged.write_bytes(payload)
 
 
-def process_episode(episode_dir: Path, *, output: Path, root: Path, apps: tuple[str, ...]) -> dict:
+def process_episode(
+    episode_dir: Path, *, output: Path, root: Path, apps: tuple[str, ...], token_check: bool
+) -> dict:
     """Convert one episode into the plain-data slice of the run it contributes.
 
     Everything returned is picklable, because the result crosses a process
@@ -280,7 +295,14 @@ def process_episode(episode_dir: Path, *, output: Path, root: Path, apps: tuple[
         document, raw, detail = None, None, ""
     try:
         result = convert_episode(
-            episode_dir, name, document, detail, output=output, root=root, apps=apps
+            episode_dir,
+            name,
+            document,
+            detail,
+            output=output,
+            root=root,
+            apps=apps,
+            token_check=token_check,
         )
     except Exception as error:
         result = {
@@ -311,6 +333,7 @@ def convert_episode(
     output: Path,
     root: Path,
     apps: tuple[str, ...],
+    token_check: bool,
 ) -> dict:
     """Parse, store and mint the rows of one episode.
 
@@ -369,6 +392,33 @@ def convert_episode(
                 if family is not None:
                     attempts[family] += 1
                 raw_target = image_path(output, step.image_sha256)
+                raw_relative = os.path.relpath(raw_target, root)
+                if token_check:
+                    # The probe rows are the rows this step would mint, measured
+                    # against the source screenshot: the stored copies do not
+                    # exist yet, and neither marking nor copying changes the
+                    # dimensions the image term reads.
+                    source = str(step.image)
+                    probe_marked = (
+                        (source, step.image_sha256)
+                        if step.target is not None and step.target.family == "tap_target"
+                        else None
+                    )
+                    lengths = [
+                        measure(_TOKEN_PROCESSOR, row)
+                        for row in rows_for_ac_step(step, source, marked=probe_marked)
+                    ]
+                    if max(lengths) > MAX_LENGTH:
+                        audit["parse:token_budget"] += 1
+                        excluded.append(
+                            {
+                                "id": step.id,
+                                "reason": "token_budget",
+                                "detail": str(max(lengths)),
+                                "stage": "parse",
+                            }
+                        )
+                        continue
                 marked = None
                 marked_png = None
                 candidates = marked_candidates(step)
@@ -379,7 +429,7 @@ def convert_episode(
                 # Rows are minted before anything is written, and an image is
                 # written and listed only for a step whose rows exist: no
                 # failure can leave a file on disk that the manifest omits.
-                produced = rows_for_ac_step(step, os.path.relpath(raw_target, root), marked=marked)
+                produced = rows_for_ac_step(step, raw_relative, marked=marked)
                 store_raw(step, raw_target)
                 images_written.append(raw_target.name)
                 if marked_png is not None:
@@ -411,7 +461,13 @@ def convert_episode(
 
 
 def episode_results(
-    episodes: list[Path], *, output: Path, root: Path, apps: tuple[str, ...], workers: int
+    episodes: list[Path],
+    *,
+    output: Path,
+    root: Path,
+    apps: tuple[str, ...],
+    workers: int,
+    token_check: bool,
 ):
     """Yield one `process_episode` result per episode, in episode order.
 
@@ -424,7 +480,9 @@ def episode_results(
     argument rather than a module global, so the output cannot depend on when the
     pool was forked.
     """
-    job = partial(process_episode, output=output, root=root, apps=apps)
+    job = partial(
+        process_episode, output=output, root=root, apps=apps, token_check=token_check
+    )
     if workers <= 1:
         for episode_dir in episodes:
             yield job(episode_dir)
@@ -472,10 +530,11 @@ def family_stats(counts: Counter, widths: dict, positives: dict) -> dict:
     return stats
 
 
-def convert(source: Path, output: Path, *, workers: int = 1) -> dict:
+def convert(source: Path, output: Path, *, processor=None, workers: int = 1) -> dict:
     """Convert every episode under `source` into the splits under `output`.
 
-    `workers` above 1 converts that many episodes at a time. The workers only
+    `processor` enables the token budget check; `workers` above 1 converts that
+    many episodes at a time. The workers only
     ever run rules on their own episode and store content-addressed files, so the
     run is as deterministic as the serial one: every episode's results are merged
     in episode order, which fixes the row order, the counters, the image list,
@@ -487,6 +546,7 @@ def convert(source: Path, output: Path, *, workers: int = 1) -> dict:
     where they are, so `manifest["images"]` describes this run rather than the
     directory.
     """
+    global _TOKEN_PROCESSOR
     root = repository_root()
     if Path.cwd().resolve() != root:
         raise SystemExit(f"Run from the repository root: {root}")
@@ -503,6 +563,7 @@ def convert(source: Path, output: Path, *, workers: int = 1) -> dict:
     # Pass one: the offered app inventory. The first pass over the corpus is
     # what lets a row ask which app to open, since Android Control never records
     # the device's installed apps -- only the apps it actually opened.
+    _TOKEN_PROCESSOR = processor
     inventory = tuple(app_vocabulary(metadata_documents(episodes)))
     print(
         json.dumps({"inventory": {"apps": len(inventory), "cap": jev.MAX_APPS}}),
@@ -520,7 +581,12 @@ def convert(source: Path, output: Path, *, workers: int = 1) -> dict:
     merged = 0
     try:
         results = episode_results(
-            episodes, output=output, root=root, apps=inventory, workers=workers
+            episodes,
+            output=output,
+            root=root,
+            apps=inventory,
+            workers=workers,
+            token_check=_TOKEN_PROCESSOR is not None,
         )
         for number, result in enumerate(results, 1):
             if result["metadata_bytes"] is not None:
@@ -659,8 +725,9 @@ def convert(source: Path, output: Path, *, workers: int = 1) -> dict:
             "the steps that recorded such an action, those rows are relatively upweighted"
         ),
         "token_stats": (
-            "not measured here; run scripts/report_token_lengths.py over this directory to "
-            "get token_lengths.jsonl and token_stats.json. No row is excluded for its length"
+            "rows over recipe.MAX_LENGTH are excluded whole as parse:token_budget when the "
+            "run is given --model; run scripts/report_token_lengths.py over this directory "
+            "for token_lengths.jsonl and token_stats.json"
         ),
         "vocabularies": {
             "rules": jev.RULES,
@@ -704,7 +771,6 @@ def convert(source: Path, output: Path, *, workers: int = 1) -> dict:
                 "marked frame for tap_target",
                 "scroll_target rows are never produced: Android Control records a scroll "
                 "direction but no coordinates, so the scrolled region is unknown",
-                "a row's question has 2..128 options while the agent allows 255",
                 "a history entry's scroll region is the lowest-indexed scroll candidate of "
                 "that screen, because the corpus does not record which region moved",
                 "the app inventory is the corpus's own open_app names, not the device's "
@@ -741,6 +807,13 @@ def main(argv=None):
     )
     parser.add_argument("--output", type=Path, required=True, help="Split directory to create")
     parser.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        help="Local processor whose tokenizer drives the token budget check",
+    )
+    parser.add_argument("--no-token-check", dest="token_check", action="store_false")
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -749,7 +822,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.workers < 1:
         raise SystemExit(f"--workers must be at least 1, not {args.workers}")
-    convert(args.input, args.output, workers=args.workers)
+    processor = None
+    if args.model is not None and args.token_check:
+        try:
+            processor = AutoProcessor.from_pretrained(str(args.model), local_files_only=True)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"Cannot load the token-check model {args.model}: {error}") from error
+    convert(args.input, args.output, processor=processor, workers=args.workers)
 
 
 if __name__ == "__main__":

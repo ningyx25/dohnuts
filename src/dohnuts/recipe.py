@@ -10,7 +10,7 @@ from dohnuts.objectives import grpo_options, sft_options
 from dohnuts.rlcd import RLCDConfig
 
 IMAGE_PIXELS = 512**2
-MAX_LENGTH = 2048
+MAX_LENGTH = 8192
 TRAINING_STEPS = 3600
 LR_DECAY_STEPS = 2400
 BASE_MODEL = Path(".cache/models/Qwen3.5-0.8B")

@@ -35,7 +35,8 @@
 | 4 | app 清单**两遍扫描**:第一遍收集全语料 `open_app` 显示名当"已安装清单",再按 `_named_apps` 语义整词收窄 |
 | 5 | 跳过 `jev_scroll_target`(AC 的 scroll 只有方向、没有坐标) |
 | 6 | `text_value` **严格**:候选恒为 goal 的 1..8 元 n-gram + `NONE`,GT 不命中就不产出行 |
-| 7 | token 预算先不作限制,全量转换后按统计重新定义 |
+| 7 | token 预算按全量统计定为 `MAX_LENGTH = 8192`,并在转换时作为门禁(`--model` 启用) |
+| 8 | 行候选上限提到 **255**,与端口一致 |
 | 8 | 统计以**完整语料**为准(`node01:/home/ningyongxin/workplace/proj/dohnuts/example-data/android_control_parsered`) |
 
 ## 3. 代码落点
@@ -60,9 +61,9 @@
 | 族(dataset) | 何时产出 | question id | criteria | target |
 | --- | --- | --- | --- | --- |
 | `jev_operation` | 每个解析成功的步 | `operation` | 该屏在场的 operation,固定键序 | GT operation 的 one-hot |
-| `jev_tap_target` | click/long_press 且命中 TAP 候选、2..128 候选 | `tap_target` | `[i] label` | 命中候选上的逆面积分布 |
-| `jev_text_value` | input_text 且 GT 文本 ∈ goal n-gram、2..128 候选 | `text_value` | goal span + `NONE` | 该 span 的 one-hot |
-| `jev_app_target` | open_app 且 GT ∈ 候选、2..128 候选 | `app_target` | app 显示名 | 该 app 的 one-hot |
+| `jev_tap_target` | click/long_press 且命中 TAP 候选、2..255 候选 | `tap_target` | `[i] label` | 命中候选上的逆面积分布 |
+| `jev_text_value` | input_text 且 GT 文本 ∈ goal n-gram、2..255 候选 | `text_value` | goal span + `NONE` | 该 span 的 one-hot |
+| `jev_app_target` | open_app 且 GT ∈ 候选、2..255 候选 | `app_target` | app 显示名 | 该 app 的 one-hot |
 | (`jev_scroll_target`) | 不产出 | — | — | — |
 
 每步 1–2 行(operation + 至多一个 target 族),与端口"只校验被选中分支"一致。
@@ -91,10 +92,11 @@
 | 请求超过 150 KB(端口的 `MAX_PAYLOAD_BYTES`) | 整步排除 `payload_too_large` |
 | GT operation 不在该屏 criteria | 整步排除 `operation_not_offered` |
 | 点击没命中任何候选 | 丢 `tap_target`,`no_target_element` |
-| 候选 <2 或 >128(三个 choice 族都会检查) | 丢该族,`too_few_candidates` / `too_many_candidates` |
+| 候选 <2 或 >255(三个 choice 族都会检查) | 丢该族,`too_few_candidates` / `too_many_candidates` |
+| 任一行超过 `recipe.MAX_LENGTH`(8192,`--model` 启用) | 整步排除 `token_budget`,`detail` 记最长行 |
 | GT 文本不是 goal span | 丢 `text_value`,`text_not_a_goal_span` |
 | GT app 不在候选 | 丢 `app_target`,`app_not_offered` |
-| 任一行超 token 预算 | **不排除**(由 `report_token_lengths.py` 另行测量) |
+
 
 族级丢弃写 `excluded.jsonl` 的 `stage: "family"`(`id = {step}:{family}`),并在 manifest 的
 `family_coverage[family].dropped` 里归因到**提出该问题的族**(计数来自 worker,不靠 reason 反推)。
@@ -129,8 +131,8 @@ scroll-only 屏与 goal 收窄 app;真实用例从 `example-data` 抽样 12 个 
 | 图像 | 146,613 个内容寻址 PNG;app 词表 758 个显示名 |
 | 确定性 | 60-episode 冒烟上 serial 与 `--workers 4` 的 621 行逐字节一致;manifest 仅 `sha256` 不同 |
 
-**token 分布**(`report_token_lengths.py`,`Qwen/Qwen3.5-0.8B` 的 processor,
-`IMAGE_PIXELS=512²`,参考线为旧的 `MAX_LENGTH=2048`):
+**token 分布**(首轮 2048 预算下的测量,`report_token_lengths.py`,
+`Qwen/Qwen3.5-0.8B` 的 processor,`IMAGE_PIXELS=512²`):
 
 | dataset | rows | p50 | p90 | p99 | max | >2048 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -141,14 +143,16 @@ scroll-only 屏与 goal 收窄 app;真实用例从 `example-data` 抽样 12 个 
 | **全部** | **150,300** | **2,128** | **4,765** | **6,653** | **44,072** | **78,546(52.3%)** |
 
 结论:对齐后的 prompt(9 键 state + elements + visibleText + 每题重复 goal)**中位数就已经
-超过旧的 2048**,旧预算是按 gui-v1 的 `{user_query, task_progress}` 定的。若按 p99 取,
-预算约 **8,192** 可覆盖 99% 的行;长尾(max 44,072)来自个别 a11y 节点的 `text` 是整篇文档
-(与旧管线的观察一致)。预算的最终取值是独立决定,本设计不改 `recipe.MAX_LENGTH`。
+超过旧的 2048**——旧预算是按 gui-v1 的 `{user_query, task_progress}` 定的。按 p99 取整后
+把预算定为 **`MAX_LENGTH = 8192`**(同时把 `Qwen35Adapter.max_input_tokens` 从 4096 提到
+8192,否则服务侧仍会拒绝长 prompt)。实测该预算只切掉 250 行 / 203 步(**0.17% / 0.21%**),
+这些行本来就无法训练(`DecisionCollator` 对超长 batch 直接抛错),因此转换时按预算**整步排除**
+(`--model` 启用,`parse:token_budget`);长尾(max 44,072)来自个别 a11y 节点的 `text` 是整篇文档。
 
-**128 上限的代价**(行只允许 2..128 选项,端口允许 255):
-`text_value` 有 2,407/5,104(47%)、`app_target` 有 530/5,697(9.3%)因候选过宽被丢,
-`tap_target` 只丢 4 行。把行的上限提到 255(与端口一致)可以基本收回这 ~2,900 行,
-代价是同时要改 `gui_data.validate_rows` 与 `predictor.options_for` 的 2..128 约束。
+**候选上限提到 255**:首轮 128 上限丢掉了 `text_value` 2,407 行(47%)与 `app_target` 530 行,
+原因是行允许的选项数比端口少。现在 `gui_data.MAX_CANDIDATES = 255`(校验器、`predictor.options_for`
+与 AC 转换共用),与端口的 `MAX_CHOICE_OPTIONS` 一致,这批行全部恢复;`tap_target` 只剩 4 行
+(129..255 候选)也一并恢复。超过 255 的屏在构造问题时就以 `payload_too_large` 整步排除。
 
 ## 9. manifest
 
@@ -170,7 +174,6 @@ scroll-only 屏与 goal 收窄 app;真实用例从 `example-data` 抽样 12 个 
 
 1. 行带截图(端口纯文本):非 target 行原图,tap_target 行标号图。
 2. `jev_scroll_target` 不产出(AC 无 scroll 坐标)。
-3. 行只允许 2..128 选项,端口允许 255。
 4. history 里 SCROLL 的区域取最小下标滚动候选。
 5. app 词表来自语料自身的 `open_app` 名,不是设备安装列表(按端口截断 200)。
 6. 末步视为成功终止(parsed 语料丢了 `goal_status`)。
@@ -185,11 +188,12 @@ python scripts/prepare_android_control_data.py \
   --output data/processed/ac-jev-v1-subset --workers 8
 
 # 全量(node01,完整语料 15,283 episode;.venv 为 3.12 + Pillow 12.3.0 + transformers 5.17)
+# --model 打开 token 门禁(MAX_LENGTH = 8192),--no-token-check 可关掉
 ssh node01
 cd /home/ningyongxin/workplace/proj/dohnuts && git pull ningyx25 <branch>
 .venv/bin/python scripts/prepare_android_control_data.py \
   --input example-data/android_control_parsered/parsered \
-  --output data/processed/ac-jev-v1 --workers 32
+  --output data/processed/ac-jev-v1 --model Qwen/Qwen3.5-0.8B --workers 32
 
 # 长度测量(不排除任何行,只产出分布)
 .venv/bin/python scripts/report_token_lengths.py \

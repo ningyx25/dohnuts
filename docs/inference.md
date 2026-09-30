@@ -116,7 +116,7 @@ with Image.open("parcel.jpg") as image:
     )
 ```
 
-Each question supports 2–128 candidates and a 4,096-token input budget,
+Each question supports 2–255 candidates and an 8,192-token input budget,
 including state, instructions, candidates, and image tokens. Inputs that exceed
 the budget are rejected; shorten the state or candidate descriptions and retry.
 Image features and the shared input prefix are reused where possible. More

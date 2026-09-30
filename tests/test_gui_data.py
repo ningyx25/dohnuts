@@ -20,6 +20,7 @@ from dohnuts.gui_data import (
     split_for,
     validate_rows,
 )
+from dohnuts.recipe import MAX_LENGTH
 
 QUERY = (
     "In the Files app, locate the 'task.html' file within the Downloads folder and switch "
@@ -729,10 +730,15 @@ def test_validate_rows_rejects_candidate_counts_out_of_range(image_root):
     rows[0]["target"] = [1.0]
     with pytest.raises(ValueError, match="Candidate count out of range"):
         validate_rows(rows)
+    # The cap matches what the agent offers the model, so a full-width question
+    # is a legal row and only one candidate past it is refused.
     rows = rows_for_step(step, str(step.image))
-    criteria = {f"c{index}": f"candidate {index}" for index in range(129)}
-    rows[0]["question"]["criteria"] = criteria
-    rows[0]["target"] = [1.0] + [0.0] * 128
+    rows[0]["question"]["criteria"] = {f"c{index}": f"candidate {index}" for index in range(255)}
+    rows[0]["target"] = [1.0] + [0.0] * 254
+    validate_rows(rows)
+    rows = rows_for_step(step, str(step.image))
+    rows[0]["question"]["criteria"] = {f"c{index}": f"candidate {index}" for index in range(256)}
+    rows[0]["target"] = [1.0] + [0.0] * 255
     with pytest.raises(ValueError, match="Candidate count out of range"):
         validate_rows(rows)
 
@@ -1022,7 +1028,7 @@ class StubProcessor:
 
 def test_token_budget_excludes_whole_record(tmp_path, image_root):
     long_progress = "(You have done the following operation on the current device): " + " ".join(
-        ["step"] * 5000
+        ["step"] * (MAX_LENGTH * 2)
     )
     over_budget = make_record("001_TaskA_step1", {"action": "wait", "time": 2})
     over_budget["messages"][1]["content"] = user_content(progress=long_progress)
@@ -1039,7 +1045,7 @@ def test_token_budget_excludes_whole_record(tmp_path, image_root):
     assert entry["id"] == "001_TaskA_step1"
     assert entry["reason"] == "token_budget"
     assert entry["stage"] == "parse"
-    assert int(entry["detail"]) > 2048
+    assert int(entry["detail"]) > MAX_LENGTH
 
 
 def test_cli_warns_on_empty_splits(image_root, capsys):

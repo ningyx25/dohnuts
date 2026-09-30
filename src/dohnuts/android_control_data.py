@@ -36,14 +36,7 @@ from typing import Any, TypeGuard
 from PIL import Image
 
 from dohnuts import mobile_jev_prompt as jev
-from dohnuts.gui_data import image_digest, one_hot, split_for
-
-# Choice questions need at least two candidates and at most 128, the same
-# limits `dohnuts.gui_data.validate_rows` enforces on every written row. The
-# agent allows 255, so a screen with 129..255 candidates loses its target row
-# rather than the whole step.
-MIN_CANDIDATES = 2
-MAX_CANDIDATES = 128
+from dohnuts.gui_data import MAX_CANDIDATES, MIN_CANDIDATES, image_digest, one_hot, split_for
 
 DATASETS = {
     "operation": "jev_operation",
@@ -763,9 +756,9 @@ def target_family(operation: str) -> str | None:
 def width_reason(criteria: dict) -> str | None:
     """Why a criteria map cannot be a row, or None when it can.
 
-    Dohnuts rows allow 2..128 options while the agent allows 255, so a screen
-    whose question is wider loses that row rather than the whole step. The
-    operation question never gets here: it has at most thirteen options.
+    Rows allow the same 2..255 options the agent does, so a screen only loses a
+    row when its question is genuinely unusable. The operation question never
+    gets here: it has at most thirteen options.
     """
     if len(criteria) < MIN_CANDIDATES:
         return TOO_FEW_CANDIDATES
@@ -787,10 +780,9 @@ def resolve_target(
     question -- WAIT, DONE, BACK, HOME, ENTER and the scrolls -- resolves to
     `(None, None)`: there is nothing to ask, which is not a failure.
 
-    Every target family is checked against the row limits first, because the
-    corpus can produce questions Dohnuts cannot ask: a long goal offers more
-    text spans than a row may carry, and a corpus-wide app inventory is wider
-    than 128 names.
+    Every target family is checked against the row limits first, because a
+    screen can offer fewer than two candidates or -- for a goal whose spans
+    overflow -- none at all.
     """
     if operation == "TAP":
         weights = tap_target_weights(request, observation, raw)

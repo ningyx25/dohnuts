@@ -207,7 +207,7 @@ def main():
         f"| Base model | {metadata['base_model']} |",
         f"| Selection | Seed {metadata['seed']}, update {metadata['selected_step']:,} |",
         "| Inference | " + metadata["inference"] + " |",
-        "| Inputs | Text and one PIL image; 2–128 candidates; 4,096 tokens per question |",
+        "| Inputs | Text and one PIL image; 2–255 candidates; 8,192 tokens per question |",
         "",
         (
             "Questions reuse a shared input prefix and compute their suffixes in parallel. "

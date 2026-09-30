@@ -328,9 +328,10 @@ weighs `1 / box area`, normalized over the hits, so the smaller — more specifi
 box of a nested pair carries the larger share and a single hit is a one-hot. The
 row is therefore a soft label, and the training loss already accepts one. A point
 that hits no candidate drops the row (`no_target_element`) instead of guessing,
-and `reference.element_positions` lists every hit. Fewer than 2 or more than 128
-candidates also drop the row (`too_few_candidates`, `too_many_candidates`) — the
-agent allows 255 options, a Dohnuts row does not.
+and `reference.element_positions` lists every hit. Fewer than 2 candidates also
+drops the row (`too_few_candidates`); the upper bound is 255, the same limit the
+agent's own question format has, so a row is never narrower than the question the
+policy would ask.
 
 **Text and app questions.** `text_value` offers the goal's 1..8 word n-grams plus
 `NONE`, exactly what the agent offers, and a typed value that is not one of them
@@ -350,22 +351,23 @@ agent's own labels and a `screenChanged` flag computed by comparing consecutive
 screens' fingerprints. `task_progress` is gone: the agent's state has no such
 key.
 
-**Token budget.** The conversion no longer checks one. `MAX_LENGTH = 2048` was
-defined before the aligned prompts existed, and a row is now measured rather than
-excluded: `scripts/report_token_lengths.py` renders every row through the same
-prompt template the collator uses and writes `token_lengths.jsonl` (one line per
-row) plus `token_stats.json` (min/p50/p90/p99/max and `over_max_length` per
-dataset and split). Measured over the full run with the `Qwen/Qwen3.5-0.8B`
-processor, the aligned prompts are far longer than the old budget: p50 2,128, p90
-4,765, p99 6,653, max 44,072, and **78,546 of 150,300 rows (52.3%) sit above
-2048** — the median row already does. A budget near 8,192 would cover 99% of
-them; the longest rows are the ones whose accessibility node `text` is a whole
-document. Until a budget is chosen, `DecisionCollator` still refuses an
-over-`MAX_LENGTH` batch, so training on `ac-jev-v1` needs that decision first.
+**Token budget.** `MAX_LENGTH` is 8,192, and `Qwen35Adapter.max_input_tokens`
+matches it so serving accepts what training does. The number comes from
+measurement, not taste: the aligned prompts put the median row at 2,128 tokens
+and p99 at 6,653, so the old 2,048 (chosen for gui-v1's short
+`{user_query, task_progress}` state) would have refused 52.3% of the corpus. At
+8,192 the check costs 250 rows / 203 steps — 0.17% of the corpus — which is why
+it is a gate again: `--model` turns it on and a step with any over-budget row is
+excluded whole as `token_budget`, because `DecisionCollator` raises on such a
+batch rather than truncating. `scripts/report_token_lengths.py` still writes
+`token_lengths.jsonl` (one line per row, so a future budget can be re-derived
+without measuring again) and `token_stats.json` (min/p50/p90/p99/max and
+`over_max_length` per dataset and split) for the record.
 
 **Exclusions and audit.** The parse stage drops whole steps
 (`unparsable_metadata`, `missing_image`, `missing_a11y`, `unknown_action`,
-`payload_too_large`, `operation_not_offered`, `unexpected`), and drops single rows
+`payload_too_large`, `operation_not_offered`, `token_budget`, `unexpected`), and
+drops single rows
 for their own question (`no_target_element`, `too_few_candidates`,
 `too_many_candidates`, `text_not_a_goal_span`, `app_not_offered`). The isolate
 stage drops rows (`cross_split_group`, `duplicate_input`). All of them land in
@@ -431,23 +433,22 @@ lands in several boxes is answered with a distribution over all of them — a so
 label the loss accepts, and the honest answer when two nested boxes are both
 plausible. A history entry's scroll region is the lowest-indexed scroll candidate
 of that screen. Marked bytes depend on the Pillow version. Rows carry screenshots
-even though the agent is text-only, and a row allows 2..128 options where the
-agent allows 255, which over the full run cost 2,407 `text_value` rows (47% of
-the typed steps: a goal longer than about nineteen words offers more spans than a
-row may carry) and 530 `app_target` rows, against only 4 `tap_target` rows.
-Raising the row cap to 255 would recover almost all of them and remove this
-deviation, at the price of touching `gui_data.validate_rows` and
-`predictor.options_for`. As in the GUI converter, symbolic links inside the input root can
-still resolve outside it.
+even though the agent is text-only. The first full run, capped at 128 candidates,
+lost 2,407 `text_value` rows (47% of the typed steps: a goal longer than about
+nineteen words offers more spans than a row may carry) and 530 `app_target` rows;
+the cap is now the agent's own 255, so those rows are produced again and a screen
+wider than that is refused while its question is built. As in the GUI converter,
+symbolic links inside the input root can still resolve outside it.
 
 ```bash
 # Run from the repository root. --input is the directory of {episode_id} episode
 # directories. --workers converts that many episodes at a time (forked
 # processes); results are merged in episode order, so the splits are byte
 # identical to a serial run.
+# --model turns on the token gate; --no-token-check skips it
 python scripts/prepare_android_control_data.py \
   --input example-data/android_control_parsered/parsered \
-  --output data/processed/ac-jev-v1 --workers 32
+  --output data/processed/ac-jev-v1 --model Qwen/Qwen3.5-0.8B --workers 32
 
 # Measure the token length of every row afterwards; nothing was excluded for it.
 python scripts/report_token_lengths.py \

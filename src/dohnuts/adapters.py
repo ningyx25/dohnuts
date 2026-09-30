@@ -18,7 +18,7 @@ class Qwen35Adapter:
 
     name = "qwen3.5"
     base_model = "Qwen/Qwen3.5-0.8B"
-    max_input_tokens = 4096
+    max_input_tokens = 8192
     marker = "<|fim_suffix|>"
     image_prefix = "<|vision_start|><|image_pad|><|vision_end|>\n"
     _vision_trainable = False

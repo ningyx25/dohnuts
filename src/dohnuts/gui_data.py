@@ -17,6 +17,13 @@ from pathlib import Path
 
 from PIL import Image
 
+# The most candidates a decision row may carry. It matches what the mobile-jev
+# policy offers the model (255 options per question), so a row is never narrower
+# than the question the agent would ask; the shared validator and the prompt
+# renderer both read it.
+MAX_CANDIDATES = 255
+MIN_CANDIDATES = 2
+
 SPLIT_SEED = "doh-gui-split-2026"
 SPLIT_ORDER = {"train": 0, "calibration": 1, "dev": 2, "test": 3}
 SPLIT_LIMITS = [("calibration", 10), ("dev", 20), ("test", 30)]
@@ -416,7 +423,7 @@ def validate_rows(rows: Iterable[dict], *, root: Path | None = None) -> None:
             raise ValueError(f"Unknown split: {row['id']} ({row['split']})")
         question = row["question"]
         width = 2 if question["type"] == "noul" else len(question["criteria"])
-        if not 2 <= width <= 128:
+        if not MIN_CANDIDATES <= width <= MAX_CANDIDATES:
             raise ValueError(f"Candidate count out of range: {row['id']}")
         if len(row["target"]) != width:
             raise ValueError(f"Target width does not match candidates: {row['id']}")

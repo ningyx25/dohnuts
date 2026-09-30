@@ -12,6 +12,7 @@ from PIL import Image
 
 from dohnuts.adapters import Qwen35Adapter
 from dohnuts.execution import plan_prefix
+from dohnuts.gui_data import MAX_CANDIDATES, MIN_CANDIDATES
 from dohnuts.model import DecisionModel, marker_positions
 from dohnuts.recipe import BASE_MODEL, IMAGE_PIXELS
 
@@ -55,8 +56,10 @@ def options_for(question):
         options = [f"level {i}: {render(value)}" for i, value in enumerate(criteria)]
     else:
         raise ValueError(f"Unsupported decision type: {kind}")
-    if not 2 <= len(options) <= 128:
-        raise ValueError("Each question requires 2–128 candidates")
+    if not MIN_CANDIDATES <= len(options) <= MAX_CANDIDATES:
+        raise ValueError(
+            f"Each question requires {MIN_CANDIDATES}–{MAX_CANDIDATES} candidates"
+        )
     return labels, options
 
 

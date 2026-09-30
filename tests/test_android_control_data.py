@@ -24,7 +24,6 @@ from dohnuts.android_control_data import (
     OPERATION_NOT_OFFERED,
     TEXT_NOT_A_GOAL_SPAN,
     TOO_FEW_CANDIDATES,
-    TOO_MANY_CANDIDATES,
     app_vocabulary,
     clamped_bounds,
     element_bounds,
@@ -45,6 +44,7 @@ from dohnuts.android_control_data import (
     validate_step,
 )
 from dohnuts.gui_data import image_digest, split_for, validate_rows
+from dohnuts.recipe import MAX_LENGTH
 
 SCREENSHOT = (100, 200)
 SCREEN = SCREENSHOT
@@ -977,7 +977,10 @@ def test_tap_family_drops_report_why(tmp_path):
         )
     )
     _, exclusions = parse(crowded, directory=directory)
-    assert exclusions[0]["reason"] == TOO_MANY_CANDIDATES
+    # MAX_CANDIDATES is the agent's own option limit now, so a screen past it is
+    # refused while the question is built, before any family is resolved.
+    assert exclusions[0]["reason"] == "payload_too_large"
+    assert exclusions[0]["stage"] == "parse"
 
 
 def test_parse_episode_reports_unreadable_metadata():
@@ -1256,6 +1259,48 @@ def test_exclusions_of_a_broken_episode_are_written(tmp_path):
     assert manifest["exclusions"]["parse:unparsable_metadata"] == 1
     lines = [json.loads(line) for line in (output / "excluded.jsonl").read_text().splitlines()]
     assert any(entry["reason"] == "unparsable_metadata" for entry in lines)
+
+
+class StubTokenizer:
+    """One token per whitespace-separated piece, which is all the gate needs."""
+
+    def __call__(self, text, truncation=False):
+        del truncation
+        return {"input_ids": list(range(len(text.split())))}
+
+
+class StubImageProcessor:
+    patch_size = 16
+    merge_size = 2
+
+
+class StubProcessor:
+    def __init__(self):
+        self.tokenizer = StubTokenizer()
+        self.image_processor = StubImageProcessor()
+
+
+def test_token_gate_excludes_an_over_budget_step(tmp_path):
+    source = write_corpus(tmp_path / "corpus")
+    metadata = json.loads((source / "1" / "metadata_1.json").read_text())
+    # Long enough that the prompt's four copies of the goal pass the budget,
+    # short enough that the request stays under the agent's payload limit.
+    metadata["goal"] = " ".join(["word"] * (MAX_LENGTH // 2))
+    (source / "1" / "metadata_1.json").write_text(json.dumps(metadata))
+    output = tmp_path / "out"
+    manifest = prepare.convert(source, output, processor=StubProcessor(), workers=1)
+    # Every step of the long-goal episode is over budget; the other episode is
+    # untouched, and nothing of the excluded steps was written.
+    assert manifest["exclusions"]["parse:token_budget"] == 3
+    assert sum(entry["n"] for entry in manifest["counts"]) == 4
+    entries = [json.loads(line) for line in (output / "excluded.jsonl").read_text().splitlines()]
+    over = [entry for entry in entries if entry["reason"] == "token_budget"]
+    assert {entry["id"] for entry in over} == {
+        "android_control_1_step0",
+        "android_control_1_step1",
+        "android_control_1_step2",
+    }
+    assert all(int(entry["detail"]) > MAX_LENGTH for entry in over)
 
 
 def test_workers_argument_is_validated(tmp_path):
