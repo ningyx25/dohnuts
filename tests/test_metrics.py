@@ -61,9 +61,14 @@ def test_by_dataset_suppresses_index_f1_for_mutable_vocabularies():
         },
         {"dataset": "gui_button", "type": "choice", "logits": [2.0, 0.0], "target": [1.0, 0.0]},
         {"dataset": "gui_button", "type": "choice", "logits": [0.0, 2.0], "target": [0.0, 1.0]},
+        # The mobile-jev operation question offers a per-screen subset of a fixed
+        # order, so its label indices shift between rows as well.
+        {"dataset": "jev_operation", "type": "choice", "logits": [2.0, 0.0], "target": [1.0, 0.0]},
+        {"dataset": "jev_operation", "type": "choice", "logits": [0.0, 2.0], "target": [0.0, 1.0]},
     ]
     result = by_dataset(rows)
     assert "macro_f1" not in result["screenshot_choice"]
+    assert "macro_f1" not in result["jev_operation"]
     assert result["gui_button"]["macro_f1"] == pytest.approx(1.0, rel=0, abs=5e-8)
 
 

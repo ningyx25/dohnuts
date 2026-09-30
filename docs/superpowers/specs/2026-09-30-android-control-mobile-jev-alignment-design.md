@@ -112,29 +112,43 @@
 scroll-only 屏与 goal 收窄 app;真实用例从 `example-data` 抽样 12 个 episode × 2 步。
 `ANDROID_WORLD_ROOT` 未设置时这两个用例跳过,仓库不新增依赖。
 
-## 8. 实测(60 个 episode 的冒烟 + 待回填的全量数字)
+## 8. 实测(node01 全量 15,283 episode)
 
-冒烟语料:`example-data/.../parsered` 中随机 60 个有 metadata 的 episode(符号链接),
-`--workers 4`:
+转换命令见 §11,`--workers 32`,墙钟约 45 分钟(含收尾的 isolate/validate:146,613 个 PNG
+逐个走容器校验),产物 74GB。
 
 | 指标 | 值 |
 | --- | --- |
-| 解析成功步数 | 395(4 步因 `operation_not_offered` 排除) |
-| 行数 | 621:`jev_operation` 395、`jev_tap_target` 214、`jev_text_value` 9、`jev_app_target` 3 |
-| 覆盖率 | operation 1.000;tap_target 214/226 = 0.947;text_value 9/20 = 0.450;app_target 3/22 = 0.136 |
-| 族级丢弃 | `no_target_element` 11、`too_few_candidates` 20(19 app + 1 tap)、`too_many_candidates` 6(text)、`text_not_a_goal_span` 5 |
-| 图像 | 608 个内容寻址 PNG(原图 + 标号图) |
-| app 词表 | 22 个显示名 |
-| 确定性 | serial 与 `--workers 4` 的 621 行逐字节一致;manifest 仅 `sha256` 不同(行内 image 路径随输出目录) |
-| 四 split | train/calibration/dev/test 均非空 |
+| episode / metadata 哈希 | 15,283 / 15,283 |
+| 步 | 99,131 步中 97,503 步产出请求(与语料步数一致);步级排除 `operation_not_offered` 1,612、`missing_a11y` 10、`payload_too_large` 6 |
+| 行(写出) | 150,300:`jev_operation` 97,217、`jev_tap_target` 50,193、`jev_text_value` 1,574、`jev_app_target` 1,316 |
+| 行(pre-isolation) | 150,703;隔离期丢弃 403(`cross_split_group` 396、`duplicate_input` 7) |
+| split | train 115,268、calibration 14,209、dev 15,673、test 15,150 |
+| 覆盖率(pre-isolation) | operation 97,503/97,503 = 1.000;tap_target 50,302/51,947 = 0.968;text_value 1,577/5,104 = 0.309;app_target 1,321/5,697 = 0.232 |
+| 族级丢弃 | `no_target_element` 1,280、`too_few_candidates` 4,115(tap 361 / text 3 / app 3,754)、`too_many_candidates` 2,941(tap 4 / text 2,407 / app 530)、`text_not_a_goal_span` 1,120、`app_not_offered` 92 |
+| 图像 | 146,613 个内容寻址 PNG;app 词表 758 个显示名 |
+| 确定性 | 60-episode 冒烟上 serial 与 `--workers 4` 的 621 行逐字节一致;manifest 仅 `sha256` 不同 |
 
-两个上限造成的损失值得注意,均来自"行只允许 2..128 选项而端口允许 255":
-`text_value` 有 6/20 因 goal span 超过 128 被丢,**app_target 有 19/22 因收窄后只剩 1 个候选被丢**
-(goal 只提到一个 app 时,端口给出的就是单选项问题)。
+**token 分布**(`report_token_lengths.py`,`Qwen/Qwen3.5-0.8B` 的 processor,
+`IMAGE_PIXELS=512²`,参考线为旧的 `MAX_LENGTH=2048`):
 
-**待回填**:在 node01 上跑完整 15,283 个 episode 后,把 manifest 的
-`counts`/`family_coverage`/`family_stats`/`exclusions` 与 `token_stats.json` 的真实数字写进本节,
-并按全量 token 分布给出预算建议(本设计不修改 `recipe.MAX_LENGTH`)。
+| dataset | rows | p50 | p90 | p99 | max | >2048 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `jev_operation` | 97,217 | 2,130 | 4,911 | 6,416 | 31,463 | 51,115(52.6%) |
+| `jev_tap_target` | 50,193 | 2,105 | 5,035 | 7,056 | 44,072 | 25,753(51.3%) |
+| `jev_text_value` | 1,574 | 3,729 | 6,384 | 7,677 | 28,062 | 1,558(99.0%) |
+| `jev_app_target` | 1,316 | 1,245 | 2,350 | 4,680 | 5,521 | 120(9.1%) |
+| **全部** | **150,300** | **2,128** | **4,765** | **6,653** | **44,072** | **78,546(52.3%)** |
+
+结论:对齐后的 prompt(9 键 state + elements + visibleText + 每题重复 goal)**中位数就已经
+超过旧的 2048**,旧预算是按 gui-v1 的 `{user_query, task_progress}` 定的。若按 p99 取,
+预算约 **8,192** 可覆盖 99% 的行;长尾(max 44,072)来自个别 a11y 节点的 `text` 是整篇文档
+(与旧管线的观察一致)。预算的最终取值是独立决定,本设计不改 `recipe.MAX_LENGTH`。
+
+**128 上限的代价**(行只允许 2..128 选项,端口允许 255):
+`text_value` 有 2,407/5,104(47%)、`app_target` 有 530/5,697(9.3%)因候选过宽被丢,
+`tap_target` 只丢 4 行。把行的上限提到 255(与端口一致)可以基本收回这 ~2,900 行,
+代价是同时要改 `gui_data.validate_rows` 与 `predictor.options_for` 的 2..128 约束。
 
 ## 9. manifest
 
@@ -184,3 +198,10 @@ cd /home/ningyongxin/workplace/proj/dohnuts && git pull ningyx25 <branch>
 # 对齐测试(可选,需要 android_world 检出)
 ANDROID_WORLD_ROOT=/path/to/android_world pytest tests/test_mobile_jev_prompt.py
 ```
+
+**产物**(node01 `data/processed/ac-jev-v1/`,74GB):
+`train.jsonl`(877MB)/`dev.jsonl`/`calibration.jsonl`/`test.jsonl`、
+`excluded.jsonl`(1.3MB)、`manifest.json`、`images/`(146,613 个 PNG)、
+`token_lengths.jsonl`(逐行长度)、`token_stats.json`(分布)。
+本地子集冒烟与 node01 全量使用的都是同一份代码,`manifest.source.metadata_files_hashed`
+可确认输入完整。

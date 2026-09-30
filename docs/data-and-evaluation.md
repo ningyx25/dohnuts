@@ -355,8 +355,13 @@ defined before the aligned prompts existed, and a row is now measured rather tha
 excluded: `scripts/report_token_lengths.py` renders every row through the same
 prompt template the collator uses and writes `token_lengths.jsonl` (one line per
 row) plus `token_stats.json` (min/p50/p90/p99/max and `over_max_length` per
-dataset and split). The budget is redefined from those numbers; until it is,
-`DecisionCollator` still refuses an over-`MAX_LENGTH` batch.
+dataset and split). Measured over the full run with the `Qwen/Qwen3.5-0.8B`
+processor, the aligned prompts are far longer than the old budget: p50 2,128, p90
+4,765, p99 6,653, max 44,072, and **78,546 of 150,300 rows (52.3%) sit above
+2048** — the median row already does. A budget near 8,192 would cover 99% of
+them; the longest rows are the ones whose accessibility node `text` is a whole
+document. Until a budget is chosen, `DecisionCollator` still refuses an
+over-`MAX_LENGTH` batch, so training on `ac-jev-v1` needs that decision first.
 
 **Exclusions and audit.** The parse stage drops whole steps
 (`unparsable_metadata`, `missing_image`, `missing_a11y`, `unknown_action`,
@@ -399,6 +404,16 @@ metadata, so its bytes are a pure function of the pixels, the candidate list and
 the Pillow version — which is why each manifest records `environment.python` and
 `environment.pillow`.
 
+**Full run.** The 15,283-episode corpus produced 97,503 parsed steps and 150,300
+rows — `jev_operation` 97,217, `jev_tap_target` 50,193, `jev_text_value` 1,574,
+`jev_app_target` 1,316 — split train 115,268 / calibration 14,209 / dev 15,673 /
+test 15,150, with 146,613 content-addressed images and a 758-name app inventory.
+Coverage before isolation is 100% for `operation`, 96.8% of click steps for
+`tap_target`, 30.9% of typed steps for `text_value` and 23.2% of `open_app` steps
+for `app_target`; 1,612 steps were excluded because the screen did not offer the
+recorded operation, 10 for an unreadable forest and 6 for a request over the
+agent's 150 KB payload limit, and isolation dropped 403 rows.
+
 **Metrics.** The four `jev_*` datasets are in `metrics.py`'s macro-F1 suppression
 set: the operation question offers a per-screen subset of a fixed vocabulary and
 the target questions have per-screen candidate lists, so index macro-F1 would
@@ -417,9 +432,12 @@ label the loss accepts, and the honest answer when two nested boxes are both
 plausible. A history entry's scroll region is the lowest-indexed scroll candidate
 of that screen. Marked bytes depend on the Pillow version. Rows carry screenshots
 even though the agent is text-only, and a row allows 2..128 options where the
-agent allows 255, which costs roughly half the `app_target` rows and a third of
-the `text_value` rows on a 60-episode smoke run (the full-run numbers are in the
-manifest). As in the GUI converter, symbolic links inside the input root can
+agent allows 255, which over the full run cost 2,407 `text_value` rows (47% of
+the typed steps: a goal longer than about nineteen words offers more spans than a
+row may carry) and 530 `app_target` rows, against only 4 `tap_target` rows.
+Raising the row cap to 255 would recover almost all of them and remove this
+deviation, at the price of touching `gui_data.validate_rows` and
+`predictor.options_for`. As in the GUI converter, symbolic links inside the input root can
 still resolve outside it.
 
 ```bash
