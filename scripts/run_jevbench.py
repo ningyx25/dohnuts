@@ -15,6 +15,7 @@ from dohnuts import __version__
 from dohnuts.adapters import Qwen35Adapter
 from dohnuts.experiment import Sampler, environment, memory
 from dohnuts.predictor import Predictor
+from dohnuts.recipe import MAX_LENGTH
 from dohnuts.train import file_hash
 
 REVISION = "e105a48f8cdb7f3babb3594424f73e5d7bdc97b9"
@@ -137,7 +138,7 @@ def summarize_run(output, cohorts, records, metadata, runtime, telemetry, upstre
             "231 public tasks; 303 private or non-redistributed tasks are unavailable, including the entire judge tier.",
             "Official runner and scoring functions; one decision per call, no concurrency, no retries.",
             "State, instructions and criteria are unchanged; labels and rationales are never given as answers.",
-            f"Checkpoint, temperatures and the {runtime['input_limit']}-token serving limit are frozen before this evaluation; the training budget remains 2048 tokens.",
+            f"Checkpoint, temperatures and the {runtime['input_limit']}-token serving limit are frozen before this evaluation; the training budget is {MAX_LENGTH} tokens.",
             "Input rejections count as wrong; no truncation or exclusion of over-budget questions.",
             "No provider tariff exists for local GPU execution. Cost and the four-axis composite stay null.",
             "Reference quality is recomputed on identical public IDs; published full-suite scores are not comparable.",

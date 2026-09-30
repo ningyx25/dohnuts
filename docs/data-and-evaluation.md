@@ -143,8 +143,8 @@ Source rules are fixed in the converter:
   held-out states are checked with punctuation-insensitive text hashes.
   Checks include Laya's 3,000-character body prefixes. Matching source groups are
   excluded. This does not prove absence of semantic or paraphrase duplicates.
-- The fixed 2,048-token training budget is unchanged. Exclusions are counted.
-  Serving still accepts 4,096 tokens. Results on the eligible ContractNLI subset
+- The fixed 8,192-token training budget is unchanged. Exclusions are counted.
+  Serving accepts the same 8,192 tokens. Results on the eligible ContractNLI subset
   must not be presented as scores on its complete official test set.
 
 The training mixture combines 17 text/image groups and nine business task/language

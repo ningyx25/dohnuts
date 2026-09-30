@@ -56,9 +56,9 @@ independently derived partitions conflict, retain the higher-priority partition
 (test > development > calibration > train) and exclude lower-priority examples.
 Report these exclusions rather than silently moving rows into the test set.
 
-All 77 BANKING77 labels fit the API's 128-candidate limit. A separate
-2,048-token training budget determines dataset eligibility. The Qwen3.5 adapter
-supports 4,096-token inference. Eligibility is frozen before training; no
+All 77 BANKING77 labels fit the API's 255-candidate limit. A separate
+8,192-token training budget determines dataset eligibility. The Qwen3.5 adapter
+supports the same 8,192 tokens at inference. Eligibility is frozen before training; no
 candidate or question is truncated to manufacture a passing result. Screening
 counts and excluded IDs accompany accuracy.
 
