@@ -116,43 +116,50 @@ scroll-only 屏与 goal 收窄 app;真实用例从 `example-data` 抽样 12 个 
 
 ## 8. 实测(node01 全量 15,283 episode)
 
-转换命令见 §11,`--workers 32`,墙钟约 45 分钟(含收尾的 isolate/validate:146,613 个 PNG
-逐个走容器校验),产物 74GB。
+转换命令见 §11(`--model` 打开 token 门禁、`--workers 32`),墙钟约 45 分钟(收尾的
+isolate/validate 要逐个走 146k 个 PNG 的容器校验),产物 74GB。
 
 | 指标 | 值 |
 | --- | --- |
 | episode / metadata 哈希 | 15,283 / 15,283 |
-| 步 | 99,131 步中 97,503 步产出请求(与语料步数一致);步级排除 `operation_not_offered` 1,612、`missing_a11y` 10、`payload_too_large` 6 |
-| 行(写出) | 150,300:`jev_operation` 97,217、`jev_tap_target` 50,193、`jev_text_value` 1,574、`jev_app_target` 1,316 |
-| 行(pre-isolation) | 150,703;隔离期丢弃 403(`cross_split_group` 396、`duplicate_input` 7) |
-| split | train 105,268、calibration 14,209、dev 15,673、test 15,150 |
-| 覆盖率(pre-isolation) | operation 97,503/97,503 = 1.000;tap_target 50,302/51,947 = 0.968;text_value 1,577/5,104 = 0.309;app_target 1,321/5,697 = 0.232 |
-| 族级丢弃 | `no_target_element` 1,280、`too_few_candidates` 4,115(tap 361 / text 3 / app 3,754)、`too_many_candidates` 2,941(tap 4 / text 2,407 / app 530)、`text_not_a_goal_span` 1,120、`app_not_offered` 92 |
-| 图像 | 146,613 个内容寻址 PNG;app 词表 758 个显示名 |
+| 步 | 99,131 步中 97,503 步产出请求;步级排除 `operation_not_offered` 1,612、`token_budget` 227、`missing_a11y` 10、`payload_too_large` 6 |
+| 行(写出) | 151,499:`jev_operation` 96,990、`jev_tap_target` 50,032、`jev_text_value` 2,970、`jev_app_target` 1,507 |
+| split | train 106,112、calibration 14,312、dev 15,816、test 15,259 |
+| 覆盖率(pre-isolation) | operation 97,276/97,503 = 0.998;tap_target 50,141/51,947 = 0.965;text_value 2,973/5,104 = 0.583;app_target 1,512/5,697 = 0.265 |
+| 族级丢弃 | `no_target_element` 1,280、`too_few_candidates` 4,115(tap 361 / app 3,754)、`text_not_a_goal_span` 2,100、`app_not_offered` 431 |
+| 隔离期丢弃 | 403(`cross_split_group` 396、`duplicate_input` 7) |
+| 图像 / app 词表 | 146,225 个内容寻址 PNG / 758 个显示名 |
 | 确定性 | 60-episode 冒烟上 serial 与 `--workers 4` 的 621 行逐字节一致;manifest 仅 `sha256` 不同 |
 
-**token 分布**(首轮 2048 预算下的测量,`report_token_lengths.py`,
-`Qwen/Qwen3.5-0.8B` 的 processor,`IMAGE_PIXELS=512²`):
+**token 分布**(`report_token_lengths.py`,`Qwen/Qwen3.5-0.8B` 的 processor,
+`IMAGE_PIXELS=512²`,`MAX_LENGTH = 8192`):
 
-| dataset | rows | p50 | p90 | p99 | max | >2048 |
+| dataset | rows | p50 | p90 | p99 | max | >8192 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `jev_operation` | 97,217 | 2,130 | 4,911 | 6,416 | 31,463 | 51,115(52.6%) |
-| `jev_tap_target` | 50,193 | 2,105 | 5,035 | 7,056 | 44,072 | 25,753(51.3%) |
-| `jev_text_value` | 1,574 | 3,729 | 6,384 | 7,677 | 28,062 | 1,558(99.0%) |
-| `jev_app_target` | 1,316 | 1,245 | 2,350 | 4,680 | 5,521 | 120(9.1%) |
-| **全部** | **150,300** | **2,128** | **4,765** | **6,653** | **44,072** | **78,546(52.3%)** |
+| `jev_operation` | 96,990 | 2,126 | 4,888 | 6,308 | 8,178 | 0 |
+| `jev_tap_target` | 50,032 | 2,098 | 4,994 | 6,828 | 8,191 | 0 |
+| `jev_text_value` | 2,970 | 4,364 | 6,336 | 8,035 | 8,192 | 0 |
+| `jev_app_target` | 1,507 | 1,307 | 5,956 | 7,025 | 7,864 | 0 |
+| **全部** | **151,499** | **2,144** | **4,793** | **6,549** | **8,192** | **0** |
 
-结论:对齐后的 prompt(9 键 state + elements + visibleText + 每题重复 goal)**中位数就已经
-超过旧的 2048**——旧预算是按 gui-v1 的 `{user_query, task_progress}` 定的。按 p99 取整后
-把预算定为 **`MAX_LENGTH = 8192`**(同时把 `Qwen35Adapter.max_input_tokens` 从 4096 提到
-8192,否则服务侧仍会拒绝长 prompt)。实测该预算只切掉 250 行 / 203 步(**0.17% / 0.21%**),
-这些行本来就无法训练(`DecisionCollator` 对超长 batch 直接抛错),因此转换时按预算**整步排除**
-(`--model` 启用,`parse:token_budget`);长尾(max 44,072)来自个别 a11y 节点的 `text` 是整篇文档。
+预算的来历:首轮用旧的 2048 测量时,p50 就已经是 2,128、p99 6,653,**78,546/150,300
+行(52.3%)超预算**——旧预算是按 gui-v1 的 `{user_query, task_progress}` 定的。按 p99 取整
+定为 **8192**,同时把 `Qwen35Adapter.max_input_tokens` 从 4096 提到 8192(否则服务侧仍会
+拒绝长 prompt)。实测该预算只切掉 227 步(0.23%),`over_max_length` 为 0 即门禁生效。
 
-**候选上限提到 255**:首轮 128 上限丢掉了 `text_value` 2,407 行(47%)与 `app_target` 530 行,
-原因是行允许的选项数比端口少。现在 `gui_data.MAX_CANDIDATES = 255`(校验器、`predictor.options_for`
-与 AC 转换共用),与端口的 `MAX_CHOICE_OPTIONS` 一致,这批行全部恢复;`tap_target` 只剩 4 行
-(129..255 候选)也一并恢复。超过 255 的屏在构造问题时就以 `payload_too_large` 整步排除。
+**候选上限提到 255 的效果**(首轮 128 → 现在 255,与端口 `MAX_CHOICE_OPTIONS` 一致):
+
+| dataset | 128 上限(首轮) | 255 上限(本次) | 变化 |
+| --- | --- | --- | --- |
+| `jev_text_value` | 1,574 | 2,970 | +1,396 |
+| `jev_app_target` | 1,316 | 1,507 | +191 |
+| `jev_tap_target` | 50,193 | 50,032 | −161(门禁) |
+| `jev_operation` | 97,217 | 96,990 | −227(门禁) |
+| 合计 | 150,300 | **151,499** | +1,199 |
+
+`text_value` 的覆盖率因此从 30.9% 升到 58.3%,`app_target` 从 23.2% 升到 26.5%
+(升幅被"goal 只提到一个 app"的 `too_few_candidates` 3,754 步限制);`too_many_candidates`
+这一族级原因不再出现——超过 255 候选的屏在构造问题时就以 `payload_too_large` 整步排除。
 
 ## 9. manifest
 

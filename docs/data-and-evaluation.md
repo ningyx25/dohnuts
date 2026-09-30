@@ -353,13 +353,14 @@ key.
 
 **Token budget.** `MAX_LENGTH` is 8,192, and `Qwen35Adapter.max_input_tokens`
 matches it so serving accepts what training does. The number comes from
-measurement, not taste: the aligned prompts put the median row at 2,128 tokens
-and p99 at 6,653, so the old 2,048 (chosen for gui-v1's short
+measurement, not taste: the aligned prompts put the median row at 2,144 tokens
+and p99 at 6,549, so the old 2,048 (chosen for gui-v1's short
 `{user_query, task_progress}` state) would have refused 52.3% of the corpus. At
-8,192 the check costs 250 rows / 203 steps — 0.17% of the corpus — which is why
-it is a gate again: `--model` turns it on and a step with any over-budget row is
-excluded whole as `token_budget`, because `DecisionCollator` raises on such a
-batch rather than truncating. `scripts/report_token_lengths.py` still writes
+8,192 the check costs 227 steps — 0.23% — which is why it is a gate again:
+`--model` turns it on and a step with any over-budget row is excluded whole as
+`token_budget`, because `DecisionCollator` raises on such a batch rather than
+truncating. The run that produced `ac-jev-v1` measures `over_max_length: 0`, so
+every written row fits. `scripts/report_token_lengths.py` still writes
 `token_lengths.jsonl` (one line per row, so a future budget can be re-derived
 without measuring again) and `token_stats.json` (min/p50/p90/p99/max and
 `over_max_length` per dataset and split) for the record.
@@ -406,15 +407,17 @@ metadata, so its bytes are a pure function of the pixels, the candidate list and
 the Pillow version — which is why each manifest records `environment.python` and
 `environment.pillow`.
 
-**Full run.** The 15,283-episode corpus produced 97,503 parsed steps and 150,300
-rows — `jev_operation` 97,217, `jev_tap_target` 50,193, `jev_text_value` 1,574,
-`jev_app_target` 1,316 — split train 105,268 / calibration 14,209 / dev 15,673 /
-test 15,150, with 146,613 content-addressed images and a 758-name app inventory.
-Coverage before isolation is 100% for `operation`, 96.8% of click steps for
-`tap_target`, 30.9% of typed steps for `text_value` and 23.2% of `open_app` steps
+**Full run.** The 15,283-episode corpus produced 97,503 parsed steps and 151,499
+rows — `jev_operation` 96,990, `jev_tap_target` 50,032, `jev_text_value` 2,970,
+`jev_app_target` 1,507 — split train 106,112 / calibration 14,312 / dev 15,816 /
+test 15,259, with 146,225 content-addressed images and a 758-name app inventory.
+Coverage before isolation is 99.8% for `operation`, 96.5% of click steps for
+`tap_target`, 58.3% of typed steps for `text_value` and 26.5% of `open_app` steps
 for `app_target`; 1,612 steps were excluded because the screen did not offer the
-recorded operation, 10 for an unreadable forest and 6 for a request over the
-agent's 150 KB payload limit, and isolation dropped 403 rows.
+recorded operation, 227 for the token budget, 10 for an unreadable forest and 6
+for a request over the agent's 150 KB payload limit, and isolation dropped 403
+rows. The first run of the same pipeline, before the candidate cap moved from 128
+to 255, held 150,300 rows with `text_value` at 30.9% and `app_target` at 23.2%.
 
 **Metrics.** The four `jev_*` datasets are in `metrics.py`'s macro-F1 suppression
 set: the operation question offers a per-screen subset of a fixed vocabulary and
