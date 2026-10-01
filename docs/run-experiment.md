@@ -90,12 +90,40 @@ Checkpoints are ordinary `format_version: 2` exports and load the same way wheth
 they were trained on one GPU or several. `--gpus 1` is the original code path with
 no process group, and a plain `python -m dohnuts.train` launch stays single-GPU.
 
-Run the GPU plumbing check with the elastic launcher (add `--full` to also train
-two real Qwen3.5 SFT steps on the pinned base):
+`scripts/smoke_multi_gpu.py` checks the GPU plumbing under the elastic launcher. `--full`
+runs the real training loop and takes `--method` (sft, rlcd, grpo), `--stage` (warmup ..
+vision_top) and `--data`, a prepared mixture to draw genuine screenshots from; without
+`--data` a vision stage synthesizes stand-in images so the check still runs on a machine
+with no data. Every stage also gets a text-only dataset, because an image-less microbatch
+is the case where the merger legitimately receives no gradient:
 
 ```bash
-pdm run torchrun --nproc_per_node=2 scripts/smoke_multi_gpu.py
+pdm run torchrun --nproc_per_node=2 scripts/smoke_multi_gpu.py --full \
+  --stage joint --data data/processed/ac-jev-v1-subset100 --workdir /tmp/smoke-joint
 ```
+
+`--workdir` keeps the run, so a second launch can resume it (`--resume --steps 4`), and a
+resume at a different `--nproc_per_node` must fail with the recipe error above.
+
+To prove data parallelism computes the same objective as one process, run the same recipe
+twice with `accumulation * world_size` held equal -- one process with `--accumulation` at
+its recipe value, N processes with it divided by N -- then compare:
+
+```bash
+A="--full --stage text --train-rows 32 --dev-rows 8 --steps 4"
+pdm run python scripts/smoke_multi_gpu.py $A --workdir /tmp/equivalence-1gpu
+pdm run torchrun --nproc_per_node=2 scripts/smoke_multi_gpu.py $A --accumulation 2 \
+  --workdir /tmp/equivalence-2gpu
+pdm run python scripts/smoke_multi_gpu.py --compare \
+  /tmp/equivalence-1gpu/run /tmp/equivalence-2gpu/run
+```
+
+Text-only runs match bit for bit on the first update. Runs over real screenshots do not, and
+need `--tolerance 1e-2`: the frozen vision cache returns an image encoded inside whichever
+microbatch first held it, so changing the partitioning puts the same screenshot in a
+different batch shape and yields a different bf16 result -- 1.5e-3 on the loss, against
+zero difference when the same layout is repeated. The gradient norm also wobbles by ~3e-5
+between two runs of one layout, which is ordinary nondeterminism in the backward kernels.
 
 Checkpoints written before the two-projection head change carry
 `format_version: 1`. Both the resume path and `Predictor.from_checkpoint` refuse

@@ -681,8 +681,43 @@ checkpoint 全部只在 rank 0;其余 rank 在 eval 后 `barrier()` 等待。`st
 **测试**:`tests/test_distributed.py`(13 项,CPU-only,含一个真实单 rank gloo 进程组)钉住 no-op 语义、
 `microbatch_index` 的单卡退化/分块无重叠/resume 对齐、`reduce_consumed` 与集合通信的初始化分支;
 `scripts/smoke_multi_gpu.py` 用 `torchrun` 在真机上验证 DDP 梯度等于全局均值、各 rank 数据不重叠,
-`--full` 额外跑两步真实 Qwen3.5 SFT。
+`--full` 按 `--method`/`--stage` 跑真实 `train()`,`--data` 从已备好的 mixture 取真实截图,
+`--compare` 校验多卡与单卡的数值等价。
+
+**真机验证(2026-10-01,node01:4×A40 46 GB,`Qwen/Qwen3.5-0.8B`)**:
+
+| 项 | 配置 | 结果 |
+|---|---|---|
+| V1 | `sft/text`,真实截图 + 纯文本混合,W=2 | LoRA 372 项、无 merger/blocks,通过 |
+| V2 | `sft/joint`,同上,W=2 | `find_unused_parameters=True` + 无图 microbatch,LoRA 372 + merger 6,通过 |
+| V3 | `sft/vision_top`,同上,W=2 | 再加 48 项视觉 block 参数,通过 |
+| V4 | `rlcd/joint`,同上,W=2 | RLCD 指标齐备(`reward_mean`/`policy_loss`/`ce_loss`),通过 |
+| V5 | `grpo/text`,`num_iterations=2`,W=2 | `clip_fraction=0.22`(单次 update 时恒为 0)⇒ 第二次策略更新确实发生 |
+| V6 | `sft/joint`,W=4 | 4 rank 梯度同步误差 0.0,24 个 microbatch 无重叠切分 |
+| V7 | resume:同界世界规模 2→3 step;同一 run 改 W=4 | 前者续跑成功;后者报 `Resume may only extend the step budget`,即上文「checkpoint」条所述拒绝确实发生 |
+| V8 | 数值等价:W=1/`A=4` vs W=2/`A=2`(`A*W` 相等 ⇒ 同一全局 microbatch 块) | **纯文本:首个 update 逐位相同(`first_update_error = 0.0`)** |
+| V9 | 入口命令 | 原样执行 `run_experiment.py` 构造的 `torchrun --nproc_per_node 2 -m dohnuts.train train`,产出完整 run 目录 |
+
+验证中修掉两个问题:
+
+- **`config.json` 启动竞态**(`c386da3`):每个 rank 启动时都读 `run/config.json` 取 `lr_decay_steps`,
+  而 rank 0 会写这个文件。落后的 rank 读到 rank 0 刚创建的文件,把自己正在启动的 run 当成「未带
+  `--resume` 的旧 run」,于是报 `Resume may only extend the step budget`。修法是在 rank 0 写之前加一次
+  `distributed.barrier()` —— resume 分支的 metrics 裁剪早就是同样的模式。
+- **等价性检查的断言范围**(`83cffba`):初版对所有共享记录断言 1e-3,会把正确的实现判为失败 ——
+  首个 update 逐位一致,但 Adam 早期除以接近零的二阶矩,几步之内就把舍入差放大成可见的评测差。
+  现在只对「基线评测 + 首个 step」严格断言(含 `grad_norm`,它是「归约后梯度是全局均值而非部分和」
+  最锐利的证据),之后的记录只报 drift。
+
+**由等价性检查暴露的既有行为(非本次引入)**:带真实截图的 run 在不同 rank 布局下**不逐位可复现**。
+冻结视觉缓存按图像字节命中,存下的是「该图第一次出现时所在 batch」的编码结果;切分方式改变 ⇒
+同一张图落入不同 batch shape ⇒ bf16 结果不同:实测首个 update 的 loss 跨布局差 1.5e-3、
+`grad_norm` 差 6.8e-3,而**同一布局重复两次**的 loss 差为 0(纯文本时跨布局也是逐位为 0)。
+另有约 3e-5 的 `grad_norm` 抖动出现在同布局重复之间,那是反向 kernel 原子加的固有不确定性,
+与 rank 布局无关。缓存早于本次改动(§2.7),改它等于改单卡数值,故不动,而以 `--tolerance`
+把预期写明。
 
 **已知限制**:reference 模型每卡一份(GRPO + `beta>0` 时每卡多约 1.7 GB);joint/vision_top 的视觉
 梯度显存随 `W` 线性增长;不做逐 rank checkpoint 状态与 `epoch_shard`;`Sampler` 仍只采 rank 0 的
-AMD sysfs 路径。
+AMD sysfs 路径;`run_experiment.py` 的完整流水线(prepare→train→calibrate→benchmark→jevbench)
+未在 `--gpus > 1` 下端到端跑过 —— V9 只验证了它构造的那条训练命令本身。

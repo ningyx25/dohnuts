@@ -58,6 +58,13 @@ open the vision tower declare `find_unused_parameters`, because a microbatch
 without an image legitimately never touches the merger or vision blocks; head and
 language parameters always do, so `warmup`/`text` keep the faster static path.
 
+The point of the arrangement is that N ranks compute the objective one process would.
+With `accumulation` scaled inversely by the world size, both draw the same global
+microbatches, and on text-only data the first update matches bit for bit. Screenshots do
+not: the frozen vision cache returns an image encoded inside whichever batch first held it,
+so re-partitioning changes that image's bf16 result. What the recipe guarantees across
+layouts is which examples a step consumes, not the bits a run reproduces.
+
 Rank 0 alone reads telemetry, evaluates development accuracy, and writes
 checkpoints and metrics; every rank makes the same collective calls in the same
 order, and metrics and consumed-sample counters are reduced before rank 0 logs
