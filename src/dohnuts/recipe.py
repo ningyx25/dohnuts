@@ -18,7 +18,11 @@ from dohnuts.objectives import grpo_options, sft_options
 from dohnuts.rlcd import RLCDConfig
 
 IMAGE_PIXELS = 1024**2
-MAX_LENGTH = 8192
+# Measured, not chosen: 1024^2 screenshots cost 1,369 visual tokens, and the longest
+# measured row of ac-jev-v1 -- 20,000 random rows through the collator's own formula --
+# reaches 8,942 tokens. 12,288 leaves room above that tail while staying far inside the
+# base model's 262,144-token context.
+MAX_LENGTH = 12_288
 TRAINING_STEPS = None
 EPOCHS = 3
 LR_DECAY_STEPS = 2400

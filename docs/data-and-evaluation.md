@@ -376,18 +376,30 @@ agent's own labels and a `screenChanged` flag computed by comparing consecutive
 screens' fingerprints. `task_progress` is gone: the agent's state has no such
 key.
 
-**Token budget.** `MAX_LENGTH` is 8,192, and `Qwen35Adapter.max_input_tokens`
-matches it so serving accepts what training does. The number comes from
+**Token budget.** `MAX_LENGTH` is 12,288, and `Qwen35Adapter.max_input_tokens` is
+bound to that constant in the source, so serving cannot refuse a row training
+accepted. The number comes from
 measurement, not taste: the aligned prompts put the median row at 2,128 tokens
 and p99 at 6,653, so the old 2,048 (chosen for gui-v1's short
 `{user_query, task_progress}` state) would have refused 52.3% of the corpus. At
 8,192 the check costs 86 steps — 0.09% — which is why it is a gate again:
 `--model` turns it on and a step with any over-budget row is excluded whole as
 `token_budget`, because `DecisionCollator` raises on such a batch rather than
-truncating. The run that produced `ac-jev-v1` measures `over_max_length: 0`, so
-every written row fits; dropping the text-value rows and capping the app question
+truncating. The run that produced `ac-jev-v1` measured `over_max_length: 0` under the 512²
+image area, so every written row fit then; dropping the text-value rows and capping the app question
 at 31 options also brought the distribution down (p50 1,995, p90 3,487, p99
-5,305, against 2,144 / 4,793 / 6,549 before the reshape). `scripts/report_token_lengths.py` still writes
+5,305, against 2,144 / 4,793 / 6,549 before the reshape).
+
+`IMAGE_PIXELS = 1024²` moved that whole distribution up -- a screenshot is 1,369
+visual tokens instead of 361 -- so the budget moved with it. Re-measured on 20,000
+random rows of `ac-jev-v1` through `dohnuts.token_stats.measure`: p50 2,762, p90 4,240,
+p99 6,044, max 8,942, with 8 rows above the old 8,192 (all `jev_tap_target`, whose
+candidate lists are the longest) and none above 9,216. 12,288 leaves about 37% headroom
+over the measured extreme, the 255-candidate rule bounds how much longer a row can get,
+and the base model's own context is 262,144 tokens. Because both `image_pixels` and
+`max_length` are validated against a checkpoint, an export made under 512² / 8,192 is
+refused rather than reinterpreted: change one constant and the corpus has to be
+re-measured (`scripts/report_token_lengths.py`) before it is trained on. `scripts/report_token_lengths.py` still writes
 `token_lengths.jsonl` (one line per row, so a future budget can be re-derived
 without measuring again) and `token_stats.json` (min/p50/p90/p99/max and
 `over_max_length` per dataset and split) for the record.

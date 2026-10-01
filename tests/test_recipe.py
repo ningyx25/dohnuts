@@ -14,6 +14,13 @@ def test_the_recipe_budgets_in_epochs_by_default():
     assert recipe["dev_cap"] is None
 
 
+def test_serving_accepts_exactly_what_training_accepted():
+    """The adapter's input limit is the training budget, not a second number to keep."""
+    from dohnuts.adapters import Qwen35Adapter
+
+    assert Qwen35Adapter.max_input_tokens == training_recipe()["max_length"]
+
+
 def test_one_epoch_walks_the_split_once_whatever_the_gpu_count():
     # an update consumes batch_size * accumulation * world_size samples
     assert resolve_steps(rows=1000, epochs=1, batch_size=8, accumulation=4) == 32

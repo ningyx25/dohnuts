@@ -11,7 +11,7 @@ from transformers import AutoModel, AutoProcessor
 
 from dohnuts import distributed
 from dohnuts.execution import language_forward
-from dohnuts.recipe import IMAGE_PIXELS, STAGES
+from dohnuts.recipe import IMAGE_PIXELS, MAX_LENGTH, STAGES
 
 
 class Qwen35Adapter:
@@ -19,7 +19,7 @@ class Qwen35Adapter:
 
     name = "qwen3.5"
     base_model = "Qwen/Qwen3.5-0.8B"
-    max_input_tokens = 8192
+    max_input_tokens = MAX_LENGTH  # serving must accept what training accepted
     marker = "<|fim_suffix|>"
     image_prefix = "<|vision_start|><|image_pad|><|vision_end|>\n"
     _vision_trainable = False
