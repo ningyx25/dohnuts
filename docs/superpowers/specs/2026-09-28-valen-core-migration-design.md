@@ -721,3 +721,39 @@ checkpoint 全部只在 rank 0;其余 rank 在 eval 后 `barrier()` 等待。`st
 梯度显存随 `W` 线性增长;不做逐 rank checkpoint 状态与 `epoch_shard`;`Sampler` 仍只采 rank 0 的
 AMD sysfs 路径;`run_experiment.py` 的完整流水线(prepare→train→calibrate→benchmark→jevbench)
 未在 `--gpus > 1` 下端到端跑过 —— V9 只验证了它构造的那条训练命令本身。
+
+## 20. 配方默认值调整(2026-10-02 追加)
+
+三个曾硬编码成产品常量的实验坐标改为默认更宽松,其余参数一律保留原值。
+
+| 项 | 旧 | 新 | 影响面 |
+| --- | --- | --- | --- |
+| 训练长度 | `TRAINING_STEPS = 3600` | `EPOCHS = 3`,`TRAINING_STEPS = None` | `recipe.py` 新增 `resolve_steps()`;`train()` 读完数据后换算并把结果写进 `run/config.json` |
+| 图像面积 | `IMAGE_PIXELS = 512²` | `1024²` | 每张截图 361 → 1369 个视觉 token;`MAX_LENGTH = 8192` 不变 |
+| 读取上限 | `train_cap = 6000` / `dev_cap = 256` | 两者 `None` | 整 split 读取,含末尾的 train 诊断;`prepare_data.py` 的两处 `6000` 同步取消 |
+
+**换算规则**:一次更新消费 `batch_size × accumulation × world_size` 条,故
+`steps = ceil(rows × epochs / (batch_size × accumulation × world_size))`。固定预算优先:模块常量
+`TRAINING_STEPS` 非 `None` 时覆盖一切,显式 `steps` 次之,`epochs` 兜底(此时 `epochs` 仍被记录但不生效)。
+把卡数放进分母是有意的:同样三遍数据,4 卡的 update 数是 1 卡的 1/4,而不是悄悄多训练四倍。
+衰减视界 `min(steps, LR_DECAY_STEPS)` 仍在首个 run 冻结,resume 读回,延长预算不会重拉伸已走过的曲线。
+
+**验证(node01,4×A40,`4d2a58c`/`9961c00`)**:72 行 text-only mixture + `epochs=3`,recorded steps
+W=1/2/4 = **7/4/2** = `ceil(216/(32W))` ✓;首个 run 的 `train_complete` 消费 224 条 = 7×32 ✓(resumed run 的
+`consumed` 是 `train.py` 从稀疏日志恢复的画图计数器,非本次引入,不等于本进程消费量)。预算升降矩阵:
+`epochs 3→6` 接受(14 步,视界仍为 7)、`epochs 3→3` 接受(零新增)、`epochs 3→1` 拒绝、
+`steps 20→12` 拒绝、固定预算退回 `epochs 3` 拒绝 ✓。真实截图 `sft/text` 2 rank 训练 `exit 0`,无
+`Token budget exceeded`、无 OOM。旧导出兼容性:把 v2 导出的 `image_pixels` 改回 `512²` 后
+`load_adapter` 报 `Checkpoint differs from the pinned model, training recipe, or checksum: image_pixels` ✓
+—— 提高默认分辨率等于宣布旧视觉 checkpoint 不可复用,这是校验而非静默重解读。
+
+**过程中发现并修掉的缺陷**(`9961c00`):resume 用「整字典相等」判定「只允许改预算」,但重建 `expected` 时只
+覆盖了 `steps`,没覆盖 `epochs` ⇒ 任何 `epochs` 改动都让字典不等,epoch 预算实际上永远无法延长。修法是
+`expected` 同时接受 `epochs` 与解析后的 `steps`,比较仍在解析后的具体 update 数上进行,故「只能变大」的
+原意(以及跨预算风格退小的拒绝)保持不变。
+
+**由本次默认值变更暴露的数据问题**:在完整 `ac-jev-v1` 语料随机抽 7000 行按新常量实测,3 行超过 8192
+(最长 8942,均为 `jev_tap_target`),直接喂给 collator 即抛 `Token budget exceeded: [...]`;这 3 行在 512² 下
+本来达标,所以当初的转换门留下了它们。叠加 `train_cap=None` 后整 split 都会被读到,采样命中只是时间问题。
+处理办法是把转换(它的预算门用的正是同一组 `IMAGE_PIXELS`/`MAX_LENGTH`)重跑一遍剔除这些行,或显式设
+`train_cap` 缩小读取量,或在数据侧截短候选列表;本次不改 `MAX_LENGTH`,因目标要求其余参数维持原默认。
