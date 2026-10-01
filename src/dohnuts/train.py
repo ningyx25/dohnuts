@@ -255,6 +255,10 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         }
         if not resume or expected != frozen or config["steps"] < previous["steps"]:
             raise ValueError("Resume may only extend the step budget of the same recipe and data")
+    # Every rank has now read the config it started from. Without this barrier a
+    # slow rank would read the file rank 0 is about to create and treat a fresh
+    # run as an unresumed continuation of itself.
+    distributed.barrier()
     if distributed.is_main_process():
         temporary = config_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(frozen, indent=2) + "\n")
