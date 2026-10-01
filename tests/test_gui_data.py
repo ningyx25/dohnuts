@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import itertools
 import json
+import math
 from collections import Counter
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from dohnuts.gui_data import (
     split_for,
     validate_rows,
 )
-from dohnuts.recipe import MAX_LENGTH
+from dohnuts.recipe import IMAGE_PIXELS, MAX_LENGTH
 
 QUERY = (
     "In the Files app, locate the 'task.html' file within the Downloads folder and switch "
@@ -1103,6 +1104,8 @@ def test_token_length_counts_words_and_image_patches(image_root):
     prompt, _, _ = prepare.render_question(
         prepare.render(row["state"]), row["question"], has_image=True
     )
-    # An 8x8 screenshot resizes to 532x532: 19x19 = 361 patches at factor 28, minus
-    # the single placeholder token already present in the rendered prompt.
-    assert prepare.token_length(StubProcessor(), row) == len(prompt.split()) + 360
+    # An 8x8 screenshot is resized to the smallest multiple-of-28 square that
+    # reaches IMAGE_PIXELS, and each 28x28 patch takes one token; the rendered
+    # prompt already carries the single placeholder, so it nets out to one less.
+    side = math.ceil(math.sqrt(IMAGE_PIXELS) / 28)
+    assert prepare.token_length(StubProcessor(), row) == len(prompt.split()) + side * side - 1

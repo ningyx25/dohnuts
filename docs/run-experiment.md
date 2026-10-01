@@ -38,11 +38,18 @@ frozen Laya chart protocol. API benchmarks measure latency and resource use.
 Every failed stage stops execution.
 Completed stages are recorded; rerunning the command resumes the same recipe.
 A different recipe or dataset requires a separate experiment directory. The
-current method warms up for 72 updates, follows cosine decay through update
-2,400, and uses the 10% learning-rate floor through update 3,600. This is the
-schedule used by the selected Dohnuts 0.1.0 export.
+current method warms up for 3% of the decay horizon, follows cosine decay through
+update 2,400, and holds the 10% learning-rate floor after it.
 
-`--steps` changes an experiment's total budget. Extending a completed run retains
+The budget is expressed in epochs. `--epochs` (default 3) walks the training split
+three times, and the update count is whatever that works out to once the number of
+training rows and the GPU count are known, because one update consumes
+`batch_size * accumulation * world_size` samples. `--steps`, or `TRAINING_STEPS` in
+`dohnuts.recipe`, pins a fixed number of updates instead and overrides the epoch
+budget. The decay horizon is `min(updates, 2,400)`, frozen into the run when it starts,
+so extending a run never re-stretches a schedule already partly walked.
+
+`--epochs` or `--steps` changes an experiment's total budget. Extending a completed run retains
 optimizer and random state, sampling position, and the decay horizon. Development
 selection includes its existing best checkpoint, followed by calibration,
 evaluation, and acceptance. Checkpoint steps are experiment coordinates, not
@@ -55,8 +62,10 @@ alone, `text` adds language LoRA (the default), `joint` also opens the vision
 merger, and `vision_top` also opens the top four vision blocks. The two vision
 stages trade the frozen-image cache for correct gradients, so they recompute
 every image feature. `--projection-dim`, `--lora-rank`, and `--lora-alpha`
-default to 256, 8, and 16. `--steps` sets the total update budget, and `--data`,
-`--model`, and `--output` identify local assets and output locations.
+default to 256, 8, and 16. `--data`, `--model`, and `--output` identify local assets
+and output locations. The recipe reads every row of each split by default:
+`train_cap` and `dev_cap` are `None`, so set them in the generated recipe file to
+subsample per dataset group.
 
 Objective details beyond those flags, such as `grpo.group_size` or
 `sft.brier_weight`, belong in the generated `recipe-seed-*.json`. The file is a
@@ -128,8 +137,10 @@ between two runs of one layout, which is ordinary nondeterminism in the backward
 Checkpoints written before the two-projection head change carry
 `format_version: 1`. Both the resume path and `Predictor.from_checkpoint` refuse
 them, because the decision-head parameter keys and the frozen recipe have
-changed. Start a new run; use `--initialize-from` only with an export written by
-the current recipe.
+changed. A checkpoint exported under a different `image_pixels` is refused the same
+way: the number of visual tokens per screenshot is part of what the weights were
+trained against, so it is validated rather than silently reinterpreted. Start a new
+run; use `--initialize-from` only with an export written by the current recipe.
 
 Base initialization and checkpoint initialization use the same 26-group mixture
 and training workflow. To initialize from an exported checkpoint:

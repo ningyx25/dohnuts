@@ -596,7 +596,7 @@ def blocked_text(base):
     blocked = set(
         json.loads(Path("data/manifests/evaluation-text-sha256.json").read_text())["hashes"]
     )
-    trained = load_records(base / "train.jsonl", 6000)
+    trained = load_records(base / "train.jsonl")
     trained_ids = {row["id"] for group in trained.values() for row in group}
     for split in SPLIT_ORDER:
         for row in rows(base / f"{split}.jsonl"):
@@ -1049,7 +1049,7 @@ def prepare_mixture(base, output, model):
         for handle in handles.values():
             handle.close()
     new_counts = counts.copy()
-    original = load_records(base / "train.jsonl", 6000)
+    original = load_records(base / "train.jsonl")
     replay_ids = {row["id"] for group in original.values() for row in group}
     for split in handles:
         with (

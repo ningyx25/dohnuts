@@ -2,21 +2,46 @@
 
 Values are recorded in each run for reproducibility. They are product defaults,
 not a configuration surface. Model-specific behavior belongs in an adapter.
+
+The budget is expressed in epochs by default: ``steps`` stays ``None`` and
+``train()`` turns ``epochs`` into optimizer updates once it knows how many
+training rows the recipe reads and how many GPUs split the work. Setting
+``TRAINING_STEPS`` pins a fixed number of updates instead and overrides the
+epoch budget, which is what an apples-to-apples comparison against a previous
+run needs.
 """
 
+import math
 from pathlib import Path
 
 from dohnuts.objectives import grpo_options, sft_options
 from dohnuts.rlcd import RLCDConfig
 
-IMAGE_PIXELS = 512**2
+IMAGE_PIXELS = 1024**2
 MAX_LENGTH = 8192
-TRAINING_STEPS = 3600
+TRAINING_STEPS = None
+EPOCHS = 3
 LR_DECAY_STEPS = 2400
 BASE_MODEL = Path(".cache/models/Qwen3.5-0.8B")
 DATA = Path("data/processed/v1")
 METHODS = ("rlcd", "sft", "grpo")
 STAGES = ("warmup", "text", "joint", "vision_top")
+
+
+def resolve_steps(*, rows, epochs, batch_size, accumulation, world_size=1, steps=None):
+    """Turn the recipe's budget into the number of optimizer updates.
+
+    A fixed ``steps`` budget wins, because it is the override. Otherwise one
+    update consumes ``batch_size * accumulation * world_size`` samples, so the
+    same ``epochs`` walks the training split exactly once per epoch whatever the
+    GPU count -- adding GPUs shortens the run instead of quietly training longer.
+    """
+    if steps is not None:
+        return steps
+    if rows < 1:
+        raise ValueError("An epoch budget needs a non-empty training split")
+    per_update = batch_size * accumulation * world_size
+    return math.ceil(rows * epochs / per_update)
 
 
 def training_recipe(
@@ -25,6 +50,7 @@ def training_recipe(
     data=DATA,
     seed=42,
     rlcd=None,
+    epochs=EPOCHS,
     steps=TRAINING_STEPS,
     method="rlcd",
     stage="text",
@@ -34,8 +60,13 @@ def training_recipe(
     sft=None,
     grpo=None,
 ):
-    if not isinstance(steps, int) or steps < 1:
+    if TRAINING_STEPS is not None:
+        # A step budget pinned in this module outranks both the caller and epochs.
+        steps = TRAINING_STEPS
+    if steps is not None and (not isinstance(steps, int) or steps < 1):
         raise ValueError("Training steps must be a positive integer")
+    if not isinstance(epochs, int) or epochs < 1:
+        raise ValueError("Training epochs must be a positive integer")
     if method not in METHODS:
         raise ValueError(f"Unsupported training method: {method}")
     if stage not in STAGES:
@@ -56,13 +87,14 @@ def training_recipe(
         "lora_alpha": lora_alpha,
         "batch_size": 8,
         "accumulation": 4,
+        "epochs": epochs,
         "steps": steps,
         "backbone_lr": 1e-4,
         "head_lr": 5e-4,
         "merger_lr": 1e-5,
         "vision_lr": 2e-6,
-        "train_cap": 6000,
-        "dev_cap": 256,
+        "train_cap": None,
+        "dev_cap": None,
         "image_pixels": IMAGE_PIXELS,
         "max_length": MAX_LENGTH,
         "cpu_threads": 8,

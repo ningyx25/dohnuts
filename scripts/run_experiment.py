@@ -9,7 +9,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from dohnuts.recipe import BASE_MODEL, DATA, TRAINING_STEPS, training_recipe
+from dohnuts.recipe import BASE_MODEL, DATA, EPOCHS, TRAINING_STEPS, training_recipe
 from dohnuts.rlcd import RLCDConfig
 from dohnuts.train import file_hash
 
@@ -20,7 +20,14 @@ def main():
     parser.add_argument("--model", type=Path, default=BASE_MODEL, help="Local pinned backbone")
     parser.add_argument("--output", type=Path, default=Path("runs/v1"))
     parser.add_argument(
-        "--steps", type=int, help="Total updates; extend a run without resetting it"
+        "--steps",
+        type=int,
+        help="Fixed number of optimizer updates; overrides --epochs and extends a run in place",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        help="Passes over the training split (default 3); ignored when --steps or TRAINING_STEPS is set",
     )
     parser.add_argument(
         "--initialize-from",
@@ -49,13 +56,19 @@ def main():
     policy = RLCDConfig(sigma=args.sigma, ce_weight=args.ce_weight)
     recipe_path = args.output / "recipe.json"
     previous = json.loads(recipe_path.read_text()) if recipe_path.exists() else None
-    steps = args.steps
-    if steps is None:
-        steps = previous["recipe"]["steps"] if previous else TRAINING_STEPS
+    # A step budget pinned in dohnuts.recipe outranks everything else; an explicit
+    # --steps pins one too; otherwise the budget is epochs.
+    steps = TRAINING_STEPS if TRAINING_STEPS is not None else args.steps
+    epochs = args.epochs
+    if steps is None and epochs is None and previous is not None:
+        # Re-running with no budget keeps the existing run's budget, as before.
+        steps = previous["recipe"].get("steps")
+        epochs = previous["recipe"].get("epochs", EPOCHS)
     recipe = training_recipe(
         model=args.model,
         data=args.data,
         rlcd=policy,
+        epochs=EPOCHS if epochs is None else epochs,
         steps=steps,
         method=args.method,
         stage=args.stage,
@@ -118,11 +131,32 @@ def main():
             "weights_sha256": file_hash(args.initialize_from / "adapter.safetensors"),
         }
     if previous is not None and previous != frozen:
-        old_steps = previous["recipe"]["steps"]
-        expected = {**previous, "recipe": {**previous["recipe"], "steps": steps}}
-        if expected != frozen or steps <= old_steps:
+        old = previous["recipe"]
+        old_steps, old_epochs = old.get("steps"), old.get("epochs", EPOCHS)
+        epochs_here = EPOCHS if epochs is None else epochs
+        expected = {**previous, "recipe": {**old, "steps": steps, "epochs": epochs_here}}
+        if expected != frozen:
             raise ValueError("An existing run permits only an increased step budget")
-        baseline = args.output / "baselines" / f"step-{old_steps}"
+        # A budget is comparable when it is stated the same way; mixing a fixed
+        # update count with an epoch budget is a different experiment.
+        if steps is None and old_steps is None:
+            raised = epochs_here > old_epochs
+        elif steps is not None and old_steps is not None:
+            raised = steps > old_steps
+        else:
+            raised = False
+        if not raised:
+            raise ValueError("An existing run permits only an increased step budget")
+        # The run's own config records the update count the budget resolved to, so
+        # the archived baseline is named after data actually seen, not intent.
+        frozen_run = args.output / f"seed-{recipe['seed']}" / "config.json"
+        if frozen_run.exists():
+            archived = f"updates-{json.loads(frozen_run.read_text())['steps']}"
+        elif old_steps is not None:
+            archived = f"updates-{old_steps}"
+        else:
+            archived = f"epochs-{old_epochs}"
+        baseline = args.output / "baselines" / archived
         if "report" not in done and not baseline.exists():
             raise ValueError("Complete the current workflow before extending its step budget")
         if baseline.exists() and json.loads((baseline / "recipe.json").read_text()) != previous:

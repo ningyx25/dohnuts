@@ -24,7 +24,7 @@ from dohnuts.experiment import Sampler, emit, environment, memory
 from dohnuts.metrics import by_dataset, by_primitive_and_candidates, fit_temperatures
 from dohnuts.model import DecisionModel
 from dohnuts.objectives import build_objective
-from dohnuts.recipe import LR_DECAY_STEPS, training_recipe
+from dohnuts.recipe import EPOCHS, LR_DECAY_STEPS, resolve_steps, training_recipe
 from dohnuts.rlcd import RLCDConfig
 from dohnuts.training_data import (
     DecisionCollator,
@@ -210,15 +210,24 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
     data = Path(config["data"])
     groups = load_records(data / "train.jsonl", config["train_cap"])
     dev = load_records(data / "dev.jsonl", config["dev_cap"])
+    # The recipe budgets in epochs, so the update count depends on how much data
+    # there is and how many GPUs split each update. Both are identical on every
+    # rank, which keeps the collective schedule aligned.
+    steps = resolve_steps(
+        rows=sum(len(records) for records in groups.values()),
+        epochs=config["epochs"],
+        batch_size=config["batch_size"],
+        accumulation=config["accumulation"],
+        world_size=distributed.world_size(),
+        steps=config["steps"],
+    )
     source_hashes = {
         split: file_hash(data / f"{split}.jsonl")
         for split in ["train", "dev", "calibration", "test"]
     }
     config_path = run / "config.json"
     previous = json.loads(config_path.read_text()) if config_path.exists() else None
-    lr_decay_steps = (
-        previous["lr_decay_steps"] if previous else min(config["steps"], LR_DECAY_STEPS)
-    )
+    lr_decay_steps = previous["lr_decay_steps"] if previous else min(steps, LR_DECAY_STEPS)
     step = 0
     best = -1.0
     training_state = None
@@ -232,6 +241,7 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
     objective = build_objective(config, model=raw, training_state=training_state, resuming=resume)
     frozen = {
         **config,
+        "steps": steps,
         "source_hashes": source_hashes,
         "objective": objective.describe(),
         "sampling": "uniform dataset, replacement, seed+microbatch index; choice permutation only",
@@ -251,9 +261,9 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         expected = {
             **previous,
             "lr_decay_steps": lr_decay_steps,
-            "steps": config["steps"],
+            "steps": steps,
         }
-        if not resume or expected != frozen or config["steps"] < previous["steps"]:
+        if not resume or expected != frozen or steps < previous["steps"]:
             raise ValueError("Resume may only extend the step budget of the same recipe and data")
     # Every rank has now read the config it started from. Without this barrier a
     # slow rank would read the file rank 0 is about to create and treat a fresh
@@ -287,7 +297,7 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
                 {
                     "kind": "resume",
                     "step": step,
-                    "target_step": config["steps"],
+                    "target_step": steps,
                     "lr_decay_steps": lr_decay_steps,
                     "optimizer_lr": [group["lr"] for group in optimizer.param_groups],
                     "checkpoint_sha256": file_hash(run / "last.pt"),
@@ -339,7 +349,7 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         collator,
         seed=config["seed"],
         batch_size=config["batch_size"],
-        steps=config["steps"],
+        steps=steps,
         accumulation=config["accumulation"],
         start_step=step,
         rank=distributed.rank(),
@@ -360,7 +370,7 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         output=run / "resources.jsonl",
         enabled=distributed.is_main_process(),
     ) as telemetry:
-        while step < config["steps"]:
+        while step < steps:
             model.train()
             optimizer.zero_grad(set_to_none=True)
             decay_steps = frozen["lr_decay_steps"]
@@ -478,7 +488,7 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
                             "memory": memory(),
                         },
                     )
-            if step % config["eval_every"] == 0 or step == config["steps"]:
+            if step % config["eval_every"] == 0 or step == steps:
                 if distributed.is_main_process():
                     predictions = evaluate(
                         raw,
@@ -677,6 +687,7 @@ def main():
         data=config["data"],
         seed=config["seed"],
         rlcd=RLCDConfig(**config.get("rlcd", {})),
+        epochs=config.get("epochs", EPOCHS),
         steps=config["steps"],
         method=config.get("method", "rlcd"),
         stage=config.get("stage", "text"),

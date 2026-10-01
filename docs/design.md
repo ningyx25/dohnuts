@@ -50,7 +50,8 @@ and `DistributedDataParallel` averages gradients across ranks. A step's mixture
 is `accumulation * N` microbatches; rank `r` reads the contiguous slice
 `[step*A*N + r*A, step*A*N + (r+1)*A)`, so the global batch scales with the GPU
 count while `--steps` keeps meaning optimizer updates. The world size is recorded
-in the run config, so a resume must reproduce it.
+in the run config, so a resume must reproduce it; with an epoch budget it also fixes
+how many updates that budget resolves to.
 
 Gradient accumulation synchronizes once per update on the last microbatch: DDP's
 `no_sync` avoids a partial sum being mixed into the reduced gradient. Stages that
@@ -80,8 +81,8 @@ cross-entropy term. `sft` is distribution cross-entropy with optional RPS and
 Brier terms, both zero by default. `grpo` samples candidates per question,
 normalizes rewards within the sampled group, and combines a clipped ratio, an
 exact categorical KL to a fixed reference, and a Brier term. See
-[RLCD and the other objectives](rlcd.md). `--steps` controls the total update
-budget.
+[RLCD and the other objectives](rlcd.md). `--epochs` controls the total budget in
+passes over the training split, and `--steps` overrides it with a fixed update count.
 
 The release path merges LoRA before calibration and final evaluation, and a
 `warmup` run has no LoRA to merge. Loading the compact checkpoint reconstructs
