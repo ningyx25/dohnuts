@@ -90,10 +90,13 @@ pdm run python scripts/run_experiment.py --gpus 4 --output runs/v1-4gpu
 The effective global batch is `batch_size * accumulation * N`, while `--steps`
 still counts optimizer updates, so the same recipe trains longer per step as
 GPUs are added. `batch_size` and `accumulation` are fixed in the recipe; scale
-`--steps` or add GPUs, not the per-rank batch. Development evaluation, telemetry,
-and checkpoint writing stay on rank 0, so metrics and selection are identical in
-shape to a single-GPU run. Final calibration and evaluation run in a separate
-single-process step and are never distributed.
+`--steps` or add GPUs, not the per-rank batch. Every rank scores its own
+contiguous slice of the development, calibration, test and diagnostic passes, so
+the merged prediction file and the metrics read off it are the same rows, in the
+same order, as a single-GPU run; telemetry, checkpoint writing and calibration
+stay on rank 0. The process group's collective timeout is the run's own
+`NCCL_TIMEOUT_S` (3,600 s, `DOHNUTS_NCCL_TIMEOUT_S`), because a pass over a large
+split legitimately takes many minutes while the other ranks wait at the barrier.
 
 The world size is recorded in the run's `config.json`; resuming requires the same
 `--gpus`, because the world size determines how each step's batch is partitioned.

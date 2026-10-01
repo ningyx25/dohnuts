@@ -722,7 +722,7 @@ checkpoint 全部只在 rank 0;其余 rank 在 eval 后 `barrier()` 等待。`st
 AMD sysfs 路径;`run_experiment.py` 的完整流水线(prepare→train→calibrate→benchmark→jevbench)
 未在 `--gpus > 1` 下端到端跑过 —— V9 只验证了它构造的那条训练命令本身。
 
-## 20. 配方默认值调整(2026-10-02 追加)
+## 20. 配方默认值调整(2026-10-01 追加)
 
 三个曾硬编码成产品常量的实验坐标改为默认更宽松,其余参数一律保留原值。
 
@@ -758,7 +758,7 @@ W=1/2/4 = **7/4/2** = `ceil(216/(32W))` ✓;首个 run 的 `train_complete` 消�
 处理办法是把转换(它的预算门用的正是同一组 `IMAGE_PIXELS`/`MAX_LENGTH`)重跑一遍剔除这些行,或显式设
 `train_cap` 缩小读取量,或在数据侧截短候选列表;本次不改 `MAX_LENGTH`,因目标要求其余参数维持原默认。
 
-## 21. token 预算随图像面积上调(2026-10-02 追加)
+## 21. token 预算随图像面积上调(2026-10-01 追加)
 
 §20 把 `IMAGE_PIXELS` 提到 1024² 后留下的数据问题,以**上调 `MAX_LENGTH`** 收口(其余参数不动)。
 
