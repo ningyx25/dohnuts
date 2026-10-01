@@ -261,6 +261,9 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         expected = {
             **previous,
             "lr_decay_steps": lr_decay_steps,
+            # The budget is the one thing a resume may change, and it is written
+            # two ways: the epoch intent and the update count it resolved to.
+            "epochs": config["epochs"],
             "steps": steps,
         }
         if not resume or expected != frozen or steps < previous["steps"]:
