@@ -11,6 +11,7 @@ from pathlib import Path
 
 import torch
 
+from dohnuts import distributed
 from dohnuts.model import DecisionModel, model_revision
 
 GIB = 1024**3
@@ -19,10 +20,11 @@ GIB = 1024**3
 class Sampler:
     """Sample board memory/utilization/power and process RSS every 20 ms."""
 
-    def __init__(self, device: Path, interval: float = 0.02, *, output=None):
+    def __init__(self, device: Path, interval: float = 0.02, *, output=None, enabled=True):
         self.device = device
         self.interval = interval
         self.output = output
+        self.enabled = enabled
         self.stream = None
         self.stop = threading.Event()
         self.samples = []
@@ -61,12 +63,16 @@ class Sampler:
             self.stop.wait(self.interval)
 
     def __enter__(self):
+        if not self.enabled:
+            return self
         if self.output:
             self.stream = self.output.open("a", buffering=1)
         self.thread.start()
         return self
 
     def __exit__(self, *args):
+        if not self.enabled:
+            return
         self.stop.set()
         self.thread.join()
         if self.stream:
@@ -155,7 +161,11 @@ def environment(model: DecisionModel, checkpoint: Path, *, method=None):
         },
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(),
-        "gpu_properties": str(torch.cuda.get_device_properties(0)),
+        "gpu_properties": str(torch.cuda.get_device_properties(torch.cuda.current_device())),
+        "distributed": distributed.is_distributed(),
+        "world_size": distributed.world_size(),
+        "rank": distributed.rank(),
+        "local_rank": distributed.local_rank(),
         "checkpoint_revision": model_revision(checkpoint),
         "parameters": sum(p.numel() for p in model.parameters()),
         "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),

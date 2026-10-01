@@ -10,6 +10,7 @@ import torch
 from huggingface_hub import snapshot_download
 from PIL import Image
 
+from dohnuts import distributed
 from dohnuts.adapters import Qwen35Adapter
 from dohnuts.execution import plan_prefix
 from dohnuts.gui_data import MAX_CANDIDATES, MIN_CANDIDATES
@@ -241,12 +242,13 @@ class Predictor:
         inputs, positions, decision_positions, mask, metadata = self.prepare(state, questions)
         token_count = int(inputs["attention_mask"].sum())
         has_image = "pixel_values" in inputs
+        target = distributed.device()
         inputs = {
-            key: value.to("cuda") if isinstance(value, torch.Tensor) else value
+            key: value.to(target) if isinstance(value, torch.Tensor) else value
             for key, value in inputs.items()
         }
-        positions = positions.to("cuda")
-        decision_positions = decision_positions.to("cuda")
+        positions = positions.to(target)
+        decision_positions = decision_positions.to(target)
         logits = (
             self.model(inputs, positions, decision_positions).cpu().masked_fill(~mask, -torch.inf)
         )

@@ -9,6 +9,7 @@ from peft import LoraConfig, get_peft_model
 from torch import nn
 from transformers import AutoModel, AutoProcessor
 
+from dohnuts import distributed
 from dohnuts.execution import language_forward
 from dohnuts.recipe import IMAGE_PIXELS, STAGES
 
@@ -33,15 +34,18 @@ class Qwen35Adapter:
             enable_triton_convolution,
         )
 
-        # The desktop shares this GPU. Bound the caching allocator so a sequence
-        # of evaluation shapes cannot retain nearly all VRAM and crash the compositor.
-        torch.cuda.set_per_process_memory_fraction(0.8)
+        # Bound the caching allocator so a sequence of evaluation shapes cannot
+        # retain nearly all VRAM and crash the compositor.  Under multi-GPU each
+        # process already owns its device, so the fraction only applies in
+        # single-GPU mode where the desktop shares the GPU.
+        if not distributed.is_distributed():
+            torch.cuda.set_per_process_memory_fraction(0.8)
         if torch.version.hip:
             os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
             enable_triton_convolution()
         backbone = AutoModel.from_pretrained(
             checkpoint, dtype=torch.bfloat16, attn_implementation="sdpa", local_files_only=True
-        ).to("cuda")
+        ).to(distributed.device())
         backbone.requires_grad_(False)
         backbone.config.use_cache = False
         enable_linear_patch_embedding(backbone.visual)

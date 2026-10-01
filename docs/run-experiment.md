@@ -16,7 +16,9 @@ pdm run python scripts/run_experiment.py
 ```
 
 The Qwen3.5 adapter limits PyTorch's caching allocator to 80% of visible VRAM,
-leaving headroom for the desktop and GPU driver on a shared workstation.
+leaving headroom for the desktop and GPU driver on a shared workstation. That
+bound applies to single-GPU runs only; with data parallelism each process owns
+its device outright.
 
 The script downloads the pinned base and public datasets when absent, converts
 the complete mixture, isolates related examples and identical images across
@@ -61,6 +63,39 @@ Objective details beyond those flags, such as `grpo.group_size` or
 closed recipe: the trainer rejects any configuration that differs from
 `training_recipe(...)`. Flags do not select architectures; different backbone
 support uses the [adapter interface](design.md).
+
+## Multiple GPUs
+
+`--gpus N` (default 1) trains on one machine with `N` data-parallel processes,
+launched through `torchrun --nproc_per_node=N`. Each process owns one visible
+device (`CUDA_VISIBLE_DEVICES=0..N-1`) and the model is replicated, not sharded,
+so a 0.8B model still needs a full copy per GPU. `--master-port` sets the
+torchrun rendezvous port (default 29500).
+
+```bash
+pdm run python scripts/run_experiment.py --gpus 4 --output runs/v1-4gpu
+```
+
+The effective global batch is `batch_size * accumulation * N`, while `--steps`
+still counts optimizer updates, so the same recipe trains longer per step as
+GPUs are added. `batch_size` and `accumulation` are fixed in the recipe; scale
+`--steps` or add GPUs, not the per-rank batch. Development evaluation, telemetry,
+and checkpoint writing stay on rank 0, so metrics and selection are identical in
+shape to a single-GPU run. Final calibration and evaluation run in a separate
+single-process step and are never distributed.
+
+The world size is recorded in the run's `config.json`; resuming requires the same
+`--gpus`, because the world size determines how each step's batch is partitioned.
+Checkpoints are ordinary `format_version: 2` exports and load the same way whether
+they were trained on one GPU or several. `--gpus 1` is the original code path with
+no process group, and a plain `python -m dohnuts.train` launch stays single-GPU.
+
+Run the GPU plumbing check with the elastic launcher (add `--full` to also train
+two real Qwen3.5 SFT steps on the pinned base):
+
+```bash
+pdm run torchrun --nproc_per_node=2 scripts/smoke_multi_gpu.py
+```
 
 Checkpoints written before the two-projection head change carry
 `format_version: 1`. Both the resume path and `Predictor.from_checkpoint` refuse

@@ -42,6 +42,29 @@ learning rates, sampling, checkpoint selection, and calibration. `recipe.py` is
 the executable specification. Run metadata records all values and data hashes,
 including values that callers cannot change.
 
+## Data-parallel training
+
+One machine, several GPUs, one process per GPU. Launched under
+`torchrun --nproc_per_node=N`, each rank replicates the model on its own device
+and `DistributedDataParallel` averages gradients across ranks. A step's mixture
+is `accumulation * N` microbatches; rank `r` reads the contiguous slice
+`[step*A*N + r*A, step*A*N + (r+1)*A)`, so the global batch scales with the GPU
+count while `--steps` keeps meaning optimizer updates. The world size is recorded
+in the run config, so a resume must reproduce it.
+
+Gradient accumulation synchronizes once per update on the last microbatch: DDP's
+`no_sync` avoids a partial sum being mixed into the reduced gradient. Stages that
+open the vision tower declare `find_unused_parameters`, because a microbatch
+without an image legitimately never touches the merger or vision blocks; head and
+language parameters always do, so `warmup`/`text` keep the faster static path.
+
+Rank 0 alone reads telemetry, evaluates development accuracy, and writes
+checkpoints and metrics; every rank makes the same collective calls in the same
+order, and metrics and consumed-sample counters are reduced before rank 0 logs
+them. A plain `python` launch takes the same single-GPU path as before, with no
+process group, so nothing changes for one device. Final calibration and
+evaluation remain single-process.
+
 `method` selects one of three objectives over the same candidate logits. `rlcd`
 (the default) is the Laya-aligned estimator, where
 `RLCDConfig(sigma=0.3, ce_weight=1.0)` is the complete configuration surface:

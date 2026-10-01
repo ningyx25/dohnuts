@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 from torch import Tensor, nn
 
+from dohnuts import distributed
 from dohnuts.adapters import Qwen35Adapter
 from dohnuts.recipe import IMAGE_PIXELS, MAX_LENGTH
 
@@ -59,7 +60,7 @@ class DecisionModel(nn.Module):
         self.head = DecisionHead(
             self.adapter.hidden_size(self.backbone),
             projection_dim,
-            device="cuda",
+            device=distributed.device(),
             dtype=torch.float32,
         )
         # Set by enable_stage; load_adapter only accepts a matching checkpoint.

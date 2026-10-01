@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
+from dohnuts import distributed
 from dohnuts.adapters import Qwen35Adapter
 from dohnuts.execution import plan_prefix
 from dohnuts.model import marker_positions
@@ -98,15 +99,16 @@ class DecisionCollator:
 
 
 def to_gpu(batch):
-    """Move a collated batch to the GPU, whatever tuple width the collator returns."""
+    """Move a collated batch to this process's GPU, whatever tuple width the collator returns."""
     inputs, *other = batch
+    target = distributed.device()
     inputs = {
-        k: v.to("cuda", dtype=torch.bfloat16 if k == "pixel_values" else v.dtype, non_blocking=True)
+        k: v.to(target, dtype=torch.bfloat16 if k == "pixel_values" else v.dtype, non_blocking=True)
         if isinstance(v, torch.Tensor)
         else v
         for k, v in inputs.items()
     }
-    return inputs, *(v.to("cuda", non_blocking=True) for v in other)
+    return inputs, *(v.to(target, non_blocking=True) for v in other)
 
 
 def prefetch_batches(loader):
@@ -117,7 +119,7 @@ def prefetch_batches(loader):
     the consumer stream keeps transferred storage alive through asynchronous use.
     """
     iterator = iter(loader)
-    transfer = torch.cuda.Stream()
+    transfer = torch.cuda.Stream(device=distributed.device())
 
     def enqueue(item):
         batch, *metadata = item
@@ -170,20 +172,56 @@ class EvaluationBatches(torch.utils.data.Dataset):
         return self.collator(rows), rows
 
 
-class TrainingBatches(torch.utils.data.Dataset):
-    """Index determines the exact examples and permutations, including after resume."""
+def microbatch_index(index, *, start_step, accumulation, rank, world_size):
+    """Map a rank-local DataLoader index to its global microbatch position.
 
-    def __init__(self, groups, collator, *, seed, batch_size, steps, accumulation, start_step=0):
+    A step consumes ``accumulation * world_size`` consecutive microbatches of
+    the global mixture; rank ``r`` owns ``[step*A*W + r*A, step*A*W + (r+1)*A)``.
+    With ``world_size=1`` and ``rank=0`` this is exactly the original
+    single-GPU offset ``start_step * accumulation + index``.
+    """
+    step = start_step + index // accumulation
+    within = index % accumulation
+    return step * accumulation * world_size + rank * accumulation + within
+
+
+class TrainingBatches(torch.utils.data.Dataset):
+    """Index determines the exact examples and permutations, including after resume.
+
+    The global microbatch index is a pure function of ``(seed, step, rank)``, so
+    ranks never overlap and a resume reproduces the same global order.
+    """
+
+    def __init__(
+        self,
+        groups,
+        collator,
+        *,
+        seed,
+        batch_size,
+        steps,
+        accumulation,
+        start_step=0,
+        rank=0,
+        world_size=1,
+    ):
         self.groups, self.collator = groups, collator
         self.keys = sorted(groups)
         self.seed, self.batch_size = seed, batch_size
         self.steps, self.accumulation, self.start_step = steps, accumulation, start_step
+        self.rank, self.world_size = rank, world_size
 
     def __len__(self):
         return (self.steps - self.start_step) * self.accumulation
 
     def __getitem__(self, index):
-        index += self.start_step * self.accumulation
+        index = microbatch_index(
+            index,
+            start_step=self.start_step,
+            accumulation=self.accumulation,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
         rng = random.Random(self.seed * 1000000007 + index)
         key = self.keys[rng.randrange(len(self.keys))]
         rows = [rng.choice(self.groups[key]) for _ in range(self.batch_size)]

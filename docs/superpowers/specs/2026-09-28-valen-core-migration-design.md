@@ -49,7 +49,8 @@ backbone 同为 Qwen3.5 VLM 且丢弃词表输出层;绝不调用 `generate()`�
    缓存**(`cache_frozen_features`),以抵消 `num_iterations=2` 带来的重复 backbone 前向。
 6. **stage 迁移量**:四档全迁(warmup/text/joint/vision_top),LoRA rank 可配 + 枚举全部 Linear,
    head/lora/merger/vision 四组独立学习率。
-7. **多卡**:暂不做,保持单卡(当前机器 4× A40 46GB,但现有代码路径全部单卡硬编码)。
+7. **多卡**:初版暂不做、保持单卡(当前机器 4× L40 46GB,但当时代码路径全部单卡硬编码)。
+   **2026-10-01 追加**:单机多卡数据并行已落地,见 §19;单卡路径逐位不变。
 8. **验证方式**:CPU 单元测试(小模型替身 + 数值闭式)+ 一个 GPU 冒烟脚本 + gui-v1 短预算训练冒烟;
    不跑完整对照实验。
 
@@ -555,8 +556,11 @@ for _ in range(objective.num_iterations):              # sft/rlcd: 1; grpo: 2
     这正是引入冻结特征缓存的原因。`--steps` 的语义(外层 step 数)在三者间保持一致。
 12. **Score 不做等级隔离**:保持 Dohnuts 的单分支 + `ordinal` RPS 惩罚,不迁 Valen 的 K 个独立分支
     (那会让 Score 计算量 ×K 并破坏单次 forward 断言)。
-13. **单卡**:不迁 `distributed.py`;`set_per_process_memory_fraction(0.8)`、`device="cuda"`、
-    `Sampler(Path("/sys/class/drm/card1/device"))`(AMD sysfs,本机只记录 `rss_bytes`)等硬编码保持现状。
+13. **单卡(初版)**:初版不迁 Valen 的 `distributed.py`,`set_per_process_memory_fraction(0.8)`、
+    `device="cuda"`、`Sampler(Path("/sys/class/drm/card1/device"))`(AMD sysfs,本机只记录
+    `rss_bytes`)等硬编码保持现状。**2026-10-01 追加**:单机多卡 DDP 已落地(§19),上述硬编码中
+    `device` 改为按 `local_rank` 取设备,`set_per_process_memory_fraction(0.8)` 仅在单卡时生效;
+    `Sampler` 仍只在 rank 0 运行。
 
 ## 15. 实现落点
 
@@ -604,7 +608,9 @@ checkpoint 可被 `Predictor.from_checkpoint` 加载并输出合法概率分布�
 ## 17. 明确不做
 
 - 不引入 Valen 的 `ArchitectureBackend`/`factory`/`interfaces` 抽象层。
-- 不引入多卡数据并行、token 预算整 state 打包、逐 rank checkpoint 状态、`epoch_shard`。
+- 初版不引入多卡数据并行、token 预算整 state 打包、逐 rank checkpoint 状态、`epoch_shard`。
+  **2026-10-01 追加**:单机多卡 DDP 已落地(§19);仍不做 token 预算整 state 打包、逐 rank
+  checkpoint 状态与 `epoch_shard`。
 - **不采用**「读题干末尾、不改模板」的 decision 位置方案(已由用户改选选项 A,§2.3)。
 - 不把 Score 改成 Valen 的 K 个独立分支。
 - 不引入 `config_version:2` 分区配置(保持扁平 recipe)。
@@ -627,3 +633,56 @@ checkpoint 可被 `Predictor.from_checkpoint` 加载并输出合法概率分布�
      的门禁(仅 grpo+warmup)、head-only reference、一次性逐位校验;新增 `tests/test_frozen_features.py`。
   3. §6 补充 warmup 档 `merge()` 必须 no-op(`language_model` 无 `merge_and_unload`);§3 补齐依赖差异
      (`transformers 5.17` vs `5.4`/`peft 0.21` vs `0.18`)与「零 dropout ⇒ 逐位可复现」这一前提。
+- **2026-10-01:追加单机多卡数据并行(§19)。** 迁移主体(§4–§13)已完成;本次在其之上加 DDP,
+  不改目标函数、recipe schema 与单卡路径。用 gloo 双进程探针实测确认:本方案采用的
+  「`no_sync` 累积到最后一个 microbatch 再一次 all-reduce」在 `find_unused_parameters` 两种取值、
+  以及 microbatch 间参数用途不一致时,梯度都精确等于全局 batch 均值(误差 < 1e-5)。
+
+## 19. 单机多卡数据并行(2026-10-01 追加)
+
+范围:**单机、数据并行、`DistributedDataParallel`**。不做多机、不做 FSDP/张量并行、不做逐 rank
+checkpoint 状态。单卡(未用 `torchrun`)走**完全相同**的原路径:不建进程组、不碰 CUDA 设备选择,
+`frozen` config 也不新增键,因此既有单卡 run 的 resume 语义逐字节不变。
+
+**启动与设备**(`src/dohnuts/distributed.py`,新增):`setup()` 读 `WORLD_SIZE`/`RANK`/`LOCAL_RANK`;
+`WORLD_SIZE <= 1` 时是纯 no-op(返回 `(0,0,1)`);否则 `torch.cuda.set_device(local_rank)` +
+`init_process_group("nccl")`。`device()` 返回 `cuda:local_rank`,`adapters.load`、`DecisionHead`、
+`to_gpu`、`prefetch_batches` 的流、`Predictor.predict` 都改用它。`set_per_process_memory_fraction(0.8)`
+只在非分布式时生效(多卡时每个进程独占自己的卡,不需要留余量)。
+
+**数据切分**(`training_data.py::microbatch_index`):一个外层 step 消费 `A*W` 个全局 microbatch
+(`A=accumulation`、`W=world_size`),rank `r` 取
+`[step*A*W + r*A, step*A*W + (r+1)*A)`。索引仍是 `(seed, 全局 microbatch)` 的纯函数,故各 rank
+不重叠、resume 复现同一全局顺序;`W=1, r=0` 时精确退化为原式 `start_step*A + index`。
+
+**梯度累积与同步**(`train.py::wrap_data_parallel` 与训练循环):
+- 每个 update iteration 内,除最后一个 microbatch 外的 backward 都包在 `model.no_sync()` 里,
+  只在最后一次 all-reduce。若在累积中途同步,部分和会与已归约值混在一起。
+- `find_unused_parameters = stage in {joint, vision_top}`:只有视觉档下,「本 microbatch 无图」会让
+  merger/vision 参数合法地拿不到梯度;warmup/text 的全部可训练参数(hidden head 两个投影 + 语言
+  LoRA,视觉冻结)每次前向都被用到,故保留更快的静态路径。
+- `broadcast_buffers` 保持 DDP 默认(合并广播):buffer 都很小、逐前向合并广播开销可忽略,同时保证
+  两个 replica 构造时就完全一致,避免依赖「每个 buffer 都是确定性的」这一隐含前提。
+- 非有限损失:先 `all_reduce_mean(finite)` 再决定是否报错,避免一个 rank 抛错、其余卡在下一个集体里。
+
+**rank 分工**:`evaluate`(开发集选择)、`Sampler` 遥测、`metrics.jsonl`/`config.json`/`samples.json`/
+checkpoint 全部只在 rank 0;其余 rank 在 eval 后 `barrier()` 等待。`stats` 取 rank 均值、
+`consumed` 取 rank 求和后才由 rank 0 落盘;`consumed` 预置全部 dataset 键为 0,保证各 rank 的
+归约键集一致。
+
+**checkpoint 与 resume**:`save/load_checkpoint` 作用在未包装的 `DecisionModel`(`raw`)上,DDP 包装
+只影响前向;`GRPOObjective` 的 reference 也从 `raw` deep-copy(绝不 deep-copy DDP 包装器),每卡一份。
+仅分布式时把 `world_size` 写入 `config.json`,因此 resume 必须用相同 `--gpus`(数据切分不变)。
+
+**入口**:`scripts/run_experiment.py` 新增 `--gpus`(默认 1)与 `--master-port`;`--gpus > 1` 时把
+训练子进程换成 `python -m torch.distributed.run --nproc_per_node=N`,并把 `CUDA_VISIBLE_DEVICES`
+设为 `0..N-1`。评测仍单进程。
+
+**测试**:`tests/test_distributed.py`(13 项,CPU-only,含一个真实单 rank gloo 进程组)钉住 no-op 语义、
+`microbatch_index` 的单卡退化/分块无重叠/resume 对齐、`reduce_consumed` 与集合通信的初始化分支;
+`scripts/smoke_multi_gpu.py` 用 `torchrun` 在真机上验证 DDP 梯度等于全局均值、各 rank 数据不重叠,
+`--full` 额外跑两步真实 Qwen3.5 SFT。
+
+**已知限制**:reference 模型每卡一份(GRPO + `beta>0` 时每卡多约 1.7 GB);joint/vision_top 的视觉
+梯度显存随 `W` 线性增长;不做逐 rank checkpoint 状态与 `epoch_shard`;`Sampler` 仍只采 rank 0 的
+AMD sysfs 路径。

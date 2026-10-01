@@ -36,7 +36,16 @@ def main():
     parser.add_argument("--projection-dim", type=int, default=256, help="Decision head width")
     parser.add_argument("--lora-rank", type=int, default=8, help="Language LoRA rank")
     parser.add_argument("--lora-alpha", type=int, default=16, help="Language LoRA alpha")
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=1,
+        help="GPUs for data-parallel training (torchrun --nproc_per_node); evaluation stays single",
+    )
+    parser.add_argument("--master-port", type=int, default=29500, help="torchrun rendezvous port")
     args = parser.parse_args()
+    if args.gpus < 1:
+        raise ValueError("--gpus must be at least 1")
     policy = RLCDConfig(sigma=args.sigma, ce_weight=args.ce_weight)
     recipe_path = args.output / "recipe.json"
     previous = json.loads(recipe_path.read_text()) if recipe_path.exists() else None
@@ -59,7 +68,7 @@ def main():
     logs.mkdir(exist_ok=True)
     env = {
         **os.environ,
-        "CUDA_VISIBLE_DEVICES": "0",
+        "CUDA_VISIBLE_DEVICES": ",".join(str(index) for index in range(args.gpus)),
         "TRITON_CACHE_DIR": str(Path(".cache/triton").resolve()),
         "HF_HOME": str(Path(".cache/hf").resolve()),
         "TOKENIZERS_PARALLELISM": "false",
@@ -154,9 +163,22 @@ def main():
     config.write_text(json.dumps(recipe, indent=2) + "\n")
     resume = ["--resume"] if (directory / "last.pt").exists() else []
     initialize = ["--initialize-from", args.initialize_from] if args.initialize_from else []
+    launcher = (
+        [
+            "-m",
+            "torch.distributed.run",
+            "--nproc_per_node",
+            str(args.gpus),
+            "--master_port",
+            str(args.master_port),
+        ]
+        if args.gpus > 1
+        else []
+    )
     if f"train-{seed}" not in done:
         python(
             f"train-{seed}",
+            *launcher,
             "-m",
             "dohnuts.train",
             "train",
