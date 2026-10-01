@@ -25,6 +25,13 @@ IMAGE_PIXELS = 1024**2
 MAX_LENGTH = 12_288
 TRAINING_STEPS = None
 EPOCHS = 3
+# Reading limits per dataset group.  ``None`` reads the whole split, which is what a
+# full-corpus run wants; a number caps each group, which is what keeps a repeated
+# evaluation pass over a large split affordable.  These are plain defaults, not pins:
+# a caller passing ``train_cap``/``dev_cap`` overrides them, and whatever the run used
+# is recorded in its recipe.
+TRAIN_CAP = None
+DEV_CAP = None
 LR_DECAY_STEPS = 2400
 BASE_MODEL = Path(".cache/models/Qwen3.5-0.8B")
 DATA = Path("data/processed/v1")
@@ -56,6 +63,8 @@ def training_recipe(
     rlcd=None,
     epochs=EPOCHS,
     steps=TRAINING_STEPS,
+    train_cap=TRAIN_CAP,
+    dev_cap=DEV_CAP,
     method="rlcd",
     stage="text",
     projection_dim=256,
@@ -71,6 +80,9 @@ def training_recipe(
         raise ValueError("Training steps must be a positive integer")
     if not isinstance(epochs, int) or epochs < 1:
         raise ValueError("Training epochs must be a positive integer")
+    for name, cap in (("train_cap", train_cap), ("dev_cap", dev_cap)):
+        if cap is not None and (not isinstance(cap, int) or cap < 1):
+            raise ValueError(f"{name} must be None or a positive integer")
     if method not in METHODS:
         raise ValueError(f"Unsupported training method: {method}")
     if stage not in STAGES:
@@ -97,8 +109,8 @@ def training_recipe(
         "head_lr": 5e-4,
         "merger_lr": 1e-5,
         "vision_lr": 2e-6,
-        "train_cap": None,
-        "dev_cap": None,
+        "train_cap": train_cap,
+        "dev_cap": dev_cap,
         "image_pixels": IMAGE_PIXELS,
         "max_length": MAX_LENGTH,
         "cpu_threads": 8,

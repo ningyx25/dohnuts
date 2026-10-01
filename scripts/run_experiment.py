@@ -30,6 +30,17 @@ def main():
         help="Passes over the training split (default 3); ignored when --steps or TRAINING_STEPS is set",
     )
     parser.add_argument(
+        "--train-cap",
+        type=int,
+        help="Rows read per training dataset group (default: the whole split)",
+    )
+    parser.add_argument(
+        "--dev-cap",
+        type=int,
+        help="Rows read per dev group, and the size of the end-of-run train diagnostic "
+        "(default: the whole split)",
+    )
+    parser.add_argument(
         "--initialize-from",
         type=Path,
         help="Initial LoRA/head weights for the training run",
@@ -47,7 +58,7 @@ def main():
         "--gpus",
         type=int,
         default=1,
-        help="GPUs for data-parallel training (torchrun --nproc_per_node); evaluation stays single",
+        help="GPUs for data-parallel training and for sharded final evaluation",
     )
     parser.add_argument("--master-port", type=int, default=29500, help="torchrun rendezvous port")
     args = parser.parse_args()
@@ -70,6 +81,8 @@ def main():
         rlcd=policy,
         epochs=EPOCHS if epochs is None else epochs,
         steps=steps,
+        train_cap=args.train_cap,
+        dev_cap=args.dev_cap,
         method=args.method,
         stage=args.stage,
         projection_dim=args.projection_dim,
@@ -225,6 +238,7 @@ def main():
         )
     python(
         f"evaluate-{seed}",
+        *launcher,
         "-m",
         "dohnuts.train",
         "evaluate",

@@ -166,6 +166,7 @@ def environment(model: DecisionModel, checkpoint: Path, *, method=None):
         "world_size": distributed.world_size(),
         "rank": distributed.rank(),
         "local_rank": distributed.local_rank(),
+        "nccl_timeout_s": distributed.timeout_seconds(),
         "checkpoint_revision": model_revision(checkpoint),
         "parameters": sum(p.numel() for p in model.parameters()),
         "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),

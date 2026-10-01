@@ -194,3 +194,41 @@ def test_resume_keeps_each_ranks_slice_aligned():
         assert len(resumed) == (4 - start_step) * accumulation
         for index in range(len(resumed)):
             assert resumed[index] == fresh[start_step * accumulation + index]
+
+
+def test_the_collective_timeout_outlives_torchs_ten_minute_default():
+    """A rank that evaluates a large split alone holds the others at a barrier that long.
+
+    The ac-jev-v1 baseline pass on a 9B model was killed by torch's 600 s default, so the
+    group timeout is the run's to choose and it is recorded in the environment metrics.
+    """
+    assert distributed.NCCL_TIMEOUT_S > 600
+    assert distributed.timeout_seconds() is None  # no process group, no collective to time out
+
+
+@pytest.mark.parametrize("shards", [1, 2, 3, 4, 5, 7])
+def test_evaluation_shards_rebuild_the_single_process_batch_sequence(shards):
+    """Each rank owns one contiguous block, so rank-order concatenation restores the order.
+
+    That is the whole reason a sharded pass writes the same file, in the same order, with
+    the same per-row padding as one process: the batch sequence is sliced, never rebuilt.
+    """
+    from dohnuts.training_data import EvaluationBatches
+
+    groups = {
+        "a": [{"id": f"a{i}", "dataset": "a", "state": {}, "question": {}} for i in range(9)],
+        "b": [{"id": f"b{i}", "dataset": "b", "state": {}, "question": {}} for i in range(5)],
+    }
+    whole = EvaluationBatches(groups, None, 4)
+    # 9 rows of a and 5 of b in batches of four: three batches plus two.
+    assert len(whole) == 5
+    assert whole.rows == 14
+    assert whole.total_rows == 14
+
+    parts = [EvaluationBatches(groups, None, 4, shard=r, shards=shards) for r in range(shards)]
+    assert [batch for part in parts for batch in part.batches] == whole.batches
+    assert sum(part.rows for part in parts) == whole.rows
+    assert {key: sum(part.rows_by_dataset[key] for part in parts) for key in ("a", "b")} == {
+        "a": 9,
+        "b": 5,
+    }

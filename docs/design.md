@@ -66,12 +66,26 @@ not: the frozen vision cache returns an image encoded inside whichever batch fir
 so re-partitioning changes that image's bf16 result. What the recipe guarantees across
 layouts is which examples a step consumes, not the bits a run reproduces.
 
-Rank 0 alone reads telemetry, evaluates development accuracy, and writes
-checkpoints and metrics; every rank makes the same collective calls in the same
-order, and metrics and consumed-sample counters are reduced before rank 0 logs
-them. A plain `python` launch takes the same single-GPU path as before, with no
-process group, so nothing changes for one device. Final calibration and
-evaluation remain single-process.
+Every rank computes; rank 0 alone reads telemetry, writes checkpoints and
+metrics, and every rank makes the same collective calls in the same order, with
+metrics and consumed-sample counters reduced before rank 0 logs them. A plain
+`python` launch takes the same single-GPU path as before, with no process group,
+so nothing changes for one device.
+
+Development, calibration, test and the train-diagnostic pass are sliced across
+ranks. Each rank scores one contiguous block of the *existing* evaluation batch
+sequence, so a row is collated with the same neighbours, padding and shapes it
+would have had alone, and rank 0 reassembles the per-rank files in rank order
+into the same file, line for line. Contiguity is what makes plain concatenation
+correct: a strided shard could only be merged round-robin, and the flat per-rank
+line sequences record no batch boundaries. Only rank 0 calibrates, writes the
+report and exports; the other ranks stop at the barrier.
+
+Because a pass over a large split legitimately takes many minutes, the process
+group runs on the project's own collective timeout -- `NCCL_TIMEOUT_S`, default
+3,600 s, overridden by `DOHNUTS_NCCL_TIMEOUT_S` -- rather than torch's 600 s
+watchdog, which is what previously killed a nine-hour-scale baseline evaluation
+ten minutes in. The value in force is recorded in the environment line.
 
 `method` selects one of three objectives over the same candidate logits. `rlcd`
 (the default) is the Laya-aligned estimator, where

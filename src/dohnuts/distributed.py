@@ -8,6 +8,7 @@ codebase can call these unconditionally.
 """
 
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -17,6 +18,10 @@ _rank: int = 0
 _local_rank: int = 0
 _world_size: int = 1
 _initialized: bool = False
+# A rank that owns a long evaluation pass holds the others at a barrier for the whole
+# pass, so the collective timeout belongs to the run, not to torch's 10-minute default:
+# the ac-jev-v1 baseline pass on a 9B model was killed by that default at 600 s.
+NCCL_TIMEOUT_S = int(os.environ.get("DOHNUTS_NCCL_TIMEOUT_S", "3600"))
 
 
 def setup() -> tuple[int, int, int]:
@@ -42,7 +47,9 @@ def setup() -> tuple[int, int, int]:
     torch.cuda.set_device(target)
     # Bind the group to this rank's device so barrier and friends never have to
     # infer it from the ambient CUDA context.
-    dist.init_process_group(backend="nccl", device_id=target)
+    dist.init_process_group(
+        backend="nccl", device_id=target, timeout=timedelta(seconds=NCCL_TIMEOUT_S)
+    )
     _initialized = True
     return _rank, _local_rank, _world_size
 
@@ -78,6 +85,11 @@ def is_main_process() -> bool:
 def is_distributed() -> bool:
     """True only when multiple processes are cooperating."""
     return _world_size > 1
+
+
+def timeout_seconds():
+    """The collective timeout in force, or ``None`` when running as one process."""
+    return NCCL_TIMEOUT_S if _initialized else None
 
 
 def barrier():

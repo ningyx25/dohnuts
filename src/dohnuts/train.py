@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import time
 from collections import Counter, deque
 from contextlib import nullcontext
@@ -91,11 +92,34 @@ def reduce_consumed(consumed):
 
 
 @torch.inference_mode()
-def evaluate(model, groups, collator, output, batch_size=16):
+def evaluate(
+    model, groups, collator, output, batch_size=16, *, shard=0, shards=1, keep_records=True
+):
+    """Score every row of ``groups`` that belongs to this rank's slice.
+
+    ``shard``/``shards`` keep a contiguous block of the global evaluation batch
+    sequence (see :func:`evaluate_shards`).  ``keep_records`` lets a rank whose only
+    job is to write its part of the file skip holding every logit in memory.
+    """
     model.eval()
     records = []
+    batches = EvaluationBatches(groups, collator, batch_size, shard=shard, shards=shards)
+    print(
+        json.dumps(
+            {
+                "kind": "evaluation_start",
+                "rows": batches.rows,
+                "batches": len(batches),
+                "of": batches.total_rows,
+                "shard": shard,
+                "shards": shards,
+            }
+        ),
+        flush=True,
+    )
+    started = time.perf_counter()
     loader = torch.utils.data.DataLoader(
-        EvaluationBatches(groups, collator, batch_size),
+        batches,
         batch_size=None,
         num_workers=2,
         prefetch_factor=2,
@@ -119,10 +143,13 @@ def evaluate(model, groups, collator, output, batch_size=16):
                 if not torch.isfinite(logits[i, : len(row["target"])]).all():
                     raise RuntimeError(f"Non-finite prediction: {row['id']}")
                 stream.write(json.dumps(result) + "\n")
-                records.append(result)
+                if keep_records:
+                    records.append(result)
                 counts[row["dataset"]] += 1
             key = rows[-1]["dataset"]
-            if counts[key] == len(groups[key]):
+            # The completion line is per shard: a group's batches can straddle a rank
+            # boundary, so the whole-split count would never be reached here.
+            if counts[key] == batches.rows_by_dataset[key]:
                 stream.flush()
                 print(
                     json.dumps({"kind": "evaluation_progress", "dataset": key, "n": counts[key]}),
@@ -141,6 +168,61 @@ def evaluate(model, groups, collator, output, batch_size=16):
                 collect()
         while pending:
             collect()
+    print(
+        json.dumps(
+            {
+                "kind": "evaluation_shard",
+                "shard": shard,
+                "shards": shards,
+                "rows": batches.rows,
+                "seconds": round(time.perf_counter() - started, 1),
+            }
+        ),
+        flush=True,
+    )
+    return records
+
+
+def evaluate_shards(model, groups, collator, output, batch_size):
+    """Evaluate on every rank at once, then reassemble the canonical file on rank 0.
+
+    Slicing the batch sequence instead of the rows is what makes this a no-op for
+    numerics: a row is collated with the same neighbours, so the sharded pass writes
+    the same lines, in the same order, as the single process would.  Only rank 0
+    needs the merged records back, and reading them from the reassembled file costs
+    the other ranks no memory.
+    """
+    output = Path(output)
+    world = distributed.world_size()
+    if world == 1:
+        return evaluate(model, groups, collator, output, batch_size)
+    rank = distributed.rank()
+
+    def part(owner):
+        return output.with_name(f".{output.stem}.rank{owner}.jsonl")
+
+    evaluate(
+        model,
+        groups,
+        collator,
+        part(rank),
+        batch_size,
+        shard=rank,
+        shards=world,
+        keep_records=False,
+    )
+    # Hold until every shard file is closed, then let rank 0 stitch them in rank
+    # order; the caller's barrier keeps the ranks aligned afterwards.
+    distributed.barrier()
+    records = []
+    if distributed.is_main_process():
+        with output.open("w") as stream:
+            for owner in range(world):
+                shard_file = part(owner)
+                for line in shard_file.read_text().splitlines(keepends=True):
+                    stream.write(line)
+                    records.append(json.loads(line))
+                shard_file.unlink(missing_ok=True)
     return records
 
 
@@ -335,9 +417,13 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
                     indent=2,
                 )
             )
-            baseline = evaluate(
-                raw, dev, collator, run / "dev-step-000000.jsonl", config["eval_batch_size"]
-            )
+        # Every rank scores its own slice of dev: a rank that evaluated alone used to
+        # leave the others at the barrier below until the pass finished, and a full
+        # dev split on a 9B model is longer than any collective timeout should be.
+        baseline = evaluate_shards(
+            raw, dev, collator, run / "dev-step-000000.jsonl", config["eval_batch_size"]
+        )
+        if distributed.is_main_process():
             baseline_metrics = by_dataset(baseline)
             emit(run / "metrics.jsonl", {"kind": "dev", "step": 0, "metrics": baseline_metrics})
             best = baseline_metrics["macro_accuracy"]
@@ -492,14 +578,15 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
                         },
                     )
             if step % config["eval_every"] == 0 or step == steps:
+                # Sharded like the baseline pass: no rank waits while one evaluates.
+                predictions = evaluate_shards(
+                    raw,
+                    dev,
+                    collator,
+                    run / f"dev-step-{step:06d}.jsonl",
+                    config["eval_batch_size"],
+                )
                 if distributed.is_main_process():
-                    predictions = evaluate(
-                        raw,
-                        dev,
-                        collator,
-                        run / f"dev-step-{step:06d}.jsonl",
-                        config["eval_batch_size"],
-                    )
                     metrics = by_dataset(predictions)
                     score = metrics["macro_accuracy"]
                     emit(run / "metrics.jsonl", {"kind": "dev", "step": step, "metrics": metrics})
@@ -539,8 +626,13 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
 
 
 def final_evaluation(config, run, *, adapter=None):
-    if distributed.is_distributed():
-        raise ValueError("Final evaluation runs on one process; launch it without torchrun")
+    """Score the held-out splits from the selected checkpoint and export it.
+
+    Under ``torchrun`` this is inference-parallel, not data-parallel: no rank needs
+    another's gradients, so each loads the same weights onto its own device and the
+    three passes below are sliced across ranks.  Only rank 0 calibrates, writes the
+    report and exports; the rest stop at the barrier.
+    """
     frozen = json.loads((run / "config.json").read_text())
     for key in [
         "model",
@@ -574,29 +666,32 @@ def final_evaluation(config, run, *, adapter=None):
     # Calibration and final evaluation use exactly the deployed merged model.
     model.merge()
     collator = DecisionCollator(config["model"], adapter=adapter)
-    calibration = evaluate(
+    calibration = evaluate_shards(
         model,
         load_records(data / "calibration.jsonl"),
         collator,
         run / "calibration-predictions.jsonl",
         config["eval_batch_size"],
     )
-    temperatures = fit_temperatures(calibration)
-    (run / "temperatures.json").write_text(json.dumps(temperatures, indent=2) + "\n")
-    predictions = evaluate(
+    predictions = evaluate_shards(
         model,
         load_records(data / "test.jsonl"),
         collator,
         run / "test-predictions.jsonl",
         config["eval_batch_size"],
     )
-    training_monitor = evaluate(
+    training_monitor = evaluate_shards(
         model,
         load_records(data / "train.jsonl", config["dev_cap"]),
         collator,
         run / "train-monitor-predictions.jsonl",
         config["eval_batch_size"],
     )
+    distributed.barrier()
+    if not distributed.is_main_process():
+        return
+    temperatures = fit_temperatures(calibration)
+    (run / "temperatures.json").write_text(json.dumps(temperatures, indent=2) + "\n")
     report = {
         "selected_step": state["step"],
         "checkpoint_sha256": file_hash(run / "best.pt"),
@@ -608,7 +703,13 @@ def final_evaluation(config, run, *, adapter=None):
         "calibrated": by_dataset(predictions, temperatures),
         "primitive_candidate_slices": by_primitive_and_candidates(predictions, temperatures),
         "train_monitor": by_dataset(training_monitor, temperatures),
-        "train_monitor_scope": "fixed subset of the capped training pool; diagnostic only, no selection",
+        "train_monitor_rows": len(training_monitor),
+        "train_monitor_scope": (
+            "the whole training split; diagnostic only, never used for selection"
+            if config["dev_cap"] is None
+            else f"the first {config['dev_cap']} rows of each training dataset; diagnostic "
+            "only, never used for selection"
+        ),
     }
     (run / "evaluation.json").write_text(json.dumps(report, indent=2) + "\n")
     export_checkpoint(state, run, run.parent / "checkpoint")
@@ -622,6 +723,12 @@ def final_evaluation(config, run, *, adapter=None):
         ),
         flush=True,
     )
+
+
+def model_size(path):
+    """The base model's size token, so an exported model card names the weights it holds."""
+    found = re.search(r"-(\d+(?:\.\d+)?[BbMmKk])$", Path(path).name)
+    return found.group(1).upper() if found else "unknown"
 
 
 def export_checkpoint(state, run, output):
@@ -645,8 +752,8 @@ def export_checkpoint(state, run, output):
         "project": "dohnuts",
         "distribution": "dohnuts",
         "version": __version__,
-        "model_id": f"Dohnuts-{__version__}-0.8B",
-        "base_model": config.get("base_model", "Qwen/Qwen3.5-0.8B"),
+        "model_id": f"Dohnuts-{__version__}-{model_size(base)}",
+        "base_model": config.get("base_model") or str(base),
         "base_path": str(base),
         "base_revision": (base / "revision.txt").read_text().strip(),
         "adapter": config.get("adapter", "qwen3.5"),
@@ -699,6 +806,8 @@ def main():
         lora_alpha=config.get("lora_alpha", 16),
         sft=config.get("sft"),
         grpo=config.get("grpo"),
+        train_cap=config.get("train_cap"),
+        dev_cap=config.get("dev_cap"),
     )
     if config != expected:
         raise ValueError("Training uses the fixed recipe, objective controls, and step budget")

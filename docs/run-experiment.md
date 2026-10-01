@@ -64,8 +64,10 @@ stages trade the frozen-image cache for correct gradients, so they recompute
 every image feature. `--projection-dim`, `--lora-rank`, and `--lora-alpha`
 default to 256, 8, and 16. `--data`, `--model`, and `--output` identify local assets
 and output locations. The recipe reads every row of each split by default:
-`train_cap` and `dev_cap` are `None`, so set them in the generated recipe file to
-subsample per dataset group.
+`train_cap` and `dev_cap` are `None`. `--train-cap` and `--dev-cap` subsample per
+dataset group and are recorded in the run's recipe, so a resumed run inherits the
+cap it started with. `dev_cap` is also the knob that keeps the repeated development
+pass short: it sizes the end-of-run train diagnostic as well.
 
 Objective details beyond those flags, such as `grpo.group_size` or
 `sft.brier_weight`, belong in the generated `recipe-seed-*.json`. The file is a

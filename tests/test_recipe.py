@@ -52,3 +52,25 @@ def test_an_epoch_budget_needs_something_to_walk_over():
 def test_a_budget_that_cannot_be_walked_is_rejected(kwargs):
     with pytest.raises(ValueError, match="must be a positive integer"):
         training_recipe(**kwargs)
+
+
+def test_a_cap_is_recorded_and_changes_nothing_else():
+    """A caller-set cap must survive the equality check `train.main()` runs on the recipe."""
+    from dohnuts.recipe import DEV_CAP, TRAIN_CAP
+
+    assert (TRAIN_CAP, DEV_CAP) == (None, None)
+    recipe = training_recipe()
+    capped = training_recipe(train_cap=256, dev_cap=64)
+    assert (capped["train_cap"], capped["dev_cap"]) == (256, 64)
+    assert training_recipe(dev_cap=8)["train_cap"] is recipe["train_cap"]
+    outside = {"train_cap", "dev_cap"}
+    assert {k: v for k, v in capped.items() if k not in outside} == {
+        k: v for k, v in recipe.items() if k not in outside
+    }
+
+
+@pytest.mark.parametrize("key", ["train_cap", "dev_cap"])
+@pytest.mark.parametrize("value", [0, -3, 2.5, "256"])
+def test_a_cap_that_reads_nothing_is_rejected(key, value):
+    with pytest.raises(ValueError, match="must be None or a positive integer"):
+        training_recipe(**{key: value})

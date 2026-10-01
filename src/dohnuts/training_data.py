@@ -4,7 +4,7 @@ import copy
 import hashlib
 import json
 import random
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import torch
@@ -153,16 +153,30 @@ def prefetch_batches(loader):
 class EvaluationBatches(torch.utils.data.Dataset):
     """Prepare independent evaluation batches in CPU workers, in stable order."""
 
-    def __init__(self, groups, collator, batch_size):
+    def __init__(self, groups, collator, batch_size, *, shard=0, shards=1):
         self.collator = collator
-        self.batches = []
+        batches = []
         for _, rows in sorted(groups.items()):
             rows = sorted(
                 rows, key=lambda r: len(json.dumps(r["state"])) + len(json.dumps(r["question"]))
             )
-            self.batches.extend(
+            batches.extend(
                 rows[start : start + batch_size] for start in range(0, len(rows), batch_size)
             )
+        # A rank takes a contiguous block of the batch sequence it would have walked
+        # alone, so every row keeps the batch, padding and shapes of the single-process
+        # pass, and concatenating the per-rank files in rank order reproduces its row
+        # order exactly.  Those files are flat line sequences: a strided shard could only
+        # be merged by round-robin, and that needs batch boundaries the file does not keep.
+        total = len(batches)
+        self.batches = batches[total * shard // shards : total * (shard + 1) // shards]
+        self.total_rows = sum(len(rows) for rows in batches)
+        self.rows_by_dataset = Counter()
+        self.rows = 0
+        for rows in self.batches:
+            for row in rows:
+                self.rows_by_dataset[row["dataset"]] += 1
+                self.rows += 1
 
     def __len__(self):
         return len(self.batches)
