@@ -37,7 +37,7 @@ from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dohnuts import distributed
-from dohnuts.recipe import BASE_MODEL, training_recipe
+from dohnuts.recipe import BASE_MODEL, EPOCHS, training_recipe
 from dohnuts.train import train
 from dohnuts.training_data import TrainingBatches, microbatch_index
 
@@ -255,7 +255,9 @@ def check_full_training(args, root):
     recipe = training_recipe(
         model=args.model,
         data=data,
-        steps=args.steps,
+        epochs=args.epochs if args.epochs is not None else EPOCHS,
+        # An epoch budget leaves `steps` to derive; a fixed one ignores epochs.
+        steps=None if args.epochs is not None else args.steps,
         method=args.method,
         stage=args.stage,
     )
@@ -287,6 +289,9 @@ def check_full_training(args, root):
         stage=args.stage,
         resumed=args.resume,
         steps=state["step"],
+        # The budget the run resolved to: epochs arrive here as an update count.
+        budget=state["config"]["steps"],
+        epochs=state["config"].get("epochs"),
         run=str(run),
         world_size=world,
         opened=opened,
@@ -387,6 +392,11 @@ def main():
         "--stage", default="warmup", choices=("warmup", "text", "joint", "vision_top")
     )
     parser.add_argument("--steps", type=int, default=2, help="Optimizer updates for --full")
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        help="Budget --full in passes over the training split instead of a fixed update count",
+    )
     parser.add_argument(
         "--accumulation",
         type=int,
