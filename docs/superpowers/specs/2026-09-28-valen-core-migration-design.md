@@ -757,3 +757,30 @@ W=1/2/4 = **7/4/2** = `ceil(216/(32W))` ✓;首个 run 的 `train_complete` 消�
 本来达标,所以当初的转换门留下了它们。叠加 `train_cap=None` 后整 split 都会被读到,采样命中只是时间问题。
 处理办法是把转换(它的预算门用的正是同一组 `IMAGE_PIXELS`/`MAX_LENGTH`)重跑一遍剔除这些行,或显式设
 `train_cap` 缩小读取量,或在数据侧截短候选列表;本次不改 `MAX_LENGTH`,因目标要求其余参数维持原默认。
+
+## 21. token 预算随图像面积上调(2026-10-02 追加)
+
+§20 把 `IMAGE_PIXELS` 提到 1024² 后留下的数据问题,以**上调 `MAX_LENGTH`** 收口(其余参数不动)。
+
+**取值来自测量**:从 `ac-jev-v1` 随机抽 20,000 行走 `dohnuts.token_stats.measure`(与
+`DecisionCollator` 同式),p50 2,762 / p90 4,240 / p99 6,044 / **max 8,942**,超旧预算 8,192 的共
+8 行且全部是 `jev_tap_target`(候选列表最长),**无一行超 9,216**。故 `MAX_LENGTH = 12_288`:
+高出实测极值约 37%,候选数上限 255 已框住行能长到多重,base 自身 context 是 262,144 token。
+
+**顺带消灭一个重复字面量**:`Qwen35Adapter.max_input_tokens` 原先硬写 `8192`,靠文档口头承诺「与
+`MAX_LENGTH` 相符」来保证 serving 接受训练接受过的行。现在它直接读配方常量,并由
+`tests/test_recipe.py::test_serving_accepts_exactly_what_training_accepted` 钉住这一不变量。
+
+**验证(node01,`50681ff`)**:
+- 同一批 20,000 行按新常量重算(复用 `token_lengths.jsonl`,不重测):`over_budget = 0`。
+- 原先抛 `Token budget exceeded` 的行现在能通过 collator,并在 1 卡 `sft/warmup` 下真实训练 1 个 update:
+  `exit 0`,loss 5.032010,`grad_norm` 56.85,**peak allocated 7.44 GiB / reserved 11.12 GiB**
+  —— 8,942 token 的行在 A40 上不是边缘行为。run config 记录 `max_length: 12288`。
+- 兼容性同 `image_pixels`:`max_length` 参与 checkpoint 校验。把 12,288 时代导出的 `dohnuts.json`
+  改回 `max_length: 8192` 后 `load_adapter` 报
+  `Checkpoint differs from the pinned model, training recipe, or checksum: max_length` ✓。
+- 测试:node01 `276 passed / 4 skipped`,本地 `275 passed / 5 skipped`(新增不变量测试),
+  `ruff check` 干净,`sphinx -W --keep-going` 通过。
+
+**影响面**:凡在 8192 预算下产出过 export 的产物,换到本常量后都会被拒;`docs/data-and-evaluation.md`
+的 token 预算一节已改写为「测量出处 + 新旧分布对照 + 改任一常量都要重跑 `report_token_lengths.py`」。
