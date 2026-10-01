@@ -20,8 +20,10 @@ Checks, in order:
   loadable ``format_version 2`` checkpoint whose trainable keys match the stage
   and whose config records the world size.
 * ``--compare RUN_A RUN_B``: two runs that drew the same global microbatches --
-  one process with ``accumulation`` A, N processes with A/N -- agree on every
-  logged metric within ``TOLERANCE``.  Needs no GPU and no torchrun.
+  one process with ``accumulation`` A, N processes with A/N -- agree on the
+  first update to ``--tolerance``.  Later records are reported as drift only,
+  because Adam amplifies rounding differences once updates accumulate.  Needs no
+  GPU and no torchrun.
 """
 
 import argparse
@@ -123,10 +125,11 @@ def check_data_partition(steps=3, accumulation=2):
 
 
 HEAD_KEYS = {"head.decision.weight", "head.candidate.weight"}
-# Two runs of one objective differ only in wall-clock, in the gradient norm (the
-# reduction order changes with the rank layout) and in the telemetry snapshot.
-SKIP = {"elapsed_s", "step_s", "grad_norm", "memory"}
-TOLERANCE = 1e-3
+# Wall-clock and the telemetry snapshot say nothing about the objective.  The
+# gradient norm stays in: at the first update it is the sharpest available
+# evidence that the reduced gradient is the global mean rather than a partial sum.
+SKIP = {"elapsed_s", "step_s", "memory"}
+TOLERANCE = 1e-4
 
 
 def write_image(path, index):
@@ -315,13 +318,20 @@ def index_metrics(path):
     return table
 
 
-def compare_runs(left, right):
+def compare_runs(left, right, tolerance=TOLERANCE):
     """Prove DDP and one process compute the same objective.
 
-    With ``accumulation * world_size`` equal, both runs draw an identical global
-    block of microbatches, so every logged number may differ only by reduction
-    order and bf16 rounding.  Counts, the learning rate and the consumed samples
-    have to agree exactly.
+    With ``accumulation * world_size`` equal, both runs draw the identical block
+    of global microbatches.  Only the records describing the *first* update are
+    asserted: the baseline evaluation and the first step's metrics are a pure
+    function of the shared starting weights and that shared block, so any
+    difference is reduction order -- and a wrong rank layout would show up here
+    as a factor of the world size, not as noise.
+
+    Later records are reported but never failed.  Adam divides by a near-zero
+    second moment early, so a difference at the level of rounding is amplified
+    into a visible evaluation gap within a few updates.  That is chaos, not a
+    partition error, and asserting on it would bury the signal that matters.
     """
     first, second = (
         index_metrics(Path(directory) / "metrics.jsonl") for directory in (left, right)
@@ -330,8 +340,11 @@ def compare_runs(left, right):
     if not common:
         print(json.dumps({"check": "equivalence", "error": "no shared metric records"}), flush=True)
         return 1
-    worst, where, exact = 0.0, None, 0
+    pinned_worst, pinned_where = 0.0, None
+    drift_worst, drift_where = 0.0, None
+    exact = 0
     for key in common:
+        pinned = key == "train:1" or key.startswith("dev:0:")
         for name, value in first[key].items():
             if name not in second[key]:
                 continue
@@ -341,23 +354,28 @@ def compare_runs(left, right):
                 exact += 1
                 continue
             error = abs(value - other) / max(abs(value), abs(other), 1e-6)
-            if error > worst:
-                worst, where = error, f"{key}.{name}"
+            if pinned:
+                if error > pinned_worst:
+                    pinned_worst, pinned_where = error, f"{key}.{name}"
+            elif error > drift_worst:
+                drift_worst, drift_where = error, f"{key}.{name}"
     print(
         json.dumps(
             {
                 "check": "equivalence",
                 "records": len(common),
                 "exact": exact,
-                "max_relative_error": worst,
-                "at": where,
-                "tolerance": TOLERANCE,
-                "verdict": worst <= TOLERANCE,
+                "first_update_error": pinned_worst,
+                "first_update_at": pinned_where,
+                "tolerance": tolerance,
+                "later_drift_error": drift_worst,
+                "later_drift_at": drift_where,
+                "verdict": pinned_worst <= tolerance,
             }
         ),
         flush=True,
     )
-    return 0 if worst <= TOLERANCE else 1
+    return 0 if pinned_worst <= tolerance else 1
 
 
 def main():
@@ -395,9 +413,15 @@ def main():
         metavar=("RUN_A", "RUN_B"),
         help="Compare two run directories and exit; needs no GPU and no torchrun",
     )
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=TOLERANCE,
+        help="Allowed relative error on the first update (text-only runs match bit for bit)",
+    )
     args = parser.parse_args()
     if args.compare is not None:
-        raise SystemExit(compare_runs(*args.compare))
+        raise SystemExit(compare_runs(*args.compare, tolerance=args.tolerance))
     # Reject a missing snapshot before any rank has loaded a backbone.
     if args.full and not (args.model / "revision.txt").is_file():
         raise SystemExit(f"A pinned snapshot with revision.txt is required: {args.model}")
