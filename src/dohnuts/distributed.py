@@ -38,8 +38,11 @@ def setup() -> tuple[int, int, int]:
     _local_rank = int(os.environ["LOCAL_RANK"])
     _world_size = world
 
-    torch.cuda.set_device(_local_rank)
-    dist.init_process_group(backend="nccl")
+    target = torch.device("cuda", _local_rank)
+    torch.cuda.set_device(target)
+    # Bind the group to this rank's device so barrier and friends never have to
+    # infer it from the ambient CUDA context.
+    dist.init_process_group(backend="nccl", device_id=target)
     _initialized = True
     return _rank, _local_rank, _world_size
 
