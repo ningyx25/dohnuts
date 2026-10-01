@@ -11,6 +11,7 @@ import torch
 from PIL import Image
 
 from dohnuts.experiment import Sampler, emit, latency_stats, memory, timed
+from dohnuts.recipe import IMAGE_PIXELS
 
 
 def image_workloads():
@@ -92,7 +93,7 @@ def measure(args, agent, engine_label):
             "dtype": "bf16",
             "model_parameters": sum(p.numel() for p in model.parameters()),
             "parameter_dtypes": sorted({str(p.dtype) for p in model.parameters()}),
-            "config": getattr(agent, "cfg", {"image_pixels": 512**2}),
+            "config": getattr(agent, "cfg", {"image_pixels": IMAGE_PIXELS}),
             "memory": memory(),
             "seed": 0,
             "checkpoint": str(args.checkpoint) if args.checkpoint else None,
