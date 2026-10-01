@@ -398,6 +398,9 @@ def main():
     args = parser.parse_args()
     if args.compare is not None:
         raise SystemExit(compare_runs(*args.compare))
+    # Reject a missing snapshot before any rank has loaded a backbone.
+    if args.full and not (args.model / "revision.txt").is_file():
+        raise SystemExit(f"A pinned snapshot with revision.txt is required: {args.model}")
     distributed.setup()
     try:
         world = distributed.world_size()
@@ -410,8 +413,6 @@ def main():
             check_gradient_sync()
             check_data_partition()
         if args.full:
-            if not (args.model / "revision.txt").is_file():
-                raise SystemExit(f"A pinned snapshot with revision.txt is required: {args.model}")
             holder = None
             if args.workdir is None:
                 holder = tempfile.TemporaryDirectory(prefix="dohnuts-smoke-")
